@@ -1,0 +1,66 @@
+# Default parameters for run_leo_link_analysis.py
+# Based on results/leo-link-20260425-100559, with explicit 2x2 MIMO ports.
+
+duration=700
+precision=500
+
+# Scenario
+scenario=NTN-Rural
+observer_mode=full-pass
+observer_elevation_boundary_deg=1.0
+
+# Carrier & bandwidth
+frequency_hz=2000000000.0
+bandwidth_hz=20000000.0
+
+# Link budget. This keeps the 20260425-100559 satellite TxPower.
+sat_eirp_dbw_per_mhz=32.0
+sat_antenna_gain_db=48.0
+vsat_antenna_gain_db=0.0
+
+# Traffic
+transport=udp
+udp_rate_mbps=500.0
+udp_packet_size=1200
+
+# Core/backhaul abstraction
+s1u_link_delay_ms=5.0
+remote_host_delay_ms=10.0
+
+# MCS control
+use_fixed_mcs=0
+fixed_mcs=20
+
+# =========================
+# MIMO / antenna settings
+# =========================
+
+enable_mimo_feedback=1
+mimo_pm_search_method=ns3::NrPmSearchFull
+mimo_full_search_codebook=ns3::NrCbTwoPort
+mimo_rank_limit=2
+mimo_rank_threshold=0.0
+mimo_rank_technique=Sasaoka
+mimo_subband_size=16
+mimo_downsampling_technique=FirstPRB
+
+# Explicit 2x2 single-polarized antenna-port setup.
+ue_antenna_rows=1
+ue_antenna_columns=2
+ue_num_vertical_ports=1
+ue_num_horizontal_ports=2
+
+gnb_antenna_rows=1
+gnb_antenna_columns=2
+gnb_num_vertical_ports=1
+gnb_num_horizontal_ports=2
+
+ue_is_dual_polarized=0
+gnb_is_dual_polarized=0
+
+ue_pol_slant_angle_deg=0.0
+gnb_pol_slant_angle_deg=0.0
+
+# Output
+results_root=results
+throughput_window_s=1.0

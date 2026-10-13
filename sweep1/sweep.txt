@@ -1,0 +1,15 @@
+date:      Thu Oct  8 16:38:00 EDT 2026
+program:   /home/ashkan/ns-3-dev-NTN-main/build/scratch/ns3.48-ntnplot-optimized
+arguments: --satSet=1 --fullPass=1 --pdcch=1 --pdcchSymbols=0 --scheduling=dynamic --idealControl=0 --bandwidthMHz=5 --dlFrequencyGHz=2.175 --altitudeKm=600 --scenario=NTN-Rural
+nUes:      1 to 21, step 2
+RngRun:    1 2 3 4 5
+date:      Thu Oct  8 16:43:20 EDT 2026
+program:   /home/ashkan/ns-3-dev-NTN-main/build/scratch/ns3.48-ntnplot-optimized
+arguments: --satSet=1 --fullPass=1 --pdcch=1 --pdcchSymbols=0 --scheduling=dynamic --idealControl=0 --bandwidthMHz=5 --dlFrequencyGHz=2.175 --altitudeKm=600 --scenario=NTN-Rural
+nUes:      1 to 20, step 1
+RngRun:    1 2 3 4 5
+date:      Thu Oct  8 17:13:13 EDT 2026
+program:   /home/ashkan/ns-3-dev-NTN-main/build/scratch/ns3.48-ntnplot-optimized
+arguments: --satSet=1 --fullPass=1 --pdcch=1 --pdcchSymbols=0 --scheduling=dynamic --idealControl=0 --bandwidthMHz=5 --dlFrequencyGHz=2.175 --altitudeKm=600 --scenario=NTN-Rural
+nUes:      1 to 10, step 1
+RngRun:    1 2 3 4 5

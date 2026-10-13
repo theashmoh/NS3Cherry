@@ -1,0 +1,6 @@
+# Bases these patches were cut against. Regenerate after every upstream pull.
+generated:   2026-09-24T06:18:12Z
+ns3_base:    ns-3.48 (d2add90b45)
+ns3_head:    2550b14102 on ns-3.48_NTN_dev
+nr_base:     v5.1 (cedceadd)
+nr_head:     84aaf7c7 on lena-5.1_NTN_dev

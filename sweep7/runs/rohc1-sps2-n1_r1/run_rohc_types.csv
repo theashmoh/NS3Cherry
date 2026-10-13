@@ -1,0 +1,10 @@
+nUes,direction,scheduling,scheduler,bandwidthMHz,pdcch,pdcchSymbols,idealControl,harq,targetBler,rohc,rohcModel,rohcMode,fullPass,freezeGeometry,elevationDeg,durationS,ueAntennaGainDbi,rngSeed,rngRun,address,rnti,lcid,dir,type,packetsPct,meanHeaderB
+1,dl,sps2,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,-5,1,1,7.0.0.2,1,3,DL,IR,0.0,
+1,dl,sps2,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,-5,1,1,7.0.0.2,1,3,DL,UOR-2-EXT-3,1.6,
+1,dl,sps2,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,-5,1,1,7.0.0.2,1,3,DL,UO-0,98.4,
+1,dl,sps2,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,-5,1,1,all,all,,,IR,0.0,
+1,dl,sps2,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,-5,1,1,all,all,,,UOR-2-EXT-3,1.6,
+1,dl,sps2,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,-5,1,1,all,all,,,UO-0,98.4,
+1,dl,sps2,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,-5,1,1,all,mean,,,IR,,39.0
+1,dl,sps2,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,-5,1,1,all,mean,,,UOR-2-EXT-3,,13.0
+1,dl,sps2,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,-5,1,1,all,mean,,,UO-0,,3.0

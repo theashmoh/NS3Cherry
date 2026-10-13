@@ -1,0 +1,23 @@
+# README example 1: a transparent pass, horizon -> zenith -> horizon, one UE.
+# python3 ntn/scripts/run_leo_link_bent_pipe_analysis.py --param-file ntn/params/leo_link_transparent_pass.txt
+#
+# Only what differs from leo-link's defaults is listed: the link budget is the default one,
+# TR 38.821 study case 9 (the sc9handset preset: S-band 2 GHz, 30 MHz, 34 dBW/MHz, handheld), and
+# the gateway sits at the UE, so the feeder follows the same geometry. frequency_hz repeats the
+# preset's 2 GHz for the plots.
+
+duration=600
+precision=1000
+frequency_hz=2000000000.0
+
+# From 10 deg (the lowest elevation the 3GPP NTN channel covers) through zenith and back.
+observer_mode=full-pass
+observer_elevation_boundary_deg=10.0
+
+transport=udp
+udp_rate_mbps=10
+udp_packet_size=1200
+use_fixed_mcs=0
+
+results_root=results
+throughput_window_s=1.0

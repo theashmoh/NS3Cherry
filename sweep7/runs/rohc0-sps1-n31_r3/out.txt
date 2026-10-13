@@ -1,0 +1,300 @@
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| NR-NTN VOICE CELL                                transparent, NTN-Rural, 5 MHz FDD, DL 2.175 / UL 1.985 GHz, 31 downlink calls |
++--------------------------------------------------------------------------------------------------------------------------------+
+
+VOICE
+  source          RTP, codec 4.75 kbit/s = 95 bits per 20 ms frame: 12 B voice frames
+                  (the bits of the frame alone; with the 10-bit payload header of RFC 4867 it is 14 B: --voicePayload=14)
+  silence (DTX)   7 more voice frames (hangover), then a 7 B SID at once and every 160 ms
+  headers         IP 20 + UDP 8 + RTP 12 = 40 B on every packet
+  ROHC            off
+  layer 2         PDCP 1 + RLC 1 + MAC 3 = 5 B, as TR 26.940 5.2.3 counts them; NR has the same 5 B as PDCP 2 + RLC 1 + MAC 2
+  bearer          5QI 1 for every UE: GBR, GFBR 40.00 kbit/s (talking: 20.80), 1 % error rate
+  delay budget    100 ms UE-UPF, of which UPF-gateway takes 3.85 ms in this run: 96.15 ms are left for the radio side, gateway-UE
+                  (TS 23.501 5.7.3.4 takes a fixed 20 ms off for 5QI 1: --upfGwDelayMinMs=20 --upfGwDelayMaxMs=20)
+  late packets    the gNB discards a new packet while its oldest has waited over 96 ms (that budget, in whole ms); a UE never does
+
+CELL
+  satellite       600 km, Set-1 LEO-600 of TR 38.821: EIRP 34.00 dBW/MHz = 70.99 dBm, antenna 30.00 dBi,
+                  G/T 1.10 dB/K (noise figure 4.28 dB)
+  beam            2.00 m aperture: 4.0575 deg wide at 3 dB on the downlink, 4.4461 deg on the uplink carrier
+  handheld        23 dBm, antenna -5.00 dBi on both carriers (--ueAntennaGainDbi), noise figure 7 dB
+  UEs             UE 0 on the beam centre, the others at random places of the beam area
+  beam area       42.5 km north-south x 42.5 km east-west, 1419 km2
+  LOS, shadowing  each UE keeps its obstruction and shadowing levels for the whole run
+  interference    none: one beam, no other cell; every SINR here is a signal-to-noise ratio
+  scheduler       OFDMA (a UE gets resource block groups), round robin
+  HARQ            up to 4 transmissions of a block, combined by the receiver (incremental redundancy); 16 processes per UE
+  link adaptation downlink: a first transmission aims at 15 % block errors (outer loop on the HARQ feedback)
+                  OFDMA: a HARQ retransmission takes resource block groups of the symbols new data has, which other UEs share
+                  a semi-persistent block keeps the MCS of its activation, so its error rate is not that target's;
+                  to compare the schemes without that, give all of them a low one: --targetBler=0.01
+  control         a DCI is lost at the block error rate of its aggregation level at the SINR it arrives with
+  link failure    when a level-8 PDCCH with 4 dB more power would lose over 10 % (below -13.82 dB), over the last 200 ms,
+                  and a level-4 PDCCH not under 2 % again (above -5.93 dB) within 1.00 s
+  after a failure no service until the level-4 PDCCH loses under 2 % again, then the UE attaches again
+
+PDCCH
+  CORESET         24 RB x 1, 2 or 3 symbols = 4, 8 or 12 CCEs as the slot needs; a DCI is 34 + 24 CRC bits
+                  (format 1_0 on 26 RB has 37 bits, TS 38.212 7.3.1.2.1: --dciBits=37)
+  level           the lowest that loses up to 1.00 % of the DCIs at the SINR the UE reported:
+                  level 1 from 0.40 dB, 2 from -2.61 dB, 4 from -5.62 dB, 8 from -8.63 dB
+                  level-1 BLER, dB:BLER (--pdcchBlerTable): -4:0.9303 -2:0.4356 -1:0.1453 0:0.0246 0.5:0.00797 1:0.00221
+  candidates      6/6/4/2 per UE at level 1/2/4/8; SIB1 and random access at level 8; a UE monitors 72 (limit 44)
+  order in a slot SIB1 (every 20 ms), random access, uplink grants (50 % of the CCEs if the downlink wants them too),
+                  downlink assignments; retransmissions first, then new data as the scheduler ranks the UEs
+  voice           semi-persistent, scenario 1: one configuration, a block every 20 ms, kept through silence (blocks stay empty)
+                  downlink (SPS): 57 B blocks
+                  uplink (configured grant Type 2): 63 B blocks = 57 B + 5 B BSR (nr module; 3GPP: 2 B) + 1 B confirmation CE
+  to silence      the first SID is no larger than a block: nothing to do
+  to voice        nor is the first voice frame
+
+GEOMETRY AND DELAY
+  satellite       flies south at 7.56 km/s, is over UE 0 at t = 255.24 s and down at 10 deg again at t = 509.49 s
+  calls           UE 0: t = 1.00 s to 509.49 s, the whole pass; call i starts i x 1 ms after UE 0's,
+                  is on only while the satellite is 10 deg or more above its own UE, and ends with UE 0's at the latest
+  UE 0            elevation -10.00 -> +10.00 deg (- before it is overhead, + after), slant range 1931.64 -> 1931.64 km
+  gateway         N 62.5 km, E -38.5 km from UE 0 (random in a circle of 200 km diameter)
+                  elevation -10.86 -> +9.16 deg, slant range 1873.32 -> 1991.09 km
+  feeder link     gateway 60.00 dBm, satellite receive gain 30.00 dBi
+  delay to UE 0   32.69 ms = 16.15 host-UPF + 3.85 UPF-gateway + 6.25 feeder + 6.44 service, one way, when its call starts
+                  33.08 ms = 16.15 host-UPF + 3.85 UPF-gateway + 6.64 feeder + 6.44 service when it ends
+  round trip      26.48 ms on the radio at most, at t = 511.40 s  =>  K_offset 27 slots for the whole run
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| CALLS                                                                              one line per call; delay: remote host to UE |
++--------------------------------------------------------------------------------------------------------------------------------+
+flow   UE address  N[km]  E[km]  beam[dB]  SF[dB]   VAF    tx    rx  lost  delay[ms]  jitter[ms]  LOS[%]  RLF  out[s]  DL SINR[dB]
+   1      7.0.0.2    0.0    0.0     -0.00   -2.03  0.51 15368  7926  7442     40.126       8.347      57    2  216.04          7.0
+   2      7.0.0.4   16.4    1.7     -0.42   -1.61  0.64 19112 19100    12     44.299       7.243     100    0    0.00          3.6
+   3      7.0.0.5    3.5    0.1     -0.02   -1.31  0.37 12734 12732     2     42.538       7.023     100    0    0.00          4.7
+   4      7.0.0.6    5.4  -12.2     -0.44   -1.19  0.56 15296 12515  2781     41.688       8.119      82    2   88.65          5.2
+   5      7.0.0.7    2.4    5.1     -0.07    1.14  0.39 11397 11395     2     39.898       6.971     100    0    0.00          6.8
+   6      7.0.0.8    6.9   15.1     -0.66    4.76  0.38 11037 11025    12     45.041       8.835      82    0    0.00          6.8
+   7     7.0.0.14   18.3    9.3     -0.73    1.07  0.52 14549 12130  2419     39.927       8.360      83    2   86.55          5.6
+   8     7.0.0.16   18.4    3.8     -0.55   -0.12  0.62 17515 17503    12     41.629       7.267     100    0    0.00          4.8
+   9     7.0.0.17    1.1   -7.8     -0.16    0.54  0.26  8885  7033  1852     37.675       7.844      82    2   88.79          6.4
+  10     7.0.0.18    7.9    5.5     -0.17   -1.13  0.42 14394 14390     4     43.052       6.821     100    0    0.00          4.6
+  11     7.0.0.19    1.7   11.3     -0.33    0.82  0.81 22527 12929  9598     41.595       8.475      57    2  215.41          7.1
+  12     7.0.0.23   19.3   -4.9     -0.66   -2.16  0.73 20475 16940  3535     42.254       8.382      83    2   86.41          4.3
+  13     7.0.0.25   19.4    2.8     -0.60    4.73  0.54 16551  3885 12666     79.750      18.373       3    2  382.31         -0.3
+  14     7.0.0.26    7.0    5.4     -0.14   -1.43  0.46 14392 14385     7     43.599       7.187     100    0    0.00          4.3
+  15     7.0.0.27    5.4    6.7     -0.15    0.03  0.72 20466 20460     6     42.151       6.993     100    0    0.00          5.6
+  16     7.0.0.20    0.1   -3.8     -0.04   -0.99  0.46 12078 12075     3     43.912       7.305     100    0    0.00          4.9
+  17     7.0.0.30    0.3   10.1     -0.27   -0.32  0.29 10577 10575     2     41.627       7.261     100    0    0.00          5.2
+  18     7.0.0.31   20.8    1.5     -0.68   -1.64  0.47 14448 14447     1     41.385       7.509     100    0    0.00          3.2
+  19     7.0.0.28   -0.5   -0.5     -0.00   -0.01  0.66 18990 18989     1     40.661       7.186     100    0    0.00          5.9
+  20     7.0.0.32   -2.4   10.6     -0.30   -4.92  0.49 15615   488 15127     37.441      10.316       3    2  493.63          7.9
+  21      7.0.0.9   -2.1   -4.2     -0.05   -2.50  0.41 13392 13384     8     42.009       7.263     100    0    0.00          3.6
+  22     7.0.0.29   -5.3    4.3     -0.09    0.08  0.49 14624 14611    13     41.494       7.264     100    0    0.00          5.8
+  23     7.0.0.15   -3.8  -18.6     -0.92   -0.30  0.56 17000 16997     3     42.302       7.176     100    0    0.00          4.2
+  24     7.0.0.11   -4.9  -16.3     -0.72   -8.17  0.40 11468   296 11172     40.377      12.425       3    2  493.78          6.5
+  25     7.0.0.22   -7.3   -9.6     -0.31    0.76  0.48 14125 14124     1     40.439       7.220     100    0    0.00          6.0
+  26     7.0.0.10   -8.1  -17.6     -0.90   -0.34  0.76 21195 21184    11     41.584       7.152     100    0    0.00          4.2
+  27     7.0.0.21  -10.5   16.4     -0.91   -2.49  0.61 17801 17788    13     40.824       7.289     100    0    0.00          2.2
+  28     7.0.0.13  -13.3  -14.0     -0.77    0.77  0.41 13513 13509     4     41.376       7.103     100    0    0.00          5.3
+  29     7.0.0.12  -14.2   -2.6     -0.32   -0.61  0.34 12964 12960     4     38.952       7.361     100    0    0.00          4.7
+  30      7.0.0.3  -16.8    6.7     -0.57    0.98  0.34 10170 10170     0     37.080       7.365     100    0    0.00          5.8
+  31     7.0.0.24  -19.8   -1.2     -0.62   -1.64  0.44 13465 13459     6     41.948       7.454     100    0    0.00          3.3
+N, E: where the UE is, north and east of the beam centre. beam, SF: beam gain and shadow fading there (negative: weaker).
+RLF: radio link failures. out: time of the call without a connection after them. DL SINR: of the control symbols received.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| LOST PACKETS BY CAUSE                                                                 in packets, and in % of the packets sent |
++--------------------------------------------------------------------------------------------------------------------------------+
+flow   UE address    tx    rx  lost  no conn.  discard  radio  ROHC  link[%]  ROHC[%]
+   1      7.0.0.2 15368  7926  7442      7377        0     65     -    48.43        -
+   2      7.0.0.4 19112 19100    12         0        0     12     -     0.06        -
+   3      7.0.0.5 12734 12732     2         0        0      2     -     0.02        -
+   4      7.0.0.6 15296 12515  2781      2710        0     71     -    18.18        -
+   5      7.0.0.7 11397 11395     2         0        0      2     -     0.02        -
+   6      7.0.0.8 11037 11025    12         0        0     12     -     0.11        -
+   7     7.0.0.14 14549 12130  2419      2397        0     22     -    16.63        -
+   8     7.0.0.16 17515 17503    12         0        0     12     -     0.07        -
+   9     7.0.0.17  8885  7033  1852      1832        0     20     -    20.84        -
+  10     7.0.0.18 14394 14390     4         0        0      4     -     0.03        -
+  11     7.0.0.19 22527 12929  9598      9518        6     74     -    42.61        -
+  12     7.0.0.23 20475 16940  3535      3456        0     79     -    17.26        -
+  13     7.0.0.25 16551  3885 12666     12557        2    107     -    76.53        -
+  14     7.0.0.26 14392 14385     7         0        0      7     -     0.05        -
+  15     7.0.0.27 20466 20460     6         0        0      6     -     0.03        -
+  16     7.0.0.20 12078 12075     3         0        0      3     -     0.02        -
+  17     7.0.0.30 10577 10575     2         0        0      2     -     0.02        -
+  18     7.0.0.31 14448 14447     1         0        0      1     -     0.01        -
+  19     7.0.0.28 18990 18989     1         0        0      1     -     0.01        -
+  20     7.0.0.32 15615   488 15127     15064        0     63     -    96.87        -
+  21      7.0.0.9 13392 13384     8         0        0      8     -     0.06        -
+  22     7.0.0.29 14624 14611    13         0        0     13     -     0.09        -
+  23     7.0.0.15 17000 16997     3         0        0      3     -     0.02        -
+  24     7.0.0.11 11468   296 11172     11165        0      7     -    97.42        -
+  25     7.0.0.22 14125 14124     1         0        0      1     -     0.01        -
+  26     7.0.0.10 21195 21184    11         0        0     11     -     0.05        -
+  27     7.0.0.21 17801 17788    13         0        0     13     -     0.07        -
+  28     7.0.0.13 13513 13509     4         0        0      4     -     0.03        -
+  29     7.0.0.12 12964 12960     4         0        0      4     -     0.03        -
+  30      7.0.0.3 10170 10170     0         0        0      0     -     0.00        -
+  31     7.0.0.24 13465 13459     6         0        0      6     -     0.04        -
+ all             466123399404 66719     66076        8    635     -    14.31        -
+no conn.: the UE had no connection. discard: the sender did not take it, the oldest packet in its queue had waited too long.
+radio: sent, did not arrive. ROHC: arrived, but the header could not be restored. link = no conn. + discard + radio.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| VOICE AGAINST 5QI 1 (TS 23.501 Table 5.7.4-1)                  at most 100 ms UE-UPF for 98 % of the packets, at most 1 % lost |
++--------------------------------------------------------------------------------------------------------------------------------+
+flow   UE address  on bearer  in PDB  late  discard  lost  over PDB[%]  PER[%]  mean[ms]   98%[ms]   max[ms]  kbit/s  missed
+   1      7.0.0.2       7991    7924     2        0    65         0.03    0.81    23.976    61.210   127.615    20.8  -
+ 1.1       RNTI 1          8       0     0        0     8         0.00  100.00         -         -         -     1.6  PER
+ 1.2      RNTI 37       7983    7924     2        0    57         0.03    0.71    23.976    61.210   127.615    20.8  -
+   2      7.0.0.4      19112   19067    33        0    12         0.17    0.06    28.149    64.246   151.751    20.8  -
+   3      7.0.0.5      12734   12724     8        0     2         0.06    0.02    26.388    58.947   130.786    20.8  -
+   4      7.0.0.6      12586   12499    16        0    71         0.13    0.56    25.538    62.449   127.412    20.8  -
+ 4.1       RNTI 2          9       0     0        0     9         0.00  100.00         -         -         -     1.8  PER
+ 4.2      RNTI 34      12577   12499    16        0    62         0.13    0.49    25.538    62.449   127.412    20.8  -
+   5      7.0.0.7      11397   11394     1        0     2         0.01    0.02    23.748    56.091   115.636    20.8  -
+   6      7.0.0.8      11037   10961    64        0    12         0.58    0.11    28.891    77.161   172.118    20.8  -
+   7     7.0.0.14      12152   12117    13        0    22         0.11    0.18    23.777    59.907   128.754    20.8  -
+ 7.1       RNTI 9          9       0     0        0     9         0.00  100.00         -         -         -     1.8  PER
+ 7.2      RNTI 32      12143   12117    13        0    13         0.11    0.11    23.777    59.907   128.754    20.8  -
+   8     7.0.0.16      17515   17475    28        0    12         0.16    0.07    25.479    63.810   149.537    20.8  -
+   9     7.0.0.17       7053    7029     4        0    20         0.06    0.28    21.525    54.895   128.513    20.8  -
+ 9.1      RNTI 29         11       0     0        0    11         0.00  100.00         -         -         -     2.2  PER
+ 9.2      RNTI 35       7042    7029     4        0     9         0.06    0.13    21.525    54.895   128.513    20.8  -
+  10     7.0.0.18      14394   14381     9        0     4         0.06    0.03    26.902    64.258   125.274    20.8  -
+  11     7.0.0.19      13009   12913    16        6    74         0.17    0.57    25.445    57.390   278.237    20.8  -
+11.1      RNTI 20         30       0     0        6    24        20.00   80.00         -         -         -     6.2  PDB PER
+11.2      RNTI 36      12979   12913    16        0    50         0.12    0.39    25.445    57.390   278.237    20.8  -
+  12     7.0.0.23      17019   16917    23        0    79         0.14    0.46    26.104    62.193   139.151    20.8  -
+12.1      RNTI 21         10       0     0        0    10         0.00  100.00         -         -         -     2.0  PER
+12.2      RNTI 33      17009   16917    23        0    69         0.14    0.41    26.104    62.193   139.151    20.8  -
+  13     7.0.0.25       3994    3348   537        2   107        13.50    2.68    63.600   159.652   259.883    20.8  PDB PER
+13.1      RNTI 30         11       0     0        2     9        18.18   81.82         -         -         -     2.2  PDB PER
+13.2      RNTI 38       3983    3348   537        0    98        13.48    2.46    63.600   159.652   259.883    20.8  PDB PER
+  14     7.0.0.26      14392   14366    19        0     7         0.13    0.05    27.448    63.619   140.878    20.8  -
+  15     7.0.0.27      20466   20437    23        0     6         0.11    0.03    26.001    68.467   135.080    20.8  -
+  16     7.0.0.20      12078   12062    13        0     3         0.11    0.02    27.762    63.528   130.613    20.8  -
+  17     7.0.0.30      10577   10566     9        0     2         0.09    0.02    25.477    62.326   147.375    20.8  -
+  18     7.0.0.31      14448   14435    12        0     1         0.08    0.01    25.235    60.684   125.071    20.8  -
+  19     7.0.0.28      18990   18985     4        0     1         0.02    0.01    24.511    61.606   126.664    20.8  -
+  20     7.0.0.32        551     485     3        0    63         0.54   11.43    21.291    43.287   204.293    20.8  PER
+20.1      RNTI 17          8       0     0        0     8         0.00  100.00         -         -         -     1.6  PER
+20.2      RNTI 39        543     485     3        0    55         0.55   10.13    21.291    43.287   204.293    20.8  PER
+  21      7.0.0.9      13392   13363    21        0     8         0.16    0.06    25.859    58.758   130.061    20.8  -
+  22     7.0.0.29      14624   14585    26        0    13         0.18    0.09    25.344    59.784   179.330    20.8  -
+  23     7.0.0.15      17000   16983    14        0     3         0.08    0.02    26.152    61.008   129.033    20.8  -
+  24     7.0.0.11        303     295     1        0     7         0.33    2.31    24.227    67.568   107.568    20.8  PER
+  25     7.0.0.22      14125   14119     5        0     1         0.04    0.01    24.289    57.594   129.556    20.8  -
+  26     7.0.0.10      21195   21168    16        0    11         0.08    0.05    25.434    61.323   130.302    20.8  -
+  27     7.0.0.21      17801   17744    44        0    13         0.25    0.07    24.674    66.983   186.983    20.8  -
+  28     7.0.0.13      13513   13498    11        0     4         0.08    0.03    25.225    62.932   128.734    20.8  -
+  29     7.0.0.12      12964   12954     6        0     4         0.05    0.03    22.802    56.929   127.806    20.8  -
+  30      7.0.0.3      10170   10169     1        0     0         0.01    0.00    20.930    52.465   111.025    20.8  -
+  31     7.0.0.24      13465   13446    13        0     6         0.10    0.04    25.798    63.464   125.669    20.8  -
+ all                  400047  398409   995        8   635         0.25    0.16    25.840    63.176   278.237    20.8  3 calls
+on bearer: packets the voice bearer was given. in PDB, late: delivered within, after the budget; late is not lost.
+lost = radio + ROHC. over PDB = late + discard, PER = lost, both in % of on bearer. mean, 98%, max: delay UE to UPF.
+kbit/s: the highest mean over 2 s. missed: PDB if over PDB is above 2 %, PER if PER is above 1 %.
+n.1, n.2: call n had more than one connection: one line for the voice bearer of each, held against 5QI 1 on its own. A radio
+link failure ends a connection, the next one sets up a new bearer (RNTI as in the ROHC tables). The line of call n adds them up.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| PDCCH                                                        t = 1.00 s to 509.49 s: 508488 slots, 138978 (27.33 %) with a DCI |
++--------------------------------------------------------------------------------------------------------------------------------+
+CCEs: 401277 used of 6101856 possible (508488 slots x 12 CCEs) = utilization 6.58 %; 158759 DCIs, 2.53 CCEs each.
+PDCCH symbols: 1 in 107631 slots (77.44 %), 2 in 24970 slots (17.97 %), 3 in 6377 slots (4.59 %); 1.27 on average.
+The symbols the slots took (1 where there was no DCI) held 2189168 CCEs; 18.33 % of these were used.
+
+purpose                     DCIs    CCEs  CCEs[%]  blocked  blocked[%]
+system information (SIB1)  25425  203400     3.33        0        0.00
+random access response         8      64     0.00        0        0.00
+downlink, new data          2111    6906     0.11     1844       46.62
+downlink, retransmission   69143  120297     1.97     3297        4.55
+downlink SPS activation    62072   70610     1.16      188        0.30
+downlink SPS release           0       0     0.00        0        0.00
+uplink, new data               0       0     0.00        0        0.00
+uplink, retransmission         0       0     0.00        0        0.00
+uplink CG activation           0       0     0.00        0        0.00
+uplink CG release              0       0     0.00        0        0.00
+all                       158759  401277     6.58     5329        3.25
+CCEs[%]: of the 6101856 CCEs possible. blocked: not sent, no candidate had all its CCEs free; its UE was not
+scheduled in that slot.
+
+level    DCIs  DCIs[%]    CCEs  CCEs[%]  from[dB]  missed  missed[%]
+    1  106861    67.31  106861     1.75      0.40    1927       1.80
+    2   17080    10.76   34160     0.56     -2.61     329       1.93
+    4    4572     2.88   18288     0.30     -5.62     292       6.39
+    8   30246    19.05  241968     3.97     -8.63    2138      44.62
+  all  158759   100.00  401277     6.58              4686       3.52
+DCIs[%]: of the DCIs. CCEs[%]: of the CCEs possible, as above. from: the level is used from this reported SINR on.
+missed: DCIs their UE did not decode.
+  NOTE: 3213 DCIs went to a UE whose reported SINR was below what the highest level needs for 1.00 %
+  NOTE: 1861 PDCCH candidates were kept for a UE that then got no data resources in the slot
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| SPS AND CONFIGURED GRANT, SCENARIO 1         the blocks of the voice bearers that needed no DCI, and the DCIs that set them up |
++--------------------------------------------------------------------------------------------------------------------------------+
+direction     activations  releases    used   empty  empty[%]  in pieces  own DCI    lost
+downlink SPS        62072         0  336695  277363     45.17          0        0     528
+uplink CG               0         0       0       0      0.00          0        0       0
+CG: configured grant Type 2. used: occasions that carried data (the first block of a configuration comes with its
+activation DCI and is not among them). empty: an occasion with nothing to send. in pieces: a packet larger than the
+block, sent over this occasion and the next. own DCI: a larger packet that was sent with a DCI instead. lost: blocks
+the UE did not know of, it had missed the DCI that activated the configuration. in pieces and own DCI count every
+such packet; the next table has those that follow a change of the speaker.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| VOICE <-> SILENCE, SCENARIO 1                       how the first packet after the speaker started or stopped talking was sent |
++--------------------------------------------------------------------------------------------------------------------------------+
+direction  change            count  in a block  in pieces  RLC PDUs  own DCI  new configuration  DCIs
+downlink   voice -> silence   3107        3089          0         0       18                  0    18
+downlink   silence -> voice   3087        3076          0         0       11                  0    11
+uplink     voice -> silence      0           0          0         0        0                  0     0
+uplink     silence -> voice      0           0          0         0        0                  0     0
+count: changes the gNB saw, by the size of the first packet after each (a voice frame or a SID). in a block, in pieces,
+own DCI: how that packet was sent. in a block: whole, in a block of the configuration. in pieces: larger than the block,
+cut by the RLC and sent in this block and the next, 20 ms apart, as so many RLC PDUs. own DCI: with a dynamic assignment
+or grant, 1 DCI (uplink: for what a block left of it, or for its scheduling request; so comes every packet while no
+configuration is active). new configuration: the gNB released the configuration and activated the other one, 2 DCIs.
+DCIs: own DCI + 2 x new configuration. Uplink: as the gNB sees it (the RLC PDUs are those it received; a late SID that it
+takes for the start of a talk spurt makes it change the configuration for nothing, and back).
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| SATELLITE SEEN FROM EACH UE DURING ITS CALL                                                                                    |
++--------------------------------------------------------------------------------------------------------------------------------+
+                                  ----- elevation [deg] ----- -------- slant range [km] --------- ------- delay [ms] --------
+flow   UE address from[s]   to[s]  start    end    low   high    start      end      min      max  start    end    min    max
+   1      7.0.0.2    1.00  509.49 -10.00 +10.00  10.00  90.00  1931.64  1931.64   600.00  1931.64 32.692 33.085 24.014 33.085
+   2      7.0.0.4    1.00  507.11 -10.23 +10.00  10.00  89.93  1915.44  1931.64   600.00  1931.64 32.638 33.031 24.011 33.031
+   3      7.0.0.5    1.00  508.99 -10.05 +10.00  10.00  89.97  1928.20  1931.64   600.00  1931.64 32.680 33.073 24.013 33.073
+   4      7.0.0.6    1.00  508.81 -10.07 +10.00  10.00  88.69  1927.08  1931.64   600.14  1931.64 32.677 33.069 24.013 33.069
+   5      7.0.0.7    1.00  509.09 -10.04 +10.00  10.00  89.49  1928.88  1931.64   600.02  1931.64 32.683 33.076 24.013 33.076
+   6      7.0.0.8    1.01  508.35 -10.11 +10.00  10.00  88.47  1923.93  1931.64   600.20  1931.64 32.666 33.059 24.013 33.059
+   7     7.0.0.14    1.01  506.75 -10.27 +10.00  10.00  89.16  1912.95  1931.64   600.06  1931.64 32.629 33.022 24.011 33.022
+   8     7.0.0.16    1.01  506.80 -10.27 +10.00  10.00  89.73  1913.24  1931.64   600.01  1931.64 32.630 33.024 24.011 33.024
+   9     7.0.0.17    1.01  509.40 -10.01 +10.00  10.00  89.18  1931.00  1931.64   600.06  1931.64 32.690 33.083 24.014 33.083
+  10     7.0.0.18    1.02  508.30 -10.12 +10.00  10.00  89.48  1923.46  1931.64   600.02  1931.64 32.664 33.058 24.012 33.058
+  11     7.0.0.19    1.02  509.13 -10.04 +10.00  10.00  88.83  1929.17  1931.64   600.11  1931.64 32.683 33.077 24.014 33.077
+  12     7.0.0.23    1.02  506.75 -10.27 +10.00  10.00  89.35  1912.86  1931.64   600.04  1931.64 32.629 33.022 24.011 33.022
+  13     7.0.0.25    1.02  506.67 -10.28 +10.00  10.00  89.84  1912.25  1931.64   600.00  1931.64 32.627 33.021 24.011 33.021
+  14     7.0.0.26    1.02  508.43 -10.11 +10.00  10.00  89.49  1924.28  1931.64   600.02  1931.64 32.667 33.061 24.013 33.061
+  15     7.0.0.27    1.02  508.65 -10.08 +10.00  10.00  89.34  1925.77  1931.64   600.04  1931.64 32.672 33.066 24.013 33.066
+  16     7.0.0.20    1.03  509.49 -10.00 +10.00  10.00  89.61  1931.64  1931.46   600.01  1931.64 32.691 33.084 24.014 33.084
+  17     7.0.0.30    1.03  509.35 -10.02 +10.00  10.00  88.95  1930.54  1931.64   600.09  1931.64 32.688 33.082 24.014 33.082
+  18     7.0.0.31    1.03  506.48 -10.30 +10.00  10.00  89.98  1910.94  1931.64   600.00  1931.64 32.622 33.016 24.011 33.016
+  19     7.0.0.28    1.07  509.49 -10.00 +10.01  10.00  89.94  1931.64  1931.15   600.00  1931.64 32.690 33.083 24.014 33.083
+  20     7.0.0.32    1.25  509.49 -10.00 +10.02  10.00  88.88  1931.64  1930.01   600.11  1931.64 32.686 33.079 24.014 33.079
+  21      7.0.0.9    1.35  509.49 -10.00 +10.03  10.00  89.57  1931.64  1929.27   600.02  1931.64 32.684 33.077 24.014 33.077
+  22     7.0.0.29    1.73  509.49 -10.00 +10.07  10.00  89.51  1931.64  1926.68   600.02  1931.64 32.675 33.068 24.015 33.068
+  23     7.0.0.15    1.73  509.49 -10.00 +10.07  10.00  88.09  1931.64  1926.84   600.30  1931.64 32.675 33.069 24.016 33.069
+  24     7.0.0.11    1.86  509.49 -10.00 +10.08  10.00  88.34  1931.64  1925.89   600.23  1931.64 32.672 33.066 24.016 33.066
+  25     7.0.0.22    2.15  509.49 -10.00 +10.11  10.00  89.05  1931.64  1923.83   600.08  1931.64 32.666 33.059 24.015 33.059
+  26     7.0.0.10    2.35  509.49 -10.00 +10.13  10.00  88.23  1931.64  1922.59   600.26  1931.64 32.661 33.055 24.016 33.055
+  27     7.0.0.21    2.37  509.49 -10.00 +10.13  10.00  88.22  1931.64  1922.44   600.26  1931.64 32.661 33.054 24.016 33.054
+  28     7.0.0.13    3.05  509.49 -10.00 +10.20  10.00  88.63  1931.64  1917.76   600.16  1931.64 32.646 33.039 24.017 33.039
+  29     7.0.0.12    3.07  509.49 -10.00 +10.20  10.00  89.82  1931.64  1917.49   600.00  1931.64 32.645 33.038 24.017 33.038
+  30      7.0.0.3    3.36  509.49 -10.00 +10.23  10.00  89.19  1931.64  1915.55   600.06  1931.64 32.638 33.031 24.017 33.031
+  31     7.0.0.24    3.87  509.49 -10.00 +10.28  10.00  89.97  1931.64  1912.06   600.00  1931.64 32.627 33.020 24.018 33.020
+from, to: when the call started and ended. elevation: - before the satellite is overhead, + after; low, high: of the call.
+delay: one way, remote host -> UPF -> gateway -> satellite -> UE, propagation only.
+
+CSV: /home/ashkan/ns-3-dev-NTN-main/sweep7/runs/rohc0-sps1-n31_r3/run_calls.csv, _delays.csv, _pdcch.csv

@@ -1,0 +1,50 @@
+# Default parameters for run_leo_link_analysis.py
+# Format: key=value
+
+duration=1400
+precision=1000
+scenario=NTN-Rural
+frequency_hz=2000000000.0
+bandwidth_hz=250000000.0
+
+# Transparent payload (leo-link --payload=transparent): feeder link and satellite EIRP.
+# 19.02 dBW/MHz over 250 MHz is 73 dBm.
+gateway_tx_power_dbm=50
+ue_tx_power_dbm=23.0
+relay_processing_delay_us=0.0
+sat_feeder_rx_gain_db=40.0
+sat_eirp_dbw_per_mhz=19.02
+relay_loss_db=3.0
+receiver_nf_db=0.0
+
+transport=udp
+udp_rate_mbps=70
+udp_packet_size=1200
+s1u_link_delay_ms=5.0
+remote_host_delay_ms=10.0
+use_fixed_mcs=0
+fixed_mcs=20
+observer_mode=full-pass
+observer_elevation_boundary_deg=5.0
+enable_mimo_feedback=1
+mimo_pm_search_method=ns3::NrPmSearchFull
+mimo_full_search_codebook=ns3::NrCbTwoPort
+mimo_rank_limit=2
+mimo_rank_threshold=0.0
+mimo_rank_technique=Sasaoka
+mimo_subband_size=32
+mimo_downsampling_technique=FirstPRB
+ue_antenna_rows=1
+ue_antenna_columns=2
+ue_num_vertical_ports=1
+ue_num_horizontal_ports=2
+gnb_antenna_rows=2
+gnb_antenna_columns=2
+gnb_num_vertical_ports=1
+gnb_num_horizontal_ports=1
+ue_is_dual_polarized=0
+gnb_is_dual_polarized=1
+ue_pol_slant_angle_deg=90.0
+gnb_pol_slant_angle_deg=0.0
+results_root=results
+throughput_window_s=1.0

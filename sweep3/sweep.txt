@@ -1,0 +1,5 @@
+date:      Thu Oct  8 18:02:10 EDT 2026
+program:   /home/ashkan/ns-3-dev-NTN-main/build/scratch/ns3.48-ntnplot-optimized
+arguments: --satSet=1 --fullPass=1 --pdcch=1 --pdcchSymbols=0 --scheduling=sps1 --idealControl=0 --bandwidthMHz=5 --scheduler=ns3::NrMacSchedulerOfdmaRR --dlFrequencyGHz=2.175 --altitudeKm=600 --scenario=NTN-Rural
+nUes:      1 to 5, step 1
+RngRun:    1 2 3 4 5

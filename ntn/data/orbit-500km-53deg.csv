@@ -1,0 +1,4 @@
+# One satellite, 500 km circular orbit, 53 degrees inclination (a Starlink-like shell).
+# Unlike the 30 degree shell, it passes over Seattle, 47.7 N. Used with ntn/tools/aim_pass.py.
+altitudeKm,inclinationDegrees,numberOfPlanes,numberOfSatellitesPerPlane
+500,53,1,1

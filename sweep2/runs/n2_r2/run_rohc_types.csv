@@ -1,0 +1,13 @@
+nUes,direction,scheduling,scheduler,bandwidthMHz,pdcch,pdcchSymbols,idealControl,harq,targetBler,rohc,rohcModel,rohcMode,fullPass,freezeGeometry,elevationDeg,durationS,rngSeed,rngRun,address,rnti,lcid,dir,type,packetsPct,meanHeaderB
+2,dl,dynamic,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,1,2,7.0.0.2,1,3,DL,IR,0.0,
+2,dl,dynamic,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,1,2,7.0.0.2,1,3,DL,UOR-2-EXT-3,1.6,
+2,dl,dynamic,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,1,2,7.0.0.2,1,3,DL,UO-0,98.4,
+2,dl,dynamic,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,1,2,7.0.0.3,2,3,DL,IR,0.0,
+2,dl,dynamic,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,1,2,7.0.0.3,2,3,DL,UOR-2-EXT-3,1.6,
+2,dl,dynamic,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,1,2,7.0.0.3,2,3,DL,UO-0,98.4,
+2,dl,dynamic,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,1,2,all,all,,,IR,0.0,
+2,dl,dynamic,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,1,2,all,all,,,UOR-2-EXT-3,1.6,
+2,dl,dynamic,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,1,2,all,all,,,UO-0,98.4,
+2,dl,dynamic,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,1,2,all,mean,,,IR,,39.0
+2,dl,dynamic,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,1,2,all,mean,,,UOR-2-EXT-3,,13.0
+2,dl,dynamic,OfdmaRR,5,1,0,0,1,0.15,1,table,O,1,0,10,508.4868365,1,2,all,mean,,,UO-0,,3.0

@@ -1,0 +1,62 @@
+# README example 3: a full regenerative pass, horizon -> zenith -> horizon, four UEs.
+# python3 ntn/scripts/run_leo_link_analysis.py --param-file ntn/params/leo_link_full_pass_4ue.txt
+
+duration=600
+precision=1000
+
+# The pass: from 10 deg (the lowest elevation the 3GPP NTN channel covers) through zenith and back.
+observer_mode=full-pass
+observer_elevation_boundary_deg=10.0
+
+# The default link budget, TR 38.821 study case 9 (the sc9handset preset), written out because the
+# harness passes every value: S-band 2 GHz, 30 MHz, 34 dBW/MHz, a 30 dBi satellite antenna,
+# NTN-Suburban, and the handheld, one element with two +/-45 deg ports, 0 dBi.
+scenario=NTN-Suburban
+frequency_hz=2000000000.0
+bandwidth_hz=30000000.0
+sat_eirp_dbw_per_mhz=34.0
+sat_antenna_gain_db=30.0
+vsat_antenna_gain_db=0.0
+
+# Four UEs in the study case's Set-1 S-band beam, 4.4127 deg HPBW (set by the preset), 50 km
+# across at nadir: the centre, 2 km, and two at the 25 km edge.
+num_ues=4
+ue_radii_km=0,2,25,25
+
+# Backlogged UDP, 1200-byte packets
+transport=udp
+udp_rate_mbps=-1
+udp_packet_size=1200
+
+# Link adaptation and HARQ
+use_fixed_mcs=0
+enable_harq_retx=1
+num_harq_process=32
+n1_delay=2
+n2_delay=2
+rlc_reordering_timer_ms=300
+
+# MIMO feedback, rank 1 as in the study case
+enable_mimo_feedback=1
+mimo_pm_search_method=ns3::NrPmSearchFull
+mimo_full_search_codebook=ns3::NrCbTwoPort
+mimo_rank_limit=1
+mimo_rank_threshold=0.0
+mimo_rank_technique=Sasaoka
+mimo_subband_size=32
+mimo_downsampling_technique=FirstPRB
+
+gnb_antenna_rows=1
+gnb_antenna_columns=1
+gnb_num_vertical_ports=1
+gnb_num_horizontal_ports=1
+gnb_is_dual_polarized=1
+gnb_pol_slant_angle_deg=0.0
+ue_antenna_rows=1
+ue_antenna_columns=1
+ue_num_vertical_ports=1
+ue_num_horizontal_ports=1
+ue_is_dual_polarized=1
+ue_pol_slant_angle_deg=45.0
+
+throughput_window_s=1.0

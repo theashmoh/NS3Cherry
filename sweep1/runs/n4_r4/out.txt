@@ -1,0 +1,184 @@
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| NR-NTN VOICE CELL                                 transparent, NTN-Rural, 5 MHz FDD, DL 2.175 / UL 1.985 GHz, 4 downlink calls |
++--------------------------------------------------------------------------------------------------------------------------------+
+
+VOICE
+  source          RTP, codec 4.75 kbit/s = 95 bits per 20 ms frame: 12 B voice frames
+                  (the bits of the frame alone; with the 10-bit payload header of RFC 4867 it is 14 B: --voicePayload=14)
+  silence (DTX)   7 more voice frames (hangover), then a 7 B SID at once and every 160 ms
+  headers         IP 20 + UDP 8 + RTP 12 = 40 B on every packet
+  ROHC            size table: UO-0 3 B, UOR-2-EXT-3 13 B, IR 39 B (1 at the start)
+  ROHC context    over 13 packets missing in a row: needs UOR-2-EXT-3 or IR; over 61: needs IR
+                  (UO-0 has 4 sequence number bits, UOR-2 6; with p = 1, RFC 3095 5.7, that is 2^4 - 3 and 2^6 - 3)
+  ROHC repair     O-mode: NACK or STATIC-NACK on the reverse link at the first packet it cannot restore, again every 32
+                  such packets (none for lost packets the window covers; RFC 3095 5.3.2.2.3, k_1 of the last n_1 = 1 of 1)
+  layer 2         PDCP 1 + RLC 1 + MAC 3 = 5 B, as TR 26.940 5.2.3 counts them; NR has the same 5 B as PDCP 2 + RLC 1 + MAC 2
+  below the MAC   voice 12 + 3 + 5 = 20 B, SID 7 + 3 + 5 = 15 B, 10 B more on a context update
+  bearer          5QI 1 for every UE: GBR, GFBR 40.00 kbit/s (talking: 20.80), 1 % error rate
+  delay budget    100 ms UE-UPF, of which UPF-gateway takes 2.90 ms in this run: 97.10 ms are left for the radio side, gateway-UE
+                  (TS 23.501 5.7.3.4 takes a fixed 20 ms off for 5QI 1: --upfGwDelayMinMs=20 --upfGwDelayMaxMs=20)
+  late packets    the gNB discards a new packet while its oldest has waited over 97 ms (that budget, in whole ms); a UE never does
+
+CELL
+  satellite       600 km, Set-1 LEO-600 of TR 38.821: EIRP 34.00 dBW/MHz = 70.99 dBm, antenna 30.00 dBi,
+                  G/T 1.10 dB/K (noise figure 4.28 dB)
+  beam            2.00 m aperture: 4.0575 deg wide at 3 dB on the downlink, 4.4461 deg on the uplink carrier
+  UEs             UE 0 on the beam centre, the others at random places of the beam area
+  beam area       42.5 km north-south x 42.5 km east-west, 1419 km2
+  LOS, shadowing  each UE keeps its obstruction and shadowing levels for the whole run
+  interference    none: one beam, no other cell; every SINR here is a signal-to-noise ratio
+  scheduler       TDMA (a UE gets whole symbols), round robin
+  HARQ            up to 4 transmissions of a block, combined by the receiver (incremental redundancy); 16 processes per UE
+  link adaptation downlink: a first transmission aims at 15 % block errors (outer loop on the HARQ feedback)
+  control         a DCI is lost at the block error rate of its aggregation level at the SINR it arrives with
+  link failure    when a level-8 PDCCH with 4 dB more power would lose over 10 % (below -13.82 dB), over the last 200 ms,
+                  and a level-4 PDCCH not under 2 % again (above -5.93 dB) within 1.00 s
+  after a failure no service until the level-4 PDCCH loses under 2 % again, then the UE attaches again
+
+PDCCH
+  CORESET         24 RB x 1, 2 or 3 symbols = 4, 8 or 12 CCEs as the slot needs; a DCI is 34 + 24 CRC bits
+                  (format 1_0 on 26 RB has 37 bits, TS 38.212 7.3.1.2.1: --dciBits=37)
+  level           the lowest that loses up to 1.00 % of the DCIs at the SINR the UE reported:
+                  level 1 from 0.40 dB, 2 from -2.61 dB, 4 from -5.62 dB, 8 from -8.63 dB
+                  level-1 BLER, dB:BLER (--pdcchBlerTable): -4:0.9303 -2:0.4356 -1:0.1453 0:0.0246 0.5:0.00797 1:0.00221
+  candidates      6/6/4/2 per UE at level 1/2/4/8; SIB1 and random access at level 8; a UE monitors 72 (limit 44)
+  order in a slot SIB1 (every 20 ms), random access, uplink grants (50 % of the CCEs if the downlink wants them too),
+                  downlink assignments; retransmissions first, then new data as the scheduler ranks the UEs
+  voice           dynamic scheduling: every block has a DCI
+
+GEOMETRY AND DELAY
+  satellite       flies south at 7.56 km/s, is over UE 0 at t = 255.24 s and down at 10 deg again at t = 509.49 s
+  calls           UE 0: t = 1.00 s to 509.49 s, the whole pass; call i starts i x 1 ms after UE 0's,
+                  is on only while the satellite is 10 deg or more above its own UE, and ends with UE 0's at the latest
+  UE 0            elevation -10.00 -> +10.00 deg (- before it is overhead, + after), slant range 1931.64 -> 1931.64 km
+  gateway         N 60.6 km, E 18.2 km from UE 0 (random in a circle of 200 km diameter)
+                  elevation -10.89 -> +9.15 deg, slant range 1871.06 -> 1992.49 km
+  feeder link     gateway 60.00 dBm, satellite receive gain 30.00 dBi
+  delay to UE 0   32.68 ms = 17.10 host-UPF + 2.90 UPF-gateway + 6.24 feeder + 6.44 service, one way, when its call starts
+                  33.09 ms = 17.10 host-UPF + 2.90 UPF-gateway + 6.65 feeder + 6.44 service when it ends
+  round trip      26.47 ms on the radio at most, at t = 511.40 s  =>  K_offset 27 slots for the whole run
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| CALLS                                                                              one line per call; delay: remote host to UE |
++--------------------------------------------------------------------------------------------------------------------------------+
+flow   UE address  N[km]  E[km]  beam[dB]  SF[dB]   VAF    tx    rx  lost  delay[ms]  jitter[ms]  LOS[%]  RLF  out[s]  DL SINR[dB]
+   1      7.0.0.2    0.0    0.0     -0.00    1.31  0.39 11647 11647     0     36.938       7.865     100    0    0.00         12.0
+   2      7.0.0.3    9.7  -12.3     -0.55   -0.60  0.54 16027 16027     0     37.280       7.970     100    0    0.00          9.4
+   3      7.0.0.4    3.7   14.3     -0.54   -1.81  0.79 21735 21735     0     37.421       7.817     100    0    0.00          8.4
+   4      7.0.0.5   17.9   -2.8     -0.53   -1.00  0.53 16059 16059     0     36.970       8.024     100    0    0.00          8.9
+N, E: where the UE is, north and east of the beam centre. beam, SF: beam gain and shadow fading there (negative: weaker).
+RLF: radio link failures. out: time of the call without a connection after them. DL SINR: of the control symbols received.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| LOST PACKETS BY CAUSE                                                                 in packets, and in % of the packets sent |
++--------------------------------------------------------------------------------------------------------------------------------+
+flow   UE address    tx    rx  lost  no conn.  discard  radio  ROHC  link[%]  ROHC[%]
+   1      7.0.0.2 11647 11647     0         0        0      0     0     0.00     0.00
+   2      7.0.0.3 16027 16027     0         0        0      0     0     0.00     0.00
+   3      7.0.0.4 21735 21735     0         0        0      0     0     0.00     0.00
+   4      7.0.0.5 16059 16059     0         0        0      0     0     0.00     0.00
+ all              65468 65468     0         0        0      0     0     0.00     0.00
+no conn.: the UE had no connection. discard: the sender did not take it, the oldest packet in its queue had waited too long.
+radio: sent, did not arrive. ROHC: arrived, but the header could not be restored. link = no conn. + discard + radio.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| VOICE AGAINST 5QI 1 (TS 23.501 Table 5.7.4-1)                  at most 100 ms UE-UPF for 98 % of the packets, at most 1 % lost |
++--------------------------------------------------------------------------------------------------------------------------------+
+flow   UE address  on bearer  in PDB  late  discard  lost  over PDB[%]  PER[%]  mean[ms]   98%[ms]   max[ms]  kbit/s  missed
+   1      7.0.0.2      11647   11647     0        0     0         0.00    0.00    19.838    49.374    80.596    20.8  -
+   2      7.0.0.3      16027   16027     0        0     0         0.00    0.00    20.180    49.970    80.697    20.8  -
+   3      7.0.0.4      21735   21735     0        0     0         0.00    0.00    20.321    49.687    83.204    20.8  -
+   4      7.0.0.5      16059   16059     0        0     0         0.00    0.00    19.870    49.313    80.575    20.8  -
+ all                   65468   65468     0        0     0         0.00    0.00    20.090    49.600    83.204    20.8  0 calls
+on bearer: packets the voice bearer was given. in PDB, late: delivered within, after the budget; late is not lost.
+lost = radio + ROHC. over PDB = late + discard, PER = lost, both in % of on bearer. mean, 98%, max: delay UE to UPF.
+kbit/s: the highest mean over 2 s. missed: PDB if over PDB is above 2 %, PER if PER is above 1 %.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| PDCCH                                                         t = 1.00 s to 509.49 s: 508488 slots, 78961 (15.53 %) with a DCI |
++--------------------------------------------------------------------------------------------------------------------------------+
+CCEs: 279393 used of 6101856 possible (508488 slots x 12 CCEs) = utilization 4.58 %; 100763 DCIs, 2.77 CCEs each.
+PDCCH symbols: 1 in 53519 slots (67.78 %), 2 in 3708 slots (4.70 %), 3 in 21734 slots (27.52 %); 1.60 on average.
+The symbols the slots took (1 where there was no DCI) held 2222656 CCEs; 12.57 % of these were used.
+
+purpose                     DCIs    CCEs  CCEs[%]  blocked  blocked[%]
+system information (SIB1)  25425  203400     3.33        0        0.00
+random access response         0       0     0.00        0        0.00
+downlink, new data         65468   66005     1.08        4        0.01
+downlink, retransmission    9858    9976     0.16        0        0.00
+uplink, new data               4       4     0.00        0        0.00
+uplink, retransmission         8       8     0.00        0        0.00
+all                       100763  279393     4.58        4        0.00
+CCEs[%]: of the 6101856 CCEs possible. blocked: not sent, no candidate had all its CCEs free; its UE was not
+scheduled in that slot.
+
+level    DCIs  DCIs[%]    CCEs  CCEs[%]  from[dB]  missed  missed[%]
+    1   74927    74.36   74927     1.23      0.40     113       0.15
+    2     323     0.32     646     0.01     -2.61       0       0.00
+    4      71     0.07     284     0.00     -5.62       0       0.00
+    8   25442    25.25  203536     3.34     -8.63       0       0.00
+  all  100763   100.00  279393     4.58               113       0.15
+DCIs[%]: of the DCIs. CCEs[%]: of the CCEs possible, as above. from: the level is used from this reported SINR on.
+missed: DCIs their UE did not decode.
+  NOTE: 5 DCIs went to a UE whose reported SINR was below what the highest level needs for 1.00 %
+  NOTE: 2 PDCCH candidates were kept for a UE that then got no data resources in the slot
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| SATELLITE SEEN FROM EACH UE DURING ITS CALL                                                                                    |
++--------------------------------------------------------------------------------------------------------------------------------+
+                                  ----- elevation [deg] ----- -------- slant range [km] --------- ------- delay [ms] --------
+flow   UE address from[s]   to[s]  start    end    low   high    start      end      min      max  start    end    min    max
+   1      7.0.0.2    1.00  509.49 -10.00 +10.00  10.00  90.00  1931.64  1931.64   600.00  1931.64 32.684 33.089 24.009 33.089
+   2      7.0.0.3    1.00  508.20 -10.12 +10.00  10.00  88.65  1922.97  1931.64   600.15  1931.64 32.655 33.060 24.008 33.060
+   3      7.0.0.4    1.00  508.81 -10.07 +10.00  10.00  88.54  1927.09  1931.64   600.18  1931.64 32.669 33.074 24.009 33.074
+   4      7.0.0.5    1.00  506.93 -10.25 +10.00  10.00  89.58  1914.22  1931.64   600.01  1931.64 32.626 33.031 24.006 33.031
+from, to: when the call started and ended. elevation: - before the satellite is overhead, + after; low, high: of the call.
+delay: one way, remote host -> UPF -> gateway -> satellite -> UE, propagation only.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| ROHC COMPRESSOR (SENDER)                                                                one line per connection (RNTI) of a UE |
++--------------------------------------------------------------------------------------------------------------------------------+
+       UE address  RNTI LCID dir mode  packets  in IR/FO/SO       header B/pkt  saved  feedback rcvd
+          7.0.0.2     1    3  DL    O    11647  1/0/11646         40.0 ->  3.1  72.1%          1/0/0
+          7.0.0.3     3    3  DL    O    16027  1/0/16026         40.0 ->  3.2  71.4%          1/0/0
+          7.0.0.4     2    3  DL    O    21735  1/0/21734         40.0 ->  3.1  71.1%          1/0/0
+          7.0.0.5     4    3  DL    O    16059  1/0/16058         40.0 ->  3.2  71.4%          1/0/0
+mode: the one it ended in. in IR/FO/SO: packets it sent in each state. saved: of the bytes of the whole packets.
+feedback rcvd: the ACK/NACK/STATIC-NACK that reached it.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| ROHC DECOMPRESSOR (RECEIVER)                                                            one line per connection (RNTI) of a UE |
++--------------------------------------------------------------------------------------------------------------------------------+
+       UE address  RNTI LCID dir     sent  arrived  restored  failed  restored[%]  context lost  for[s]  net saved  feedback sent
+          7.0.0.2     1    3  DL    11647    11647     11647       0        100.0             0    0.00      72.1%          1/0/0
+          7.0.0.3     3    3  DL    16027    16027     16027       0        100.0             0    0.00      71.4%          1/0/0
+          7.0.0.4     2    3  DL    21735    21735     21735       0        100.0             0    0.00      71.1%          1/0/0
+          7.0.0.5     4    3  DL    16059    16059     16059       0        100.0             0    0.00      71.4%          1/0/0
+sent: by the compressor. arrived: of these, reached the decompressor. restored: header put back, also in % of arrived.
+failed: dropped, the context could not restore the header. context lost: runs of failed packets; for[s]: their time in all.
+net saved: 1 - bytes arrived / bytes of the packets restored from them. feedback sent: ACK/NACK/STATIC-NACK.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| ROHC MODE OF THE COMPRESSOR                                                             one line per connection (RNTI) of a UE |
++--------------------------------------------------------------------------------------------------------------------------------+
+       UE address  RNTI LCID dir  U from[s]  packets  O from[s]  packets  last packet[s]  O-mode started by
+          7.0.0.2     1    3  DL      1.020        5      1.117    11642         509.480  ACK sent at 1.037 s
+          7.0.0.3     3    3  DL      1.021        7      1.150    16020         508.221  ACK sent at 1.038 s
+          7.0.0.4     2    3  DL      1.022        8      1.183    21727         508.822  ACK sent at 1.039 s
+          7.0.0.5     4    3  DL      1.023        7      1.152    16052         506.943  ACK sent at 1.040 s
+U-mode from its first packet (U from), O-mode once feedback that asks for it has arrived (O from). It does not go back to
+U-mode; the next connection of the UE starts in U-mode again.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| ROHC PACKET TYPES                                                                            in % of the packets of the bearer |
++--------------------------------------------------------------------------------------------------------------------------------+
+       UE address  RNTI LCID dir mode  packets      IR  UOR-2-EXT-3    UO-0
+          7.0.0.2     1    3  DL    O    11647     0.0          1.5    98.5
+          7.0.0.3     3    3  DL    O    16027     0.0          1.7    98.3
+          7.0.0.4     2    3  DL    O    21735     0.0          1.5    98.5
+          7.0.0.5     4    3  DL    O    16059     0.0          1.5    98.5
+    all bearers                          65468     0.0          1.5    98.4
+    mean ROHC header [B]                          39.0         13.0     3.0
+
+CSV: /home/ashkan/ns-3-dev-NTN-main/sweep1/runs/n4_r4/run_calls.csv, _delays.csv, _pdcch.csv, _rohc.csv, _rohc_types.csv

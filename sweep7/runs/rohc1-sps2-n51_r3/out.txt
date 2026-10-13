@@ -1,0 +1,706 @@
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| NR-NTN VOICE CELL                                transparent, NTN-Rural, 5 MHz FDD, DL 2.175 / UL 1.985 GHz, 51 downlink calls |
++--------------------------------------------------------------------------------------------------------------------------------+
+
+VOICE
+  source          RTP, codec 4.75 kbit/s = 95 bits per 20 ms frame: 12 B voice frames
+                  (the bits of the frame alone; with the 10-bit payload header of RFC 4867 it is 14 B: --voicePayload=14)
+  silence (DTX)   7 more voice frames (hangover), then a 7 B SID at once and every 160 ms
+  headers         IP 20 + UDP 8 + RTP 12 = 40 B on every packet
+  ROHC            size table: UO-0 3 B, UOR-2-EXT-3 13 B, IR 39 B (1 at the start)
+  ROHC context    over 13 packets missing in a row: needs UOR-2-EXT-3 or IR; over 61: needs IR
+                  (UO-0 has 4 sequence number bits, UOR-2 6; with p = 1, RFC 3095 5.7, that is 2^4 - 3 and 2^6 - 3)
+  ROHC repair     O-mode: NACK or STATIC-NACK on the reverse link at the first packet it cannot restore, again every 32
+                  such packets (none for lost packets the window covers; RFC 3095 5.3.2.2.3, k_1 of the last n_1 = 1 of 1)
+  layer 2         PDCP 1 + RLC 1 + MAC 3 = 5 B, as TR 26.940 5.2.3 counts them; NR has the same 5 B as PDCP 2 + RLC 1 + MAC 2
+  below the MAC   voice 12 + 3 + 5 = 20 B, SID 7 + 3 + 5 = 15 B, 10 B more on a context update
+  bearer          5QI 1 for every UE: GBR, GFBR 40.00 kbit/s (talking: 20.80), 1 % error rate
+  delay budget    100 ms UE-UPF, of which UPF-gateway takes 3.85 ms in this run: 96.15 ms are left for the radio side, gateway-UE
+                  (TS 23.501 5.7.3.4 takes a fixed 20 ms off for 5QI 1: --upfGwDelayMinMs=20 --upfGwDelayMaxMs=20)
+  late packets    the gNB discards a new packet while its oldest has waited over 96 ms (that budget, in whole ms); a UE never does
+
+CELL
+  satellite       600 km, Set-1 LEO-600 of TR 38.821: EIRP 34.00 dBW/MHz = 70.99 dBm, antenna 30.00 dBi,
+                  G/T 1.10 dB/K (noise figure 4.28 dB)
+  beam            2.00 m aperture: 4.0575 deg wide at 3 dB on the downlink, 4.4461 deg on the uplink carrier
+  handheld        23 dBm, antenna -5.00 dBi on both carriers (--ueAntennaGainDbi), noise figure 7 dB
+  UEs             UE 0 on the beam centre, the others at random places of the beam area
+  beam area       42.5 km north-south x 42.5 km east-west, 1419 km2
+  LOS, shadowing  each UE keeps its obstruction and shadowing levels for the whole run
+  interference    none: one beam, no other cell; every SINR here is a signal-to-noise ratio
+  scheduler       OFDMA (a UE gets resource block groups), round robin
+  HARQ            up to 4 transmissions of a block, combined by the receiver (incremental redundancy); 16 processes per UE
+  link adaptation downlink: a first transmission aims at 15 % block errors (outer loop on the HARQ feedback)
+                  OFDMA: a HARQ retransmission takes resource block groups of the symbols new data has, which other UEs share
+                  a semi-persistent block keeps the MCS of its activation, so its error rate is not that target's;
+                  to compare the schemes without that, give all of them a low one: --targetBler=0.01
+  control         a DCI is lost at the block error rate of its aggregation level at the SINR it arrives with
+  link failure    when a level-8 PDCCH with 4 dB more power would lose over 10 % (below -13.82 dB), over the last 200 ms,
+                  and a level-4 PDCCH not under 2 % again (above -5.93 dB) within 1.00 s
+  after a failure no service until the level-4 PDCCH loses under 2 % again, then the UE attaches again
+
+PDCCH
+  CORESET         24 RB x 1, 2 or 3 symbols = 4, 8 or 12 CCEs as the slot needs; a DCI is 34 + 24 CRC bits
+                  (format 1_0 on 26 RB has 37 bits, TS 38.212 7.3.1.2.1: --dciBits=37)
+  level           the lowest that loses up to 1.00 % of the DCIs at the SINR the UE reported:
+                  level 1 from 0.40 dB, 2 from -2.61 dB, 4 from -5.62 dB, 8 from -8.63 dB
+                  level-1 BLER, dB:BLER (--pdcchBlerTable): -4:0.9303 -2:0.4356 -1:0.1453 0:0.0246 0.5:0.00797 1:0.00221
+  candidates      6/6/4/2 per UE at level 1/2/4/8; SIB1 and random access at level 8; a UE monitors 72 (limit 44)
+  order in a slot SIB1 (every 20 ms), random access, uplink grants (50 % of the CCEs if the downlink wants them too),
+                  downlink assignments; retransmissions first, then new data as the scheduler ranks the UEs
+  voice           semi-persistent, scenario 2: talk: a block every 20 ms; silence: every 160 ms; a change is 2 DCIs
+                  downlink (SPS): 20 B and 15 B blocks, up to 10 B larger for the first packet after a change
+                  uplink (configured grant Type 2): 41 B and 36 B blocks = 20 B and 15 B + 10 B for a first packet
+                  + 5 B BSR (nr module; 3GPP: 2 B) + 6 B confirmation MAC CE
+  to silence      downlink: at the first SID (25 B) 1 DCI releases the talk configuration, 1 activates the silence one with
+                  the SID in its first block. Uplink: the first SID comes in a talk block, the 2 DCIs one silence period later
+                  (none if the speaker talks again before that)
+  to voice        downlink: the same at the first voice frame (30 B). Uplink: its scheduling request gets a dynamic grant
+                  (1 DCI), then the 2 DCIs: the talk configuration starts with the next frame
+
+GEOMETRY AND DELAY
+  satellite       flies south at 7.56 km/s, is over UE 0 at t = 255.24 s and down at 10 deg again at t = 509.49 s
+  calls           UE 0: t = 1.00 s to 509.49 s, the whole pass; call i starts i x 1 ms after UE 0's,
+                  is on only while the satellite is 10 deg or more above its own UE, and ends with UE 0's at the latest
+  UE 0            elevation -10.00 -> +10.00 deg (- before it is overhead, + after), slant range 1931.64 -> 1931.64 km
+  gateway         N 62.5 km, E -38.5 km from UE 0 (random in a circle of 200 km diameter)
+                  elevation -10.86 -> +9.16 deg, slant range 1873.32 -> 1991.09 km
+  feeder link     gateway 60.00 dBm, satellite receive gain 30.00 dBi
+  delay to UE 0   32.69 ms = 16.15 host-UPF + 3.85 UPF-gateway + 6.25 feeder + 6.44 service, one way, when its call starts
+                  33.08 ms = 16.15 host-UPF + 3.85 UPF-gateway + 6.64 feeder + 6.44 service when it ends
+  round trip      26.48 ms on the radio at most, at t = 511.40 s  =>  K_offset 27 slots for the whole run
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| CALLS                                                                              one line per call; delay: remote host to UE |
++--------------------------------------------------------------------------------------------------------------------------------+
+flow   UE address  N[km]  E[km]  beam[dB]  SF[dB]   VAF    tx    rx  lost  delay[ms]  jitter[ms]  LOS[%]  RLF  out[s]  DL SINR[dB]
+   1      7.0.0.2    0.0    0.0     -0.00   -2.03  0.51 15368  7928  7440     35.499       7.509      57    2  216.04          6.9
+   2      7.0.0.4   16.4    1.7     -0.42   -1.61  0.64 19112 19111     1     38.363       7.243     100    0    0.00          3.6
+   3      7.0.0.5    3.5    0.1     -0.02   -1.31  0.37 12734 12731     3     38.227       7.382     100    0    0.00          4.6
+   4      7.0.0.6    5.4  -12.2     -0.44   -1.19  0.56 15296 12521  2775     37.327       7.890      82    2   88.65          5.2
+   5      7.0.0.7    2.4    5.1     -0.07    1.14  0.39 11397 11397     0     37.172       6.711     100    0    0.00          6.7
+   6      7.0.0.8    6.9   15.1     -0.66    4.76  0.38 11037 11020    17     40.433       8.270      82    0    0.00          6.7
+   7     7.0.0.14   18.3    9.3     -0.73    1.07  0.52 14549 12133  2416     37.712       8.032      83    2   86.53          5.6
+   8     7.0.0.16   18.4    3.8     -0.55   -0.12  0.62 17515 17515     0     37.915       7.237     100    0    0.00          4.7
+   9     7.0.0.17    1.1   -7.8     -0.16    0.54  0.26  8885  7035  1850     36.188       7.031      82    2   88.79          6.4
+  10     7.0.0.18    7.9    5.5     -0.17   -1.13  0.42 14394 14391     3     38.198       7.171     100    0    0.00          4.5
+  11     7.0.0.19    1.7   11.3     -0.33    0.82  0.81 22527 12923  9604     35.649       7.390      57    2  215.43          7.0
+  12     7.0.0.23   19.3   -4.9     -0.66   -2.16  0.73 20475 16952  3523     37.668       8.010      83    2   86.41          4.2
+  13     7.0.0.25   19.4    2.8     -0.60    4.73  0.54 16551  3852 12699     60.548      17.679       3    2  384.46         -0.4
+  14     7.0.0.26    7.0    5.4     -0.14   -1.43  0.46 14392 14391     1     37.942       7.377     100    0    0.00          4.3
+  15     7.0.0.27    5.4    6.7     -0.15    0.03  0.72 20466 20466     0     37.648       6.388     100    0    0.00          5.6
+  16     7.0.0.20    0.1   -3.8     -0.04   -0.99  0.46 12078 12076     2     37.569       6.883     100    0    0.00          4.9
+  17     7.0.0.30    0.3   10.1     -0.27   -0.32  0.29 10577 10577     0     37.605       6.857     100    0    0.00          5.1
+  18     7.0.0.31   20.8    1.5     -0.68   -1.64  0.47 14448 14447     1     38.368       7.718     100    0    0.00          3.1
+  19     7.0.0.33    9.2   -7.3     -0.28   -3.19  0.65 18721 10841  7880     36.917       7.798      57    2  214.36          6.1
+  20     7.0.0.35   12.5   15.7     -0.87    1.04  0.47 13750 13750     0     37.546       7.462     100    0    0.00          5.4
+  21     7.0.0.36    4.2  -18.3     -0.93   -1.60  0.29 10222  8303  1919     37.272       8.330      82    2   88.97          4.3
+  22     7.0.0.38   20.3   -4.2     -0.71    0.89  0.48 16350 16350     0     37.609       6.860     100    0    0.00          5.4
+  23     7.0.0.40    1.9   -3.1     -0.03    1.34  0.51 15750 15750     0     37.056       6.312     100    0    0.00          7.0
+  24     7.0.0.41    9.9   -1.8     -0.16   -1.96  0.49 14914 14914     0     38.007       7.183     100    0    0.00          3.8
+  25     7.0.0.42    4.6   20.1     -1.09    1.56  0.39 12411 12411     0     37.550       7.073     100    0    0.00          5.6
+  26     7.0.0.43    9.3    5.6     -0.21   -1.57  0.47 14366 14365     1     38.231       7.389     100    0    0.00          4.0
+  27     7.0.0.46    7.4  -14.6     -0.66   -0.32  0.75 21321 21321     0     38.137       6.873     100    0    0.00          4.5
+  28     7.0.0.47   -0.5   17.9     -0.85   -8.40  0.55 16466  9276  7190     38.196       8.799      57    2  215.66          4.0
+  29     7.0.0.48   13.9   11.5     -0.63    2.47  0.30 10508 10508     0     37.167       6.093     100    0    0.00          7.1
+  30     7.0.0.49    1.9    5.6     -0.09   -1.37  0.54 15439 15437     2     38.032       6.907     100    0    0.00          4.4
+  31     7.0.0.52   -0.1   16.7     -0.73   -0.77  0.45 14290 14290     0     38.049       7.468     100    0    0.00          4.0
+  32     7.0.0.28   -0.5   -0.5     -0.00   -0.01  0.66 18990 18989     1     37.883       6.483     100    0    0.00          5.8
+  33     7.0.0.32   -2.4   10.6     -0.30   -4.92  0.49 15615   492 15123     35.860       8.170       3    2  493.62          7.9
+  34      7.0.0.9   -2.1   -4.2     -0.05   -2.50  0.41 13392 13392     0     36.960       6.926     100    0    0.00          3.5
+  35     7.0.0.37   -4.3    7.7     -0.19    0.39  0.43 12646 12646     0     37.388       6.796     100    0    0.00          5.9
+  36     7.0.0.44   -5.1   18.1     -0.92    0.86  0.47 14108 14108     0     36.591       7.334     100    0    0.00          5.2
+  37     7.0.0.29   -5.3    4.3     -0.09    0.08  0.49 14624 14624     0     36.368       6.794     100    0    0.00          5.7
+  38     7.0.0.15   -3.8  -18.6     -0.92   -0.30  0.56 17000 17000     0     37.455       7.226     100    0    0.00          4.1
+  39     7.0.0.51   -5.6    6.6     -0.16    0.50  0.34 10340 10340     0     36.849       6.423     100    0    0.00          6.0
+  40     7.0.0.11   -4.9  -16.3     -0.72   -8.17  0.40 11468   296 11172     36.813      10.088       3    2  493.78          6.4
+  41     7.0.0.50   -6.5   -2.1     -0.07    2.98  0.45 13508  8706  4802     38.402       7.906      57    2  190.70          7.6
+  42     7.0.0.22   -7.3   -9.6     -0.31    0.76  0.48 14125 14125     0     37.389       6.764     100    0    0.00          6.0
+  43     7.0.0.34   -7.8  -18.9     -1.02   -1.17  0.54 15471 15467     4     37.755       7.743     100    0    0.00          3.2
+  44     7.0.0.10   -8.1  -17.6     -0.90   -0.34  0.76 21195 21194     1     37.527       7.183     100    0    0.00          4.1
+  45     7.0.0.21  -10.5   16.4     -0.91   -2.49  0.61 17801 17794     7     39.115       7.790     100    0    0.00          2.2
+  46     7.0.0.13  -13.3  -14.0     -0.77    0.77  0.41 13513 13513     0     36.779       6.959     100    0    0.00          5.3
+  47     7.0.0.12  -14.2   -2.6     -0.32   -0.61  0.34 12964 12964     0     36.784       6.950     100    0    0.00          4.6
+  48     7.0.0.39  -14.4   -3.3     -0.34    0.04  0.59 16343 16342     1     37.577       6.921     100    0    0.00          5.2
+  49      7.0.0.3  -16.8    6.7     -0.57    0.98  0.34 10170 10168     2     36.540       7.366     100    0    0.00          5.7
+  50     7.0.0.45  -17.3    3.6     -0.51    4.13  0.50 16101 11768  4333     42.113       9.279      58    2  150.32          6.5
+  51     7.0.0.24  -19.8   -1.2     -0.62   -1.64  0.44 13465 13463     2     37.852       7.243     100    0    0.00          3.2
+N, E: where the UE is, north and east of the beam centre. beam, SF: beam gain and shadow fading there (negative: weaker).
+RLF: radio link failures. out: time of the call without a connection after them. DL SINR: of the control symbols received.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| LOST PACKETS BY CAUSE                                                                 in packets, and in % of the packets sent |
++--------------------------------------------------------------------------------------------------------------------------------+
+flow   UE address    tx    rx  lost  no conn.  discard  radio  ROHC  link[%]  ROHC[%]
+   1      7.0.0.2 15368  7928  7440      7377        0     63     0    48.41     0.00
+   2      7.0.0.4 19112 19111     1         0        0      1     0     0.01     0.00
+   3      7.0.0.5 12734 12731     3         0        0      3     0     0.02     0.00
+   4      7.0.0.6 15296 12521  2775      2710        1     64     0    18.14     0.00
+   5      7.0.0.7 11397 11397     0         0        0      0     0     0.00     0.00
+   6      7.0.0.8 11037 11020    17         0        2     15     0     0.15     0.00
+   7     7.0.0.14 14549 12133  2416      2397        1     18     0    16.61     0.00
+   8     7.0.0.16 17515 17515     0         0        0      0     0     0.00     0.00
+   9     7.0.0.17  8885  7035  1850      1832        1     17     0    20.82     0.00
+  10     7.0.0.18 14394 14391     3         0        0      3     0     0.02     0.00
+  11     7.0.0.19 22527 12923  9604      9519        2     83     0    42.63     0.00
+  12     7.0.0.23 20475 16952  3523      3457        2     64     0    17.21     0.00
+  13     7.0.0.25 16551  3852 12699     12625        0     72     2    76.71     0.01
+  14     7.0.0.26 14392 14391     1         0        0      1     0     0.01     0.00
+  15     7.0.0.27 20466 20466     0         0        0      0     0     0.00     0.00
+  16     7.0.0.20 12078 12076     2         0        0      2     0     0.02     0.00
+  17     7.0.0.30 10577 10577     0         0        0      0     0     0.00     0.00
+  18     7.0.0.31 14448 14447     1         0        0      1     0     0.01     0.00
+  19     7.0.0.33 18721 10841  7880      7819        3     58     0    42.09     0.00
+  20     7.0.0.35 13750 13750     0         0        0      0     0     0.00     0.00
+  21     7.0.0.36 10222  8303  1919      1900        3     16     0    18.77     0.00
+  22     7.0.0.38 16350 16350     0         0        0      0     0     0.00     0.00
+  23     7.0.0.40 15750 15750     0         0        0      0     0     0.00     0.00
+  24     7.0.0.41 14914 14914     0         0        0      0     0     0.00     0.00
+  25     7.0.0.42 12411 12411     0         0        0      0     0     0.00     0.00
+  26     7.0.0.43 14366 14365     1         0        0      1     0     0.01     0.00
+  27     7.0.0.46 21321 21321     0         0        0      0     0     0.00     0.00
+  28     7.0.0.47 16466  9276  7190      7148        8     34     0    43.67     0.00
+  29     7.0.0.48 10508 10508     0         0        0      0     0     0.00     0.00
+  30     7.0.0.49 15439 15437     2         0        0      2     0     0.01     0.00
+  31     7.0.0.52 14290 14290     0         0        0      0     0     0.00     0.00
+  32     7.0.0.28 18990 18989     1         0        1      0     0     0.01     0.00
+  33     7.0.0.32 15615   492 15123     15063        0     60     0    96.85     0.00
+  34      7.0.0.9 13392 13392     0         0        0      0     0     0.00     0.00
+  35     7.0.0.37 12646 12646     0         0        0      0     0     0.00     0.00
+  36     7.0.0.44 14108 14108     0         0        0      0     0     0.00     0.00
+  37     7.0.0.29 14624 14624     0         0        0      0     0     0.00     0.00
+  38     7.0.0.15 17000 17000     0         0        0      0     0     0.00     0.00
+  39     7.0.0.51 10340 10340     0         0        0      0     0     0.00     0.00
+  40     7.0.0.11 11468   296 11172     11165        0      7     0    97.42     0.00
+  41     7.0.0.50 13508  8706  4802      4757        0     45     0    35.55     0.00
+  42     7.0.0.22 14125 14125     0         0        0      0     0     0.00     0.00
+  43     7.0.0.34 15471 15467     4         0        0      4     0     0.03     0.00
+  44     7.0.0.10 21195 21194     1         0        0      1     0     0.00     0.00
+  45     7.0.0.21 17801 17794     7         0        0      7     0     0.04     0.00
+  46     7.0.0.13 13513 13513     0         0        0      0     0     0.00     0.00
+  47     7.0.0.12 12964 12964     0         0        0      0     0     0.00     0.00
+  48     7.0.0.39 16343 16342     1         0        0      1     0     0.01     0.00
+  49      7.0.0.3 10170 10168     2         0        0      2     0     0.02     0.00
+  50     7.0.0.45 16101 11768  4333      4260        0     73     0    26.91     0.00
+  51     7.0.0.24 13465 13463     2         0        0      2     0     0.01     0.00
+ all             759148666373 92775     92029       24    720     2    12.22     0.00
+no conn.: the UE had no connection. discard: the sender did not take it, the oldest packet in its queue had waited too long.
+radio: sent, did not arrive. ROHC: arrived, but the header could not be restored. link = no conn. + discard + radio.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| VOICE AGAINST 5QI 1 (TS 23.501 Table 5.7.4-1)                  at most 100 ms UE-UPF for 98 % of the packets, at most 1 % lost |
++--------------------------------------------------------------------------------------------------------------------------------+
+flow   UE address  on bearer  in PDB  late  discard  lost  over PDB[%]  PER[%]  mean[ms]   98%[ms]   max[ms]  kbit/s  missed
+   1      7.0.0.2       7991    7927     1        0    63         0.01    0.79    19.349    47.469   111.620    20.8  -
+ 1.1       RNTI 1          8       0     0        0     8         0.00  100.00         -         -         -     1.6  PER
+ 1.2      RNTI 59       7983    7927     1        0    55         0.01    0.69    19.349    47.469   111.620    20.8  -
+   2      7.0.0.4      19112   19101    10        0     1         0.05    0.01    22.213    52.919   130.026    20.8  -
+   3      7.0.0.5      12734   12722     9        0     3         0.07    0.02    22.077    52.642   129.344    20.8  -
+   4      7.0.0.6      12586   12515     6        1    64         0.06    0.51    21.177    50.486   116.523    20.8  -
+ 4.1       RNTI 3          9       0     0        1     8        11.11   88.89         -         -         -     1.8  PDB PER
+ 4.2      RNTI 54      12577   12515     6        0    56         0.05    0.45    21.177    50.486   116.523    20.8  -
+   5      7.0.0.7      11397   11397     0        0     0         0.00    0.00    21.021    51.561    82.442    20.8  -
+   6      7.0.0.8      11037   10883   137        2    15         1.26    0.14    24.283    84.439   218.317    20.8  -
+   7     7.0.0.14      12152   12124     9        1    18         0.08    0.15    21.562    56.881   129.742    20.8  -
+ 7.1      RNTI 13          9       0     0        1     8        11.11   88.89         -         -         -     1.8  PDB PER
+ 7.2      RNTI 52      12143   12124     9        0    10         0.07    0.08    21.562    56.881   129.742    20.8  -
+   8     7.0.0.16      17515   17512     3        0     0         0.02    0.00    21.765    52.092   112.667    20.8  -
+   9     7.0.0.17       7053    7033     2        1    17         0.04    0.24    20.038    49.855   115.710    20.8  -
+ 9.1      RNTI 45         11       0     0        1    10         9.09   90.91         -         -         -     2.2  PDB PER
+ 9.2      RNTI 56       7042    7033     2        0     7         0.03    0.10    20.038    49.855   115.710    20.8  -
+  10     7.0.0.18      14394   14381    10        0     3         0.07    0.02    22.048    52.376   118.475    20.8  -
+  11     7.0.0.19      13008   12920     3        2    83         0.04    0.64    19.499    47.532   240.233    20.8  -
+11.1      RNTI 30         30       0     0        2    28         6.67   93.33         -         -         -     6.2  PDB PER
+11.2      RNTI 58      12978   12920     3        0    55         0.02    0.42    19.499    47.532   240.233    20.8  -
+  12     7.0.0.23      17018   16939    13        2    64         0.09    0.38    21.518    50.737   126.725    20.8  -
+12.1      RNTI 31         10       0     0        2     8        20.00   80.00         -         -         -     2.0  PDB PER
+12.2      RNTI 53      17008   16939    13        0    56         0.08    0.33    21.518    50.737   126.725    20.8  -
+  13     7.0.0.25       3926    3599   253        0    74         6.44    1.88    44.398   128.819   251.640    20.8  PDB PER
+13.1      RNTI 46         11       0     0        0    11         0.00  100.00         -         -         -     2.2  PER
+13.2      RNTI 63       3915    3599   253        0    63         6.46    1.61    44.398   128.819   251.640    20.8  PDB PER
+  14     7.0.0.26      14392   14381    10        0     1         0.07    0.01    21.792    52.455   117.005    20.8  -
+  15     7.0.0.27      20466   20464     2        0     0         0.01    0.00    21.498    52.176   114.777    20.8  -
+  16     7.0.0.20      12078   12072     4        0     2         0.03    0.02    21.419    51.546   126.697    20.8  -
+  17     7.0.0.30      10577   10575     2        0     0         0.02    0.00    21.455    52.521   114.146    20.8  -
+  18     7.0.0.31      14448   14436    11        0     1         0.08    0.01    22.218    52.641   113.567    20.8  -
+  19     7.0.0.33      10902   10832     9        3    58         0.11    0.53    20.767    58.104   159.406    20.8  -
+19.1      RNTI 48         23       0     0        3    20        13.04   86.96         -         -         -     4.7  PDB PER
+19.2      RNTI 57      10879   10832     9        0    38         0.08    0.35    20.767    58.104   159.406    20.8  -
+  20     7.0.0.35      13750   13747     3        0     0         0.02    0.00    21.396    51.658   114.291    20.8  -
+  21     7.0.0.36       8322    8299     4        3    16         0.08    0.19    21.122    50.583   126.971    20.8  -
+21.1      RNTI 17          9       0     0        3     6        33.33   66.67         -         -         -     1.8  PDB PER
+21.2      RNTI 55       8313    8299     4        0    10         0.05    0.12    21.122    50.583   126.971    20.8  -
+  22     7.0.0.38      16350   16349     1        0     0         0.01    0.00    21.459    51.685   114.189    20.8  -
+  23     7.0.0.40      15750   15750     0        0     0         0.00    0.00    20.906    51.400    93.377    20.8  -
+  24     7.0.0.41      14914   14906     8        0     0         0.05    0.00    21.857    52.518   113.986    20.8  -
+  25     7.0.0.42      12411   12411     0        0     0         0.00    0.00    21.400    52.279    84.794    20.8  -
+  26     7.0.0.43      14366   14354    11        0     1         0.08    0.01    22.081    52.473   126.084    20.8  -
+  27     7.0.0.46      21321   21315     6        0     0         0.03    0.00    21.987    52.322   121.112    20.8  -
+  28     7.0.0.47       9318    9265    11        8    34         0.20    0.36    22.046    59.378   125.391    20.8  -
+28.1      RNTI 43         32       0     0        8    24        25.00   75.00         -         -         -     6.8  PDB PER
+28.2      RNTI 60       9286    9265    11        0    10         0.12    0.11    22.046    59.378   125.391    20.8  -
+  29     7.0.0.48      10508   10507     1        0     0         0.01    0.00    21.017    51.623   113.104    20.8  -
+  30     7.0.0.49      15439   15428     9        0     2         0.06    0.01    21.882    52.735   127.438    20.8  -
+  31     7.0.0.52      14290   14282     8        0     0         0.06    0.00    21.899    51.974   115.810    20.8  -
+  32     7.0.0.28      18990   18978    11        1     0         0.06    0.00    21.733    52.435   191.318    20.8  -
+  33     7.0.0.32        552     485     7        0    60         1.27   10.87    19.709    43.280   247.289    20.8  PER
+33.1      RNTI 25          8       0     0        0     8         0.00  100.00         -         -         -     1.6  PER
+33.2      RNTI 64        544     485     7        0    52         1.29    9.56    19.709    43.280   247.289    20.8  PER
+  34      7.0.0.9      13392   13384     8        0     0         0.06    0.00    20.810    51.871   116.557    20.8  -
+  35     7.0.0.37      12646   12646     0        0     0         0.00    0.00    21.238    51.549    84.200    20.8  -
+  36     7.0.0.44      14108   14106     2        0     0         0.01    0.00    20.441    50.966   113.273    20.8  -
+  37     7.0.0.29      14624   14622     2        0     0         0.01    0.00    20.218    51.245   113.737    20.8  -
+  38     7.0.0.15      17000   16992     8        0     0         0.05    0.00    21.305    51.833   114.143    20.8  -
+  39     7.0.0.51      10340   10340     0        0     0         0.00    0.00    20.699    51.100    82.972    20.8  -
+  40     7.0.0.11        303     296     0        0     7         0.00    2.31    20.663    55.569    76.569    20.8  PER
+  41     7.0.0.50       8751    8556   150        0    45         1.71    0.51    22.252    94.439   222.943    20.8  -
+  42     7.0.0.22      14125   14124     1        0     0         0.01    0.00    21.239    51.633   111.704    20.8  -
+  43     7.0.0.34      15471   15455    12        0     4         0.08    0.03    21.605    51.933   134.747    20.8  -
+  44     7.0.0.10      21195   21186     8        0     1         0.04    0.00    21.377    51.891   126.881    20.8  -
+  45     7.0.0.21      17801   17761    33        0     7         0.19    0.04    22.965    61.057   175.369    20.8  -
+  46     7.0.0.13      13513   13510     3        0     0         0.02    0.00    20.628    50.919   113.089    20.8  -
+  47     7.0.0.12      12964   12964     0        0     0         0.00    0.00    20.634    51.435    82.185    20.8  -
+  48     7.0.0.39      16343   16338     4        0     1         0.02    0.01    21.427    51.929   113.920    20.8  -
+  49      7.0.0.3      10170   10162     6        0     2         0.06    0.02    20.390    50.867   164.323    20.8  -
+  50     7.0.0.45      11841   11493   275        0    73         2.32    0.62    25.963   111.988   283.508    20.8  PDB
+  51     7.0.0.24      13465   13452    11        0     2         0.08    0.01    21.702    52.824   119.678    20.8  -
+ all                  667119  665276  1097       24   722         0.17    0.11    21.663    52.471   283.508    20.8  4 calls
+on bearer: packets the voice bearer was given. in PDB, late: delivered within, after the budget; late is not lost.
+lost = radio + ROHC. over PDB = late + discard, PER = lost, both in % of on bearer. mean, 98%, max: delay UE to UPF.
+kbit/s: the highest mean over 2 s. missed: PDB if over PDB is above 2 %, PER if PER is above 1 %.
+n.1, n.2: call n had more than one connection: one line for the voice bearer of each, held against 5QI 1 on its own. A radio
+link failure ends a connection, the next one sets up a new bearer (RNTI as in the ROHC tables). The line of call n adds them up.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| PDCCH                                                        t = 1.00 s to 509.49 s: 508488 slots, 172510 (33.93 %) with a DCI |
++--------------------------------------------------------------------------------------------------------------------------------+
+CCEs: 481733 used of 6101856 possible (508488 slots x 12 CCEs) = utilization 7.89 %; 216353 DCIs, 2.23 CCEs each.
+PDCCH symbols: 1 in 138797 slots (80.46 %), 2 in 25125 slots (14.56 %), 3 in 8588 slots (4.98 %); 1.25 on average.
+The symbols the slots took (1 where there was no DCI) held 2203648 CCEs; 21.86 % of these were used.
+
+purpose                     DCIs    CCEs  CCEs[%]  blocked  blocked[%]
+system information (SIB1)  25425  203400     3.33        0        0.00
+random access response        12      96     0.00        0        0.00
+downlink, new data           920    2327     0.04     2091       69.45
+downlink, retransmission  111473  178344     2.92     3095        2.70
+downlink SPS activation    68031   83284     1.36     1041        1.51
+downlink SPS release       10331   13885     0.23      164        1.56
+uplink, new data              52     117     0.00        0        0.00
+uplink, retransmission       109     280     0.00        1        0.91
+uplink CG activation           0       0     0.00        0        0.00
+uplink CG release              0       0     0.00        0        0.00
+all                       216353  481733     7.89     6392        2.87
+CCEs[%]: of the 6101856 CCEs possible. blocked: not sent, no candidate had all its CCEs free; its UE was not
+scheduled in that slot.
+
+level    DCIs  DCIs[%]    CCEs  CCEs[%]  from[dB]  missed  missed[%]
+    1  151773    70.15  151773     2.49      0.40    3065       2.02
+    2   27024    12.49   54048     0.89     -2.61     377       1.40
+    4    6134     2.84   24536     0.40     -5.62     420       6.85
+    8   31422    14.52  251376     4.12     -8.63    2084      34.98
+  all  216353   100.00  481733     7.89              5946       3.11
+DCIs[%]: of the DCIs. CCEs[%]: of the CCEs possible, as above. from: the level is used from this reported SINR on.
+missed: DCIs their UE did not decode.
+  NOTE: 3643 DCIs went to a UE whose reported SINR was below what the highest level needs for 1.00 %
+  NOTE: 1 DCIs were sent at the highest level: their UE had not reported a SINR yet
+  NOTE: 466 PDCCH candidates were kept for a UE that then got no data resources in the slot
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| SPS AND CONFIGURED GRANT, SCENARIO 2         the blocks of the voice bearers that needed no DCI, and the DCIs that set them up |
++--------------------------------------------------------------------------------------------------------------------------------+
+direction     activations  releases    used   empty  empty[%]  in pieces  own DCI    lost
+downlink SPS        68031     10331  598446     650      0.11          0        1     865
+uplink CG               0         0       0       0      0.00          0        0       0
+CG: configured grant Type 2. used: occasions that carried data (the first block of a configuration comes with its
+activation DCI and is not among them). empty: an occasion with nothing to send. in pieces: a packet larger than the
+block, sent over this occasion and the next. own DCI: a larger packet that was sent with a DCI instead. lost: blocks
+the UE did not know of, it had missed the DCI that activated the configuration. in pieces and own DCI count every
+such packet; the next table has those that follow a change of the speaker.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| VOICE <-> SILENCE, SCENARIO 2                       how the first packet after the speaker started or stopped talking was sent |
++--------------------------------------------------------------------------------------------------------------------------------+
+direction  change            count  in a block  in pieces  RLC PDUs  own DCI  new configuration  DCIs
+downlink   voice -> silence   5096        5080          0         0       16               5077 10170
+downlink   silence -> voice   5068        5015          0         0       53               5055 10163
+uplink     voice -> silence      0           0          0         0        0                  0     0
+uplink     silence -> voice      0           0          0         0        0                  0     0
+count: changes the gNB saw, by the size of the first packet after each (a voice frame or a SID). in a block, in pieces,
+own DCI: how that packet was sent. in a block: whole, in a block of the configuration. in pieces: larger than the block,
+cut by the RLC and sent in this block and the next, 20 ms apart, as so many RLC PDUs. own DCI: with a dynamic assignment
+or grant, 1 DCI (uplink: for what a block left of it, or for its scheduling request; so comes every packet while no
+configuration is active). new configuration: the gNB released the configuration and activated the other one, 2 DCIs.
+DCIs: own DCI + 2 x new configuration. Uplink: as the gNB sees it (the RLC PDUs are those it received; a late SID that it
+takes for the start of a talk spurt makes it change the configuration for nothing, and back).
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| SATELLITE SEEN FROM EACH UE DURING ITS CALL                                                                                    |
++--------------------------------------------------------------------------------------------------------------------------------+
+                                  ----- elevation [deg] ----- -------- slant range [km] --------- ------- delay [ms] --------
+flow   UE address from[s]   to[s]  start    end    low   high    start      end      min      max  start    end    min    max
+   1      7.0.0.2    1.00  509.49 -10.00 +10.00  10.00  90.00  1931.64  1931.64   600.00  1931.64 32.692 33.085 24.014 33.085
+   2      7.0.0.4    1.00  507.11 -10.23 +10.00  10.00  89.93  1915.44  1931.64   600.00  1931.64 32.638 33.031 24.011 33.031
+   3      7.0.0.5    1.00  508.99 -10.05 +10.00  10.00  89.97  1928.20  1931.64   600.00  1931.64 32.680 33.073 24.013 33.073
+   4      7.0.0.6    1.00  508.81 -10.07 +10.00  10.00  88.69  1927.08  1931.64   600.14  1931.64 32.677 33.069 24.013 33.069
+   5      7.0.0.7    1.00  509.09 -10.04 +10.00  10.00  89.49  1928.88  1931.64   600.02  1931.64 32.683 33.076 24.013 33.076
+   6      7.0.0.8    1.01  508.35 -10.11 +10.00  10.00  88.47  1923.93  1931.64   600.20  1931.64 32.666 33.059 24.013 33.059
+   7     7.0.0.14    1.01  506.75 -10.27 +10.00  10.00  89.16  1912.95  1931.64   600.06  1931.64 32.629 33.022 24.011 33.022
+   8     7.0.0.16    1.01  506.80 -10.27 +10.00  10.00  89.73  1913.24  1931.64   600.01  1931.64 32.630 33.024 24.011 33.024
+   9     7.0.0.17    1.01  509.40 -10.01 +10.00  10.00  89.18  1931.00  1931.64   600.06  1931.64 32.690 33.083 24.014 33.083
+  10     7.0.0.18    1.02  508.30 -10.12 +10.00  10.00  89.48  1923.46  1931.64   600.02  1931.64 32.664 33.058 24.012 33.058
+  11     7.0.0.19    1.02  509.13 -10.04 +10.00  10.00  88.83  1929.17  1931.64   600.11  1931.64 32.683 33.077 24.014 33.077
+  12     7.0.0.23    1.02  506.75 -10.27 +10.00  10.00  89.35  1912.86  1931.64   600.04  1931.64 32.629 33.022 24.011 33.022
+  13     7.0.0.25    1.02  506.67 -10.28 +10.00  10.00  89.84  1912.25  1931.64   600.00  1931.64 32.627 33.021 24.011 33.021
+  14     7.0.0.26    1.02  508.43 -10.11 +10.00  10.00  89.49  1924.28  1931.64   600.02  1931.64 32.667 33.061 24.013 33.061
+  15     7.0.0.27    1.02  508.65 -10.08 +10.00  10.00  89.34  1925.77  1931.64   600.04  1931.64 32.672 33.066 24.013 33.066
+  16     7.0.0.20    1.03  509.49 -10.00 +10.00  10.00  89.61  1931.64  1931.46   600.01  1931.64 32.691 33.084 24.014 33.084
+  17     7.0.0.30    1.03  509.35 -10.02 +10.00  10.00  88.95  1930.54  1931.64   600.09  1931.64 32.688 33.082 24.014 33.082
+  18     7.0.0.31    1.03  506.48 -10.30 +10.00  10.00  89.98  1910.94  1931.64   600.00  1931.64 32.622 33.016 24.011 33.016
+  19     7.0.0.33    1.03  508.23 -10.13 +10.00  10.00  89.18  1922.90  1931.64   600.06  1931.64 32.662 33.056 24.012 33.056
+  20     7.0.0.35    1.03  507.53 -10.19 +10.00  10.00  88.45  1918.18  1931.64   600.20  1931.64 32.646 33.040 24.012 33.040
+  21     7.0.0.36    1.03  509.04 -10.04 +10.00  10.00  88.06  1928.56  1931.64   600.31  1931.64 32.681 33.075 24.014 33.075
+  22     7.0.0.38    1.04  506.60 -10.29 +10.00  10.00  89.42  1911.72  1931.64   600.03  1931.64 32.625 33.019 24.011 33.019
+  23     7.0.0.40    1.04  509.24 -10.03 +10.00  10.00  89.66  1929.67  1931.64   600.01  1931.64 32.685 33.079 24.013 33.079
+  24     7.0.0.41    1.04  508.07 -10.14 +10.00  10.00  89.75  1921.74  1931.64   600.01  1931.64 32.658 33.053 24.012 33.053
+  25     7.0.0.42    1.04  508.61 -10.09 +10.00  10.00  87.94  1925.63  1931.64   600.35  1931.64 32.671 33.065 24.014 33.065
+  26     7.0.0.43    1.04  508.09 -10.14 +10.00  10.00  89.48  1921.86  1931.64   600.02  1931.64 32.658 33.053 24.012 33.053
+  27     7.0.0.46    1.04  508.55 -10.09 +10.00  10.00  88.43  1925.06  1931.64   600.21  1931.64 32.669 33.063 24.013 33.063
+  28     7.0.0.47    1.04  509.38 -10.01 +10.00  10.00  88.13  1930.75  1931.64   600.29  1931.64 32.688 33.082 24.015 33.082
+  29     7.0.0.48    1.05  507.36 -10.21 +10.00  10.00  88.89  1916.92  1931.64   600.10  1931.64 32.642 33.036 24.012 33.036
+  30     7.0.0.49    1.05  509.15 -10.04 +10.00  10.00  89.43  1929.06  1931.64   600.03  1931.64 32.682 33.077 24.013 33.077
+  31     7.0.0.52    1.05  509.33 -10.02 +10.00  10.00  88.26  1930.38  1931.64   600.25  1931.64 32.687 33.081 24.014 33.081
+  32     7.0.0.28    1.07  509.49 -10.00 +10.01  10.00  89.94  1931.64  1931.15   600.00  1931.64 32.690 33.083 24.014 33.083
+  33     7.0.0.32    1.25  509.49 -10.00 +10.02  10.00  88.88  1931.64  1930.01   600.11  1931.64 32.686 33.079 24.014 33.079
+  34      7.0.0.9    1.35  509.49 -10.00 +10.03  10.00  89.57  1931.64  1929.27   600.02  1931.64 32.684 33.077 24.014 33.077
+  35     7.0.0.37    1.55  509.49 -10.00 +10.05  10.00  89.16  1931.64  1927.90   600.06  1931.64 32.679 33.072 24.015 33.072
+  36     7.0.0.44    1.57  509.49 -10.00 +10.05  10.00  88.08  1931.64  1927.90   600.31  1931.64 32.679 33.072 24.015 33.072
+  37     7.0.0.29    1.73  509.49 -10.00 +10.07  10.00  89.51  1931.64  1926.68   600.02  1931.64 32.675 33.068 24.015 33.068
+  38     7.0.0.15    1.73  509.49 -10.00 +10.07  10.00  88.09  1931.64  1926.84   600.30  1931.64 32.675 33.069 24.016 33.069
+  39     7.0.0.51    1.74  509.49 -10.00 +10.07  10.00  89.28  1931.64  1926.60   600.04  1931.64 32.675 33.068 24.015 33.068
+  40     7.0.0.11    1.86  509.49 -10.00 +10.08  10.00  88.34  1931.64  1925.89   600.23  1931.64 32.672 33.066 24.016 33.066
+  41     7.0.0.50    1.96  509.49 -10.00 +10.09  10.00  89.82  1931.64  1925.11   600.00  1931.64 32.670 33.063 24.015 33.063
+  42     7.0.0.22    2.15  509.49 -10.00 +10.11  10.00  89.05  1931.64  1923.83   600.08  1931.64 32.666 33.059 24.015 33.059
+  43     7.0.0.34    2.31  509.49 -10.00 +10.13  10.00  88.09  1931.64  1922.89   600.31  1931.64 32.662 33.056 24.016 33.056
+  44     7.0.0.10    2.35  509.49 -10.00 +10.13  10.00  88.23  1931.64  1922.59   600.26  1931.64 32.661 33.055 24.016 33.055
+  45     7.0.0.21    2.37  509.49 -10.00 +10.13  10.00  88.22  1931.64  1922.44   600.26  1931.64 32.661 33.054 24.016 33.054
+  46     7.0.0.13    3.05  509.49 -10.00 +10.20  10.00  88.63  1931.64  1917.76   600.16  1931.64 32.646 33.039 24.017 33.039
+  47     7.0.0.12    3.07  509.49 -10.00 +10.20  10.00  89.82  1931.64  1917.49   600.00  1931.64 32.645 33.038 24.017 33.038
+  48     7.0.0.39    3.11  509.49 -10.00 +10.21  10.00  89.76  1931.64  1917.24   600.00  1931.64 32.644 33.037 24.017 33.037
+  49      7.0.0.3    3.36  509.49 -10.00 +10.23  10.00  89.19  1931.64  1915.55   600.06  1931.64 32.638 33.031 24.017 33.031
+  50     7.0.0.45    3.46  509.49 -10.00 +10.24  10.00  89.50  1931.64  1914.85   600.02  1931.64 32.636 33.029 24.017 33.029
+  51     7.0.0.24    3.87  509.49 -10.00 +10.28  10.00  89.97  1931.64  1912.06   600.00  1931.64 32.627 33.020 24.018 33.020
+from, to: when the call started and ended. elevation: - before the satellite is overhead, + after; low, high: of the call.
+delay: one way, remote host -> UPF -> gateway -> satellite -> UE, propagation only.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| ROHC COMPRESSOR (SENDER)                                                                one line per connection (RNTI) of a UE |
++--------------------------------------------------------------------------------------------------------------------------------+
+       UE address  RNTI LCID dir mode  packets  in IR/FO/SO       header B/pkt  saved  feedback rcvd
+          7.0.0.2     1    3  DL    U        8  1/0/7             40.0 ->  8.8  60.8%          0/0/0
+          7.0.0.2    59    3  DL    O     7983  1/0/7982          40.0 ->  3.2  71.7%          1/0/0
+          7.0.0.2   all    3  DL  U+O     7991  2/0/7989          40.0 ->  3.2  71.7%          1/0/0
+          7.0.0.3    21    3  DL    O    10170  1/0/10169         40.0 ->  3.2  72.4%          1/0/0
+          7.0.0.4    11    3  DL    O    19112  1/0/19111         40.0 ->  3.2  71.2%          1/0/0
+          7.0.0.5    37    3  DL    O    12734  1/0/12733         40.0 ->  3.2  71.9%          1/0/0
+          7.0.0.6     3    3  DL    U        9  1/0/8             40.0 ->  8.1  62.7%          0/0/0
+          7.0.0.6    54    3  DL    O    12577  1/0/12576         40.0 ->  3.2  71.5%          1/0/0
+          7.0.0.6   all    3  DL  U+O    12586  2/0/12584         40.0 ->  3.2  71.5%          1/0/0
+          7.0.0.7    28    3  DL    O    11397  1/0/11396         40.0 ->  3.2  72.1%          1/0/0
+          7.0.0.8    22    3  DL    O    11037  1/0/11036         40.0 ->  3.2  72.1%          1/0/0
+          7.0.0.9    44    3  DL    O    13392  1/0/13391         40.0 ->  3.2  71.7%          1/0/0
+         7.0.0.10     4    3  DL    O    21195  1/0/21194         40.0 ->  3.2  71.1%          1/0/0
+         7.0.0.11    65    3  DL    O      303  1/0/302           40.0 ->  3.3  71.8%          1/0/0
+         7.0.0.12    12    3  DL    O    12964  1/0/12963         40.0 ->  3.1  71.9%          1/0/0
+         7.0.0.13    38    3  DL    O    13513  1/0/13512         40.0 ->  3.2  71.7%          1/0/0
+         7.0.0.14    13    3  DL    U        9  1/0/8             40.0 ->  8.1  62.7%          0/0/0
+         7.0.0.14    52    3  DL    O    12143  1/0/12142         40.0 ->  3.2  71.5%          1/0/0
+         7.0.0.14   all    3  DL  U+O    12152  2/0/12150         40.0 ->  3.2  71.5%          1/0/0
+         7.0.0.15    39    3  DL    O    17000  1/0/16999         40.0 ->  3.2  71.4%          1/0/0
+         7.0.0.16    23    3  DL    O    17515  1/0/17514         40.0 ->  3.1  71.3%          1/0/0
+         7.0.0.17    45    3  DL    U       11  1/0/10            40.0 ->  7.2  65.4%          0/0/0
+         7.0.0.17    56    3  DL    O     7042  1/0/7041          40.0 ->  3.2  72.9%          1/0/0
+         7.0.0.17   all    3  DL  U+O     7053  2/0/7051          40.0 ->  3.2  72.8%          1/0/0
+         7.0.0.18     5    3  DL    O    14394  1/0/14393         40.0 ->  3.1  71.7%          1/0/0
+         7.0.0.19    30    3  DL    U       30  1/0/29            40.0 ->  4.2  68.8%          0/0/0
+         7.0.0.19    58    3  DL    O    12978  1/0/12977         40.0 ->  3.1  71.0%          1/0/0
+         7.0.0.19   all    3  DL  U+O    13008  2/0/13006         40.0 ->  3.1  71.0%          1/0/0
+         7.0.0.20    14    3  DL    O    12078  1/0/12077         40.0 ->  3.2  71.9%          1/0/0
+         7.0.0.21    40    3  DL    O    17801  1/0/17800         40.0 ->  3.2  71.3%          1/0/0
+         7.0.0.22     6    3  DL    O    14125  1/0/14124         40.0 ->  3.2  71.7%          1/0/0
+         7.0.0.23    31    3  DL    U       10  1/0/9             40.0 ->  7.6  64.2%          0/0/0
+         7.0.0.23    53    3  DL    O    17008  1/0/17007         40.0 ->  3.1  71.1%          1/0/0
+         7.0.0.23   all    3  DL  U+O    17018  2/0/17016         40.0 ->  3.1  71.1%          1/0/0
+         7.0.0.24    24    3  DL    O    13465  1/0/13464         40.0 ->  3.1  71.8%          1/0/0
+         7.0.0.25    46    3  DL    U       11  1/0/10            40.0 ->  7.2  65.4%          0/0/0
+         7.0.0.25    63    3  DL    O     3915  1/0/3914          40.0 ->  3.2  71.4%          1/0/0
+         7.0.0.25   all    3  DL  U+O     3926  2/0/3924          40.0 ->  3.2  71.4%          1/0/0
+         7.0.0.26     7    3  DL    O    14392  1/0/14391         40.0 ->  3.2  71.6%          1/0/0
+         7.0.0.27    32    3  DL    O    20466  1/0/20465         40.0 ->  3.2  71.1%          1/0/0
+         7.0.0.28    15    3  DL    O    18990  1/0/18989         40.0 ->  3.2  71.2%          1/0/0
+         7.0.0.29    47    3  DL    O    14624  1/0/14623         40.0 ->  3.2  71.6%          1/0/0
+         7.0.0.30    16    3  DL    O    10577  1/0/10576         40.0 ->  3.1  72.3%          1/0/0
+         7.0.0.31    41    3  DL    O    14448  1/0/14447         40.0 ->  3.2  71.6%          1/0/0
+         7.0.0.32    25    3  DL    U        8  1/0/7             40.0 ->  8.8  60.8%          0/0/0
+         7.0.0.32    64    3  DL    O      544  1/0/543           40.0 ->  3.3  71.0%          1/0/0
+         7.0.0.32   all    3  DL  U+O      552  2/0/550           40.0 ->  3.4  70.8%          1/0/0
+         7.0.0.33    48    3  DL    U       23  1/0/22            40.0 ->  5.4  67.0%          0/0/0
+         7.0.0.33    57    3  DL    O    10879  1/0/10878         40.0 ->  3.1  71.2%          1/0/0
+         7.0.0.33   all    3  DL  U+O    10902  2/0/10900         40.0 ->  3.2  71.2%          1/0/0
+         7.0.0.34     2    3  DL    O    15471  1/0/15470         40.0 ->  3.2  71.5%          1/0/0
+         7.0.0.35    33    3  DL    O    13750  1/0/13749         40.0 ->  3.2  71.7%          1/0/0
+         7.0.0.36    17    3  DL    U        9  1/0/8             40.0 ->  8.1  62.7%          0/0/0
+         7.0.0.36    55    3  DL    O     8313  1/0/8312          40.0 ->  3.1  72.4%          1/0/0
+         7.0.0.36   all    3  DL  U+O     8322  2/0/8320          40.0 ->  3.1  72.4%          1/0/0
+         7.0.0.37    42    3  DL    O    12646  1/0/12645         40.0 ->  3.2  71.8%          1/0/0
+         7.0.0.38     8    3  DL    O    16350  1/0/16349         40.0 ->  3.1  71.5%          1/0/0
+         7.0.0.39    34    3  DL    O    16343  1/0/16342         40.0 ->  3.2  71.4%          1/0/0
+         7.0.0.40    26    3  DL    O    15750  1/0/15749         40.0 ->  3.2  71.5%          1/0/0
+         7.0.0.41    49    3  DL    O    14914  1/0/14913         40.0 ->  3.2  71.6%          1/0/0
+         7.0.0.42     9    3  DL    O    12411  1/0/12410         40.0 ->  3.1  71.9%          1/0/0
+         7.0.0.43    35    3  DL    O    14366  1/0/14365         40.0 ->  3.1  71.7%          1/0/0
+         7.0.0.44    18    3  DL    O    14108  1/0/14107         40.0 ->  3.1  71.7%          1/0/0
+         7.0.0.45    62    3  DL    O    11841  1/0/11840         40.0 ->  3.1  71.4%          1/0/0
+         7.0.0.46    19    3  DL    O    21321  1/0/21320         40.0 ->  3.1  71.1%          1/0/0
+         7.0.0.47    43    3  DL    U       32  1/0/31            40.0 ->  4.8  68.0%          0/0/0
+         7.0.0.47    60    3  DL    O     9286  1/0/9285          40.0 ->  3.1  71.5%          1/0/0
+         7.0.0.47   all    3  DL  U+O     9318  2/0/9316          40.0 ->  3.2  71.4%          1/0/0
+         7.0.0.48    27    3  DL    O    10508  1/0/10507         40.0 ->  3.1  72.3%          1/0/0
+         7.0.0.49    51    3  DL    O    15439  1/0/15438         40.0 ->  3.2  71.5%          1/0/0
+         7.0.0.50    61    3  DL    O     8751  1/0/8750          40.0 ->  3.1  71.7%          1/0/0
+         7.0.0.51    36    3  DL    O    10340  1/0/10339         40.0 ->  3.1  72.4%          1/0/0
+         7.0.0.52    20    3  DL    O    14290  1/0/14289         40.0 ->  3.1  71.7%          1/0/0
+mode: the one it ended in. in IR/FO/SO: packets it sent in each state. saved: of the bytes of the whole packets.
+feedback rcvd: the ACK/NACK/STATIC-NACK that reached it.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| ROHC DECOMPRESSOR (RECEIVER)                                                            one line per connection (RNTI) of a UE |
++--------------------------------------------------------------------------------------------------------------------------------+
+       UE address  RNTI LCID dir     sent  arrived  restored  failed  restored[%]  context lost  for[s]  net saved  feedback sent
+          7.0.0.2     1    3  DL        8        0         0       0            -             0    0.00          -          0/0/0
+          7.0.0.2    59    3  DL     7983     7928      7928       0        100.0             0    0.00      71.7%          1/0/0
+          7.0.0.2   all    3  DL     7991     7928      7928       0        100.0             0    0.00      71.7%          1/0/0
+          7.0.0.3    21    3  DL    10170    10168     10168       0        100.0             0    0.00      72.4%          1/0/0
+          7.0.0.4    11    3  DL    19112    19111     19111       0        100.0             0    0.00      71.2%          1/0/0
+          7.0.0.5    37    3  DL    12734    12731     12731       0        100.0             0    0.00      71.9%          1/0/0
+          7.0.0.6     3    3  DL        9        0         0       0            -             0    0.00          -          0/0/0
+          7.0.0.6    54    3  DL    12577    12521     12521       0        100.0             0    0.00      71.5%          1/0/0
+          7.0.0.6   all    3  DL    12586    12521     12521       0        100.0             0    0.00      71.5%          1/0/0
+          7.0.0.7    28    3  DL    11397    11397     11397       0        100.0             0    0.00      72.1%          1/0/0
+          7.0.0.8    22    3  DL    11037    11020     11020       0        100.0             0    0.00      72.1%          1/0/0
+          7.0.0.9    44    3  DL    13392    13392     13392       0        100.0             0    0.00      71.7%          1/0/0
+         7.0.0.10     4    3  DL    21195    21194     21194       0        100.0             0    0.00      71.1%          1/0/0
+         7.0.0.11    65    3  DL      303      296       296       0        100.0             0    0.00      71.7%          1/0/0
+         7.0.0.12    12    3  DL    12964    12964     12964       0        100.0             0    0.00      71.9%          1/0/0
+         7.0.0.13    38    3  DL    13513    13513     13513       0        100.0             0    0.00      71.7%          1/0/0
+         7.0.0.14    13    3  DL        9        0         0       0            -             0    0.00          -          0/0/0
+         7.0.0.14    52    3  DL    12143    12133     12133       0        100.0             0    0.00      71.5%          1/0/0
+         7.0.0.14   all    3  DL    12152    12133     12133       0        100.0             0    0.00      71.5%          1/0/0
+         7.0.0.15    39    3  DL    17000    17000     17000       0        100.0             0    0.00      71.4%          1/0/0
+         7.0.0.16    23    3  DL    17515    17515     17515       0        100.0             0    0.00      71.3%          1/0/0
+         7.0.0.17    45    3  DL       11        0         0       0            -             0    0.00          -          0/0/0
+         7.0.0.17    56    3  DL     7042     7035      7035       0        100.0             0    0.00      72.9%          1/0/0
+         7.0.0.17   all    3  DL     7053     7035      7035       0        100.0             0    0.00      72.9%          1/0/0
+         7.0.0.18     5    3  DL    14394    14391     14391       0        100.0             0    0.00      71.7%          1/0/0
+         7.0.0.19    30    3  DL       30        0         0       0            -             0    0.00          -          0/0/0
+         7.0.0.19    58    3  DL    12978    12923     12923       0        100.0             0    0.00      71.0%          1/0/0
+         7.0.0.19   all    3  DL    13008    12923     12923       0        100.0             0    0.00      71.0%          1/0/0
+         7.0.0.20    14    3  DL    12078    12076     12076       0        100.0             0    0.00      71.9%          1/0/0
+         7.0.0.21    40    3  DL    17801    17794     17794       0        100.0             0    0.00      71.3%          1/0/0
+         7.0.0.22     6    3  DL    14125    14125     14125       0        100.0             0    0.00      71.7%          1/0/0
+         7.0.0.23    31    3  DL       10        0         0       0            -             0    0.00          -          0/0/0
+         7.0.0.23    53    3  DL    17008    16952     16952       0        100.0             0    0.00      71.1%          1/0/0
+         7.0.0.23   all    3  DL    17018    16952     16952       0        100.0             0    0.00      71.1%          1/0/0
+         7.0.0.24    24    3  DL    13465    13463     13463       0        100.0             0    0.00      71.8%          1/0/0
+         7.0.0.25    46    3  DL       11        2         0       2          0.0             1    0.00          -          0/0/1
+         7.0.0.25    63    3  DL     3915     3852      3852       0        100.0             0    0.00      71.4%          1/0/0
+         7.0.0.25   all    3  DL     3926     3854      3852       2         99.9             1    0.00      71.4%          1/0/1
+         7.0.0.26     7    3  DL    14392    14391     14391       0        100.0             0    0.00      71.6%          1/0/0
+         7.0.0.27    32    3  DL    20466    20466     20466       0        100.0             0    0.00      71.1%          1/0/0
+         7.0.0.28    15    3  DL    18990    18989     18989       0        100.0             0    0.00      71.2%          1/0/0
+         7.0.0.29    47    3  DL    14624    14624     14624       0        100.0             0    0.00      71.6%          1/0/0
+         7.0.0.30    16    3  DL    10577    10577     10577       0        100.0             0    0.00      72.3%          1/0/0
+         7.0.0.31    41    3  DL    14448    14447     14447       0        100.0             0    0.00      71.6%          1/0/0
+         7.0.0.32    25    3  DL        8        0         0       0            -             0    0.00          -          0/0/0
+         7.0.0.32    64    3  DL      544      492       492       0        100.0             0    0.00      71.0%          1/0/0
+         7.0.0.32   all    3  DL      552      492       492       0        100.0             0    0.00      71.0%          1/0/0
+         7.0.0.33    48    3  DL       23        0         0       0            -             0    0.00          -          0/0/0
+         7.0.0.33    57    3  DL    10879    10841     10841       0        100.0             0    0.00      71.2%          1/0/0
+         7.0.0.33   all    3  DL    10902    10841     10841       0        100.0             0    0.00      71.2%          1/0/0
+         7.0.0.34     2    3  DL    15471    15467     15467       0        100.0             0    0.00      71.5%          1/0/0
+         7.0.0.35    33    3  DL    13750    13750     13750       0        100.0             0    0.00      71.7%          1/0/0
+         7.0.0.36    17    3  DL        9        0         0       0            -             0    0.00          -          0/0/0
+         7.0.0.36    55    3  DL     8313     8303      8303       0        100.0             0    0.00      72.4%          1/0/0
+         7.0.0.36   all    3  DL     8322     8303      8303       0        100.0             0    0.00      72.4%          1/0/0
+         7.0.0.37    42    3  DL    12646    12646     12646       0        100.0             0    0.00      71.8%          1/0/0
+         7.0.0.38     8    3  DL    16350    16350     16350       0        100.0             0    0.00      71.5%          1/0/0
+         7.0.0.39    34    3  DL    16343    16342     16342       0        100.0             0    0.00      71.4%          1/0/0
+         7.0.0.40    26    3  DL    15750    15750     15750       0        100.0             0    0.00      71.5%          1/0/0
+         7.0.0.41    49    3  DL    14914    14914     14914       0        100.0             0    0.00      71.6%          1/0/0
+         7.0.0.42     9    3  DL    12411    12411     12411       0        100.0             0    0.00      71.9%          1/0/0
+         7.0.0.43    35    3  DL    14366    14365     14365       0        100.0             0    0.00      71.7%          1/0/0
+         7.0.0.44    18    3  DL    14108    14108     14108       0        100.0             0    0.00      71.7%          1/0/0
+         7.0.0.45    62    3  DL    11841    11768     11768       0        100.0             0    0.00      71.4%          1/0/0
+         7.0.0.46    19    3  DL    21321    21321     21321       0        100.0             0    0.00      71.1%          1/0/0
+         7.0.0.47    43    3  DL       32        0         0       0            -             0    0.00          -          0/0/0
+         7.0.0.47    60    3  DL     9286     9276      9276       0        100.0             0    0.00      71.4%          1/0/0
+         7.0.0.47   all    3  DL     9318     9276      9276       0        100.0             0    0.00      71.4%          1/0/0
+         7.0.0.48    27    3  DL    10508    10508     10508       0        100.0             0    0.00      72.3%          1/0/0
+         7.0.0.49    51    3  DL    15439    15437     15437       0        100.0             0    0.00      71.5%          1/0/0
+         7.0.0.50    61    3  DL     8751     8706      8706       0        100.0             0    0.00      71.7%          1/0/0
+         7.0.0.51    36    3  DL    10340    10340     10340       0        100.0             0    0.00      72.4%          1/0/0
+         7.0.0.52    20    3  DL    14290    14290     14290       0        100.0             0    0.00      71.7%          1/0/0
+sent: by the compressor. arrived: of these, reached the decompressor. restored: header put back, also in % of arrived.
+failed: dropped, the context could not restore the header. context lost: runs of failed packets; for[s]: their time in all.
+net saved: 1 - bytes arrived / bytes of the packets restored from them. feedback sent: ACK/NACK/STATIC-NACK.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| ROHC MODE OF THE COMPRESSOR                                                             one line per connection (RNTI) of a UE |
++--------------------------------------------------------------------------------------------------------------------------------+
+       UE address  RNTI LCID dir  U from[s]  packets  O from[s]  packets  last packet[s]  O-mode started by
+          7.0.0.2     1    3  DL      1.020        8          -        -           1.160  never: no feedback was sent
+          7.0.0.2    59    3  DL    109.920        1    110.007     7982         402.020  ACK sent at 109.932 s
+          7.0.0.3    21    3  DL      3.384        7      3.512    10163         509.464  ACK sent at 3.400 s
+          7.0.0.4    11    3  DL      1.022        8      1.183    19104         507.102  ACK sent at 1.039 s
+          7.0.0.5    37    3  DL      1.023        8      1.184    12726         508.863  ACK sent at 1.040 s
+          7.0.0.6     3    3  DL      1.024        9          -        -           1.324  never: no feedback was sent
+          7.0.0.6    54    3  DL     46.024        4     46.149    12573         464.644  ACK sent at 46.039 s
+          7.0.0.7    28    3  DL      1.025        5      1.122    11392         509.105  ACK sent at 1.042 s
+          7.0.0.8    22    3  DL      1.026        8      1.188    11029         508.206  ACK sent at 1.043 s
+          7.0.0.9    44    3  DL      1.368        8      1.528    13384         509.488  ACK sent at 1.384 s
+         7.0.0.10     4    3  DL      2.370        8      2.531    21187         509.350  ACK sent at 2.387 s
+         7.0.0.11    65    3  DL    249.883        3    249.931      300         263.643  ACK sent at 249.891 s
+         7.0.0.12    12    3  DL      3.095        8      3.255    12956         509.495  ACK sent at 3.111 s
+         7.0.0.13    38    3  DL      3.069        7      3.197    13506         509.469  ACK sent at 3.085 s
+         7.0.0.14    13    3  DL      1.032        9          -        -           1.332  never: no feedback was sent
+         7.0.0.14    52    3  DL     44.032        5     44.125    12138         462.532  ACK sent at 44.047 s
+         7.0.0.15    39    3  DL      1.749        7      1.879    16993         509.369  ACK sent at 1.767 s
+         7.0.0.16    23    3  DL      1.034        7      1.163    17508         506.814  ACK sent at 1.051 s
+         7.0.0.17    45    3  DL      1.035       11          -        -           1.655  never: no feedback was sent
+         7.0.0.17    56    3  DL     46.475        1     46.568     7041         465.135  ACK sent at 46.490 s
+         7.0.0.18     5    3  DL      1.036        8      1.197    14386         508.276  ACK sent at 1.053 s
+         7.0.0.19    30    3  DL      1.037       30          -        -           1.617  never: no feedback was sent
+         7.0.0.19    58    3  DL    109.657        5    109.744    12973         401.697  ACK sent at 109.669 s
+         7.0.0.20    14    3  DL      1.047        9      1.209    12069         509.507  ACK sent at 1.065 s
+         7.0.0.21    40    3  DL      2.392        8      2.552    17793         509.492  ACK sent at 2.408 s
+         7.0.0.22     6    3  DL      2.171        7      2.300    14118         509.491  ACK sent at 2.188 s
+         7.0.0.23    31    3  DL      1.041       10          -        -           1.501  never: no feedback was sent
+         7.0.0.23    53    3  DL     43.901        5     43.994    17003         462.581  ACK sent at 43.916 s
+         7.0.0.24    24    3  DL      3.891        8      4.052    13457         509.491  ACK sent at 3.908 s
+         7.0.0.25    46    3  DL      1.043       11          -        -           1.663  never: 1 STATIC-NACK sent, none arrived
+         7.0.0.25    63    3  DL    245.883        3    245.931     3912         366.283  ACK sent at 245.891 s
+         7.0.0.26     7    3  DL      1.044        8      1.206    14384         508.444  ACK sent at 1.061 s
+         7.0.0.27    32    3  DL      1.045        9      1.210    20457         508.665  ACK sent at 1.066 s
+         7.0.0.28    15    3  DL      1.091        8      1.253    18982         509.491  ACK sent at 1.109 s
+         7.0.0.29    47    3  DL      1.748        7      1.877    14617         509.388  ACK sent at 1.765 s
+         7.0.0.30    16    3  DL      1.048        8      1.213    10569         509.208  ACK sent at 1.068 s
+         7.0.0.31    41    3  DL      1.049        8      1.215    14440         506.349  ACK sent at 1.071 s
+         7.0.0.32    25    3  DL      1.268        8          -        -           1.408  never: no feedback was sent
+         7.0.0.32    64    3  DL    249.088        3    249.135      541         263.388  ACK sent at 249.095 s
+         7.0.0.33    48    3  DL      1.051       23          -        -           1.771  never: no feedback was sent
+         7.0.0.33    57    3  DL    108.751        1    108.902    10878         400.611  ACK sent at 108.763 s
+         7.0.0.34     2    3  DL      2.329        8      2.490    15463         509.469  ACK sent at 2.346 s
+         7.0.0.35    33    3  DL      1.053        5      1.150    13745         507.393  ACK sent at 1.070 s
+         7.0.0.36    17    3  DL      1.054        9          -        -           1.354  never: no feedback was sent
+         7.0.0.36    55    3  DL     46.294       10     46.485     8303         464.834  ACK sent at 46.343 s
+         7.0.0.37    42    3  DL      1.572        7      1.701    12639         509.492  ACK sent at 1.589 s
+         7.0.0.38     8    3  DL      1.056        7      1.185    16343         506.616  ACK sent at 1.073 s
+         7.0.0.39    34    3  DL      3.132        8      3.293    16335         509.492  ACK sent at 3.149 s
+         7.0.0.40    26    3  DL      1.058        5      1.156    15745         509.158  ACK sent at 1.076 s
+         7.0.0.41    49    3  DL      1.059        8      1.241    14906         507.999  ACK sent at 1.097 s
+         7.0.0.42     9    3  DL      1.060        5      1.158    12406         508.560  ACK sent at 1.077 s
+         7.0.0.43    35    3  DL      1.061        8      1.240    14358         508.101  ACK sent at 1.096 s
+         7.0.0.44    18    3  DL      1.595        7      1.724    14101         509.495  ACK sent at 1.612 s
+         7.0.0.45    62    3  DL    112.584        1    112.639    11840         468.124  ACK sent at 112.596 s
+         7.0.0.46    19    3  DL      1.064        8      1.228    21313         508.504  ACK sent at 1.083 s
+         7.0.0.47    43    3  DL      1.065       32          -        -           1.685  never: no feedback was sent
+         7.0.0.47    60    3  DL    109.885        5    109.972     9281         401.745  ACK sent at 109.897 s
+         7.0.0.48    27    3  DL      1.066        5      1.165    10503         507.366  ACK sent at 1.085 s
+         7.0.0.49    51    3  DL      1.067        8      1.235    15431         509.167  ACK sent at 1.091 s
+         7.0.0.50    61    3  DL    110.897        1    110.984     8750         427.657  ACK sent at 110.909 s
+         7.0.0.51    36    3  DL      1.763        7      1.891    10333         509.463  ACK sent at 1.779 s
+         7.0.0.52    20    3  DL      1.070        8      1.234    14282         509.350  ACK sent at 1.090 s
+U-mode from its first packet (U from), O-mode once feedback that asks for it has arrived (O from). It does not go back to
+U-mode; the next connection of the UE starts in U-mode again.
+
++--------------------------------------------------------------------------------------------------------------------------------+
+| ROHC PACKET TYPES                                                                            in % of the packets of the bearer |
++--------------------------------------------------------------------------------------------------------------------------------+
+       UE address  RNTI LCID dir mode  packets      IR  UOR-2-EXT-3    UO-0
+          7.0.0.2     1    3  DL    U        8    12.5         12.5    75.0
+          7.0.0.2    59    3  DL    O     7983     0.0          1.7    98.3
+          7.0.0.2   all    3  DL  U+O     7991     0.0          1.7    98.3
+          7.0.0.3    21    3  DL    O    10170     0.0          1.5    98.5
+          7.0.0.4    11    3  DL    O    19112     0.0          1.6    98.4
+          7.0.0.5    37    3  DL    O    12734     0.0          1.5    98.4
+          7.0.0.6     3    3  DL    U        9    11.1         11.1    77.8
+          7.0.0.6    54    3  DL    O    12577     0.0          1.7    98.3
+          7.0.0.6   all    3  DL  U+O    12586     0.0          1.7    98.3
+          7.0.0.7    28    3  DL    O    11397     0.0          1.5    98.5
+          7.0.0.8    22    3  DL    O    11037     0.0          1.9    98.1
+          7.0.0.9    44    3  DL    O    13392     0.0          1.7    98.3
+         7.0.0.10     4    3  DL    O    21195     0.0          1.5    98.5
+         7.0.0.11    65    3  DL    O      303     0.3          2.3    97.4
+         7.0.0.12    12    3  DL    O    12964     0.0          1.3    98.7
+         7.0.0.13    38    3  DL    O    13513     0.0          1.5    98.4
+         7.0.0.14    13    3  DL    U        9    11.1         11.1    77.8
+         7.0.0.14    52    3  DL    O    12143     0.0          1.9    98.1
+         7.0.0.14   all    3  DL  U+O    12152     0.0          1.9    98.1
+         7.0.0.15    39    3  DL    O    17000     0.0          1.6    98.4
+         7.0.0.16    23    3  DL    O    17515     0.0          1.5    98.5
+         7.0.0.17    45    3  DL    U       11     9.1          9.1    81.8
+         7.0.0.17    56    3  DL    O     7042     0.0          1.5    98.5
+         7.0.0.17   all    3  DL  U+O     7053     0.0          1.5    98.5
+         7.0.0.18     5    3  DL    O    14394     0.0          1.4    98.6
+         7.0.0.19    30    3  DL    U       30     3.3          0.0    96.7
+         7.0.0.19    58    3  DL    O    12978     0.0          1.3    98.7
+         7.0.0.19   all    3  DL  U+O    13008     0.0          1.3    98.7
+         7.0.0.20    14    3  DL    O    12078     0.0          1.7    98.3
+         7.0.0.21    40    3  DL    O    17801     0.0          1.6    98.4
+         7.0.0.22     6    3  DL    O    14125     0.0          1.6    98.4
+         7.0.0.23    31    3  DL    U       10    10.0         10.0    80.0
+         7.0.0.23    53    3  DL    O    17008     0.0          1.4    98.6
+         7.0.0.23   all    3  DL  U+O    17018     0.0          1.4    98.6
+         7.0.0.24    24    3  DL    O    13465     0.0          1.2    98.8
+         7.0.0.25    46    3  DL    U       11     9.1          9.1    81.8
+         7.0.0.25    63    3  DL    O     3915     0.0          1.5    98.4
+         7.0.0.25   all    3  DL  U+O     3926     0.1          1.6    98.4
+         7.0.0.26     7    3  DL    O    14392     0.0          1.6    98.4
+         7.0.0.27    32    3  DL    O    20466     0.0          1.5    98.5
+         7.0.0.28    15    3  DL    O    18990     0.0          1.5    98.4
+         7.0.0.29    47    3  DL    O    14624     0.0          1.6    98.4
+         7.0.0.30    16    3  DL    O    10577     0.0          1.4    98.6
+         7.0.0.31    41    3  DL    O    14448     0.0          1.7    98.3
+         7.0.0.32    25    3  DL    U        8    12.5         12.5    75.0
+         7.0.0.32    64    3  DL    O      544     0.2          2.2    97.6
+         7.0.0.32   all    3  DL  U+O      552     0.4          2.4    97.3
+         7.0.0.33    48    3  DL    U       23     4.3          8.7    87.0
+         7.0.0.33    57    3  DL    O    10879     0.0          1.4    98.6
+         7.0.0.33   all    3  DL  U+O    10902     0.0          1.4    98.5
+         7.0.0.34     2    3  DL    O    15471     0.0          1.6    98.4
+         7.0.0.35    33    3  DL    O    13750     0.0          1.6    98.4
+         7.0.0.36    17    3  DL    U        9    11.1         11.1    77.8
+         7.0.0.36    55    3  DL    O     8313     0.0          1.3    98.7
+         7.0.0.36   all    3  DL  U+O     8322     0.0          1.3    98.7
+         7.0.0.37    42    3  DL    O    12646     0.0          1.7    98.3
+         7.0.0.38     8    3  DL    O    16350     0.0          1.3    98.7
+         7.0.0.39    34    3  DL    O    16343     0.0          1.8    98.2
+         7.0.0.40    26    3  DL    O    15750     0.0          1.6    98.4
+         7.0.0.41    49    3  DL    O    14914     0.0          1.6    98.4
+         7.0.0.42     9    3  DL    O    12411     0.0          1.4    98.6
+         7.0.0.43    35    3  DL    O    14366     0.0          1.4    98.6
+         7.0.0.44    18    3  DL    O    14108     0.0          1.4    98.6
+         7.0.0.45    62    3  DL    O    11841     0.0          1.3    98.7
+         7.0.0.46    19    3  DL    O    21321     0.0          1.4    98.6
+         7.0.0.47    43    3  DL    U       32     3.1          6.2    90.6
+         7.0.0.47    60    3  DL    O     9286     0.0          1.5    98.5
+         7.0.0.47   all    3  DL  U+O     9318     0.0          1.5    98.5
+         7.0.0.48    27    3  DL    O    10508     0.0          1.4    98.5
+         7.0.0.49    51    3  DL    O    15439     0.0          1.6    98.4
+         7.0.0.50    61    3  DL    O     8751     0.0          1.3    98.7
+         7.0.0.51    36    3  DL    O    10340     0.0          1.4    98.6
+         7.0.0.52    20    3  DL    O    14290     0.0          1.4    98.6
+    all bearers                         667119     0.0          1.5    98.5
+    mean ROHC header [B]                          39.0         13.0     3.0
+
+CSV: /home/ashkan/ns-3-dev-NTN-main/sweep7/runs/rohc1-sps2-n51_r3/run_calls.csv, _delays.csv, _pdcch.csv, _rohc.csv, _rohc_types.csv
