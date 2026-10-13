@@ -1,0 +1,438 @@
+// Copyright (c) 2019 Centre Tecnologic de Telecomunicacions de Catalunya (CTTC)
+//
+// SPDX-License-Identifier: GPL-2.0-only
+
+#pragma once
+
+#include "beam-id.h"
+#include "nr-amc.h"
+#include "nr-mac-harq-vector.h"
+#include "nr-mac-sched-sap.h"
+#include "nr-mac-scheduler-lcg.h"
+
+#include "ns3/matrix-array.h"
+#include "ns3/nr-export.h"
+
+#include <functional>
+#include <optional>
+#include <unordered_map>
+
+namespace ns3
+{
+
+class NrMacSchedulerUeInfo;
+/**
+ * @brief Shared pointer to an instance of NrMacSchedulerUeInfo
+ */
+typedef std::shared_ptr<NrMacSchedulerUeInfo> UePtr;
+
+/**
+ * @ingroup scheduler
+ * @brief The representation of an user for any Mac scheduler
+ *
+ * Basic representation for an UE inside any scheduler. The class is responsible
+ * to store all the UE-related field that can be used by any scheduler.
+ *
+ * If a scheduler needs to store additional information, it is necessary to
+ * create a subclass and store the information there. Then, the scheduler
+ * will return a pointer to a newly created instance through
+ * NrMacSchedulerNs3::CreateUeRepresentation.
+ *
+ * The class stores information such as RBG, MCS, and CQI. Information that
+ * should be reset after each slot (such as RBG count) should be reset in the
+ * method ResetDlSchedInfo() and ResetUlSchedInfo().
+ *
+ * When a scheduler assign new resources to the UE, it will call
+ * the method UpdateDlMetric() or UpdateUlMetric(). Make sure all the relevant
+ * information that should be updated for a correct sorting are updated there.
+ *
+ * @see NrMacSchedulerUeInfoRR
+ * @see NrMacSchedulerUeInfoPF
+ * @see NrMacSchedulerUeInfoMR
+ */
+class NR_EXPORT NrMacSchedulerUeInfo
+{
+  public:
+    /**
+     * @brief Default Constructor (deleted)
+     */
+    NrMacSchedulerUeInfo() = delete;
+
+    typedef std::function<uint32_t()> GetRbPerRbgFn;
+
+    /**
+     * @brief Create a new UE representation
+     * @param rnti the RNTI of the UE
+     * @param beamId the BeamID of the UE (can be updated later)
+     */
+    NrMacSchedulerUeInfo(uint16_t rnti, BeamId beamId, const GetRbPerRbgFn& fn);
+
+    /**
+     * @brief ~NrMacSchedulerUeInfo deconstructor
+     */
+    virtual ~NrMacSchedulerUeInfo();
+
+    /**
+     * @brief GetDlRBG
+     * @param ue UE pointer from which obtain the value
+     * @return
+     */
+    static std::vector<uint16_t>& GetDlRBG(const UePtr& ue);
+    /**
+     * @brief GetUlRBG
+     * @param ue UE pointer from which obtain the value
+     * @return
+     */
+    static std::vector<uint16_t>& GetUlRBG(const UePtr& ue);
+    /**
+     * @brief GetDlSym
+     * @param ue UE pointer from which obtain the value
+     * @return
+     */
+    static std::vector<uint8_t>& GetDlSym(const UePtr& ue);
+    /**
+     * @brief GetUlSym
+     * @param ue UE pointer from which obtain the value
+     * @return
+     */
+    static std::vector<uint8_t>& GetUlSym(const UePtr& ue);
+
+    enum class McsCsiSource
+    {
+        AVG_MCS,      //!< Estimate MCS based on the average MCS of allocated RBGs
+        AVG_SPEC_EFF, //!< Estimate MCS based on the average spectral efficiency of allocated RBGs
+        AVG_SINR,     //!< Estimate MCS based on the average SINR of allocated RBGs
+        WIDEBAND_MCS  //!< Wideband MCS
+    };
+    /**
+     * @brief Get the downlink MCS, given by the wideband CQI, or
+     *        the sub-band CQIs of the currently allocated RBGs, if available
+     * @return downlink mcs
+     */
+    uint8_t GetDlMcs() const;
+    /**
+     * @brief GetDlMcs
+     * @param ue UE pointer from which obtain the value
+     * @return
+     */
+    static uint8_t& GetDlMcs(const UePtr& ue);
+    /**
+     * @brief Get the downlink MCS from CSI only, without the OLLA offset
+     * @return downlink mcs before outer-loop correction
+     */
+    uint8_t GetDlMcsFromCsi() const;
+
+    /**
+     * @brief GetUlMcs
+     * @param ue UE pointer from which obtain the value
+     * @return
+     */
+    static uint8_t& GetUlMcs(const UePtr& ue);
+    /**
+     * @brief The uplink MCS for a grant of `rbs` resource blocks
+     *
+     * m_ulMcs is what the SINR the gNB measured on the UE's last uplink transmission allows.
+     * The UE spreads its power over the resource blocks it is granted (UniformPowerAllocUsed,
+     * no uplink power control), so with m_ulMcsPerRbs a grant of other resource blocks gets the
+     * MCS of the measured SINR scaled to them: measured RBs / rbs. With UL OLLA (m_ulOllaMax
+     * > 0) the outer-loop offset is added.
+     * @param rbs resource blocks of the grant
+     * @return the MCS
+     */
+    uint8_t GetUlMcsFor(uint32_t rbs) const;
+    /// MCS and CQI the last UL measurement gives over `rbs` resource blocks (no OLLA)
+    std::pair<uint8_t, uint8_t> UlLinkFor(uint32_t rbs) const;
+    /**
+     * @brief Resource blocks of the uplink resource block groups assigned in this slot
+     * (m_ulRBG lists an RBG once per symbol)
+     */
+    uint32_t GetUlRbs() const;
+    /**
+     * @brief With m_ulMcsPerRbs: the most resource blocks over which the UE's power still
+     * carries MCS 0 (at the AMC's 10 % block errors), from its last measurement; more would
+     * only lower the SINR of each. Without a measurement, or m_ulMcsPerRbs false: no limit.
+     */
+    uint32_t GetUlMaxRbs() const;
+    /**
+     * @brief GetDlTBS
+     * @param ue UE pointer from which obtain the value
+     * @return The TB size
+     */
+    static uint32_t& GetDlTBS(const UePtr& ue);
+
+    /**
+     * @brief GetUlTBS
+     * @param ue UE pointer from which obtain the value
+     * @return
+     */
+    static uint32_t& GetUlTBS(const UePtr& ue)
+    {
+        return ue->m_ulTbSize;
+    }
+
+    /**
+     * @brief GetDlLCG
+     * @param ue UE pointer from which obtain the value
+     * @return
+     */
+    static std::unordered_map<uint8_t, LCGPtr>& GetDlLCG(const UePtr& ue);
+    /**
+     * @brief GetUlLCG
+     * @param ue UE pointer from which obtain the value
+     * @return
+     */
+    static std::unordered_map<uint8_t, LCGPtr>& GetUlLCG(const UePtr& ue);
+    /**
+     * @brief GetDlHarqVector
+     * @param ue UE pointer from which obtain the value
+     * @return
+     */
+    static NrMacHarqVector& GetDlHarqVector(const UePtr& ue);
+    /**
+     * @brief GetUlHarqVector
+     * @param ue UE pointer from which obtain the value
+     * @return
+     */
+    static NrMacHarqVector& GetUlHarqVector(const UePtr& ue);
+
+    /**
+     * @brief Prints information related to the 5QI of a UEs LC
+     * @param ue UE for which we want to print the LC info
+     * @param lcgId The logical channel group ID
+     * @param lcId The logical channel ID
+     * @param fiveQi The 5QI of this LC
+     * @param P The priority associated to the 5QI of this LC
+     * @return
+     */
+    static void PrintLcInfo(uint16_t ue,
+                            uint8_t lcgId,
+                            uint8_t lcId,
+                            uint8_t fiveQi,
+                            uint8_t P,
+                            uint8_t minP);
+
+    typedef std::function<std::unordered_map<uint8_t, LCGPtr>&(const UePtr& ue)> GetLCGFn;
+    typedef std::function<NrMacHarqVector&(const UePtr& ue)> GetHarqVectorFn;
+
+    /**
+     * @brief Reset DL information
+     *
+     * Called after each slot. It should reset all the information that are
+     * slot-dependent.
+     */
+    virtual void ResetDlSchedInfo();
+
+    /**
+     * @brief Reset UL information
+     *
+     * Called after each slot. It should reset all the information that are
+     * slot-dependent.
+     */
+    virtual void ResetUlSchedInfo();
+
+    /**
+     * @brief Update DL metrics after resources have been assigned
+     *
+     * The amount of assigned resources is stored inside m_dlRBG by the scheduler.
+     */
+    virtual void UpdateDlMetric();
+
+    /**
+     * @brief ResetDlMetric
+     *
+     * Called when the scheduler has assigned RBGs, but the sum does not arrive
+     * to a TBS > 0. The assignation is, therefore, not transformed in DCI.
+     * These RBG will not be assigned, they will be empty in the slot.
+     */
+    virtual void ResetDlMetric();
+
+    /**
+     * @brief Update UL metrics after resources have been assigned
+     *
+     * The amount of assigned resources is stored inside m_ulRBG by the scheduler.
+     */
+    virtual void UpdateUlMetric();
+
+    /**
+     * @brief ResetUlMetric
+     *
+     * Called when the scheduler has assigned RBGs, but the sum does not arrive
+     * to a TBS > 0. The assignation is, therefore, not transformed in DCI.
+     * These RBG will not be assigned, they will be empty in the slot.
+     */
+    virtual void ResetUlMetric();
+
+    uint32_t GetTotalDlBuffer() const;
+
+    /**
+     * @brief Get the total number of logical channels in the downlink LCG map.
+     *
+     * This method counts all logical channels contained in all downlink logical
+     * channel groups of the UE, regardless of whether they currently have data
+     * pending for transmission.
+     *
+     * @return The total number of downlink logical channels.
+     */
+    uint32_t GetTotalNumDlLc() const;
+
+    /**
+     * @brief Get the total number of logical channels in the uplink LCG map.
+     *
+     * This method counts all logical channels contained in all uplink logical
+     * channel groups of the UE, regardless of whether they currently have data
+     * pending for transmission.
+     *
+     * @return The total number of uplink logical channels.
+     */
+    uint32_t GetTotalNumUlLc() const;
+
+    /**
+     * @brief Get the total number of active logical channels in the downlink LCG map.
+     *
+     * An active logical channel is a logical channel whose buffer occupancy is
+     * greater than zero. This method sums the active logical channels across all
+     * downlink logical channel groups of the UE.
+     *
+     * @return The total number of active downlink logical channels.
+     */
+    uint32_t GetTotalNumActiveDlLc() const;
+
+    /**
+     * @brief Get the total number of active logical channels in the uplink LCG map.
+     *
+     * An active logical channel is a logical channel whose buffer occupancy is
+     * greater than zero. This method sums the active logical channels across all
+     * uplink logical channel groups of the UE.
+     *
+     * @return The total number of active uplink logical channels.
+     */
+    uint32_t GetTotalNumActiveUlLc() const;
+
+    /**
+     * @brief Check whether the UE has pending downlink signaling traffic.
+     *
+     * Downlink signaling traffic is carried in logical channel group 0.
+     *
+     * @return true if DL LCG 0 has pending bytes, false otherwise.
+     */
+    bool HasPendingDlSignalingTraffic() const;
+
+    /**
+     * @brief Received CQI information
+     */
+    struct NR_EXPORT CqiInfo
+    {
+        /**
+         * @brief Type of CQI
+         */
+        enum CqiType
+        {
+            WB,          //!< Wide-band
+            SB           //!< Sub-band
+        } m_cqiType{WB}; //!< CQI type
+
+        std::vector<double> m_sinr;   //!< Vector of SINR for the entire band
+        uint8_t m_wbCqi{0};           //!< CQI reported value
+        std::vector<uint8_t> m_sbCqi; //!< Sub-band CQI reported values
+        uint32_t m_timer{0};          //!< Timer (in slot number).
+                                      //!< When the timer is 0, the value is discarded
+    };
+
+    void ReleaseLC(uint8_t lcid);
+
+    uint16_t m_rnti{0}; //!< RNTI of the UE
+    BeamId m_beamId;    //!< Beam ID of the UE (kept updated as much as possible by MAC)
+
+    std::unordered_map<uint8_t, LCGPtr> m_dlLCG; //!< DL LCG
+    std::unordered_map<uint8_t, LCGPtr> m_ulLCG; //!< UL LCG
+
+    /**
+     * @brief Size of the uplink grant owed to this UE because it sent a scheduling request.
+     *
+     * A scheduling request carries neither a buffer size nor a logical channel group (3GPP
+     * TS 38.321, clause 5.4.4), so it must not be recorded as buffer in m_ulLCG: only a buffer
+     * status report tells the scheduler what the UE has and where (clause 5.4.5). It is instead
+     * kept here, as the size of the bootstrap grant the UE needs in order to send that buffer
+     * status report, and it makes the UE eligible for uplink scheduling without making any of
+     * its logical channels look active.
+     */
+    uint32_t m_srBytesPending{0};
+
+    uint32_t m_dlMRBRetx{0};       //!< MRB assigned for retx. To update the name,
+                                   //!< what is MRB is not defined
+    uint32_t m_ulMRBRetx{0};       //!< MRB assigned for retx. To update the name,
+                                   //!< what is MRB is not defined
+    std::vector<uint16_t> m_dlRBG; //!< DL Resource Block Group assigned in this slot
+    std::vector<uint16_t> m_ulRBG; //!< UL Resource Block Group assigned in this slot
+    std::vector<uint8_t> m_dlSym;  //!< Corresponding symbol of m_dlRBG in this slot
+    std::vector<uint8_t> m_ulSym;  //!< Corresponding symbol of m_ulRBG in this slot
+
+    uint8_t m_dlMcs{0}; //!< DL MCS
+    std::optional<uint8_t>
+        m_fhMaxMcsAssignable; //!< Maximum DL MCS assignable due to FH limitations
+    uint8_t m_ulMcs{0};       //!< UL MCS
+
+    double m_dlOlla{0.0};    //!< DL outer-loop link adaptation offset, in MCS steps.
+                             //!< Driven by first-transmission HARQ feedback so that the
+                             //!< measured initial BLER converges on the configured target.
+                             //!< Zero (and unused) unless OllaStepUp > 0.
+    double m_dlOllaMax{0.0}; //!< Absolute clamp on m_dlOlla; 0 disables OLLA
+    double m_ulOlla{0.0};    //!< UL outer-loop link adaptation offset, in MCS steps
+    double m_ulOllaMax{0.0}; //!< Absolute clamp on m_ulOlla; 0 disables UL OLLA
+    bool m_ulMcsPerRbs{false};          //!< see GetUlMcsFor()
+    std::vector<double> m_ulSinrMeas;   //!< linear SINR of each RB of the last UL measurement
+    Ptr<const SpectrumModel> m_ulModel; //!< spectrum model of the UL measurements
+    /// MCS and CQI of the last measurement over a number of resource blocks (GetUlMcsFor())
+    mutable std::unordered_map<uint32_t, std::pair<uint8_t, uint8_t>> m_ulMcsByRbs;
+    mutable uint32_t m_ulMaxRbs{0}; //!< GetUlMaxRbs() of the last measurement; 0 = not yet
+
+    struct NR_EXPORT SbMcsInfo
+    {
+        uint8_t cqi;
+        uint8_t mcs;
+        float specEff;
+        float sinr;
+    };
+
+    std::vector<SbMcsInfo> m_dlSbMcsInfo; //!< Precomputed MCS, Spectral Efficiency and estimated
+                                          //!< SINR for a sub-band CQI associated with a RBG
+    std::vector<uint8_t> m_rbgToSb;       //!< Precomputed RBG to SB mapping
+
+    uint32_t m_dlTbSize{0}; //!< DL Transport Block Size, depends on MCS and RBG,
+                            //!< updated in UpdateDlMetric()
+    uint32_t m_ulTbSize{0}; //!< UL Transport Block Size, depends on MCS and RBG,
+                            //!< updated in UpdateDlMetric()
+    uint8_t m_dlRank{1};    //!< DL rank (number of MIMO layers)
+    uint8_t m_ulRank{1};    //!< UL rank (number of MIMO layers)
+    Ptr<const ComplexMatrixArray> m_dlPrecMats{nullptr}; //!< DL Precoding matrices
+    Ptr<const ComplexMatrixArray> m_ulPrecMats{nullptr}; //!< UL Precoding matrices
+
+    CqiInfo m_dlCqi; //!< DL CQI information
+    CqiInfo m_ulCqi; //!< UL CQI information
+
+    NrMacHarqVector m_dlHarq; //!< HARQ process vector for DL
+    NrMacHarqVector m_ulHarq; //!< HARQ process vector for UL
+
+    uint32_t m_srsPeriodicity{0}; //!< SRS periodicity
+    uint32_t m_srsOffset{0};      //!< SRS offset
+    uint8_t m_startMcsDlUe{0};    //!< Starting DL MCS to be used
+
+    // Settings from the scheduler, that affects MCS, TBS and throughput computation
+    Ptr<NrAmc> m_dlAmc;          //!< AMC instance of scheduler associated with DL
+    Ptr<NrAmc> m_ulAmc;          //!< AMC instance of scheduler associated with UL
+    McsCsiSource m_mcsCsiSource; //!< Source of MCS computation based on CSI feedback
+
+  protected:
+    /**
+     * @brief Retrieve the number of RB per RBG
+     *
+     * @return numRbPerRbg. Calls the MAC.
+     */
+    uint32_t GetNumRbPerRbg() const;
+
+  private:
+    const GetRbPerRbgFn m_getNumRbPerRbg; //!< Function that points to a method which knows the
+                                          //!< number of RB per RBG.
+};
+
+} // namespace ns3

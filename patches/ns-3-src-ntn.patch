@@ -1,0 +1,1580 @@
+diff --git a/src/antenna/model/angles.cc b/src/antenna/model/angles.cc
+index 145105259a..4388707634 100644
+--- a/src/antenna/model/angles.cc
++++ b/src/antenna/model/angles.cc
+@@ -10,6 +10,7 @@
+ 
+ #include "ns3/log.h"
+ 
++#include <algorithm>
+ #include <cmath>
+ 
+ namespace ns3
+@@ -194,7 +195,7 @@ Angles::Angles(double azimuth, double inclination)
+ 
+ Angles::Angles(Vector v)
+     : m_azimuth(std::atan2(v.y, v.x)),
+-      m_inclination(std::acos(v.z / v.GetLength()))
++      m_inclination(std::acos(std::clamp(v.z / v.GetLength(), -1.0, 1.0)))
+ {
+     // azimuth and inclination angles for zero-length vectors are not defined
+     if (v.x == 0.0 && v.y == 0.0 && v.z == 0.0)
+diff --git a/src/antenna/model/phased-array-model.h b/src/antenna/model/phased-array-model.h
+index 98cc928c67..7256081a6b 100644
+--- a/src/antenna/model/phased-array-model.h
++++ b/src/antenna/model/phased-array-model.h
+@@ -212,6 +212,15 @@ class PhasedArrayModel : public Object
+      */
+     const PhasedArrayModel::ComplexVector& GetBeamformingVectorRef() const;
+ 
++    /**
++     * @return true if a beamforming vector has been set for the current array configuration,
++     *         that is, if GetBeamformingVector() may be called
++     */
++    bool IsBeamformingVectorValid() const
++    {
++        return m_isBfVectorValid;
++    }
++
+     /**
+      * Returns the beamforming vector that points towards the specified position
+      * @param a the beamforming angle
+diff --git a/src/antenna/model/uniform-planar-array.cc b/src/antenna/model/uniform-planar-array.cc
+index 1034447570..7ed29c0daf 100644
+--- a/src/antenna/model/uniform-planar-array.cc
++++ b/src/antenna/model/uniform-planar-array.cc
+@@ -11,6 +11,8 @@
+ #include "ns3/log.h"
+ #include "ns3/uinteger.h"
+ 
++#include <algorithm>
++
+ namespace ns3
+ {
+ 
+@@ -225,7 +227,7 @@ UniformPlanarArray::GetElementFieldPattern(Angles a, uint8_t polIndex) const
+     double sinIncl = sin(inclination);
+     double cosAzim = cos(azimuth - m_alpha);
+     double sinAzim = sin(azimuth - m_alpha);
+-    double thetaPrime = std::acos(m_cosBeta * cosIncl + m_sinBeta * cosAzim * sinIncl);
++    double thetaPrime = std::acos(std::clamp(m_cosBeta * cosIncl + m_sinBeta * cosAzim * sinIncl, -1.0, 1.0));
+     double phiPrime =
+         std::arg(std::complex<double>(m_cosBeta * sinIncl * cosAzim - m_sinBeta * cosIncl,
+                                       sinAzim * sinIncl));
+diff --git a/src/mobility/model/geocentric-constant-position-mobility-model.cc b/src/mobility/model/geocentric-constant-position-mobility-model.cc
+index 8caa63d3ec..e0c13a9b14 100644
+--- a/src/mobility/model/geocentric-constant-position-mobility-model.cc
++++ b/src/mobility/model/geocentric-constant-position-mobility-model.cc
+@@ -136,11 +136,9 @@ double
+ GeocentricConstantPositionMobilityModel::DoGetDistanceFrom(
+     Ptr<const GeocentricConstantPositionMobilityModel> other) const
+ {
+-    Vector cartesianCoordA =
+-        GeographicPositions::GeographicToCartesianCoordinates(m_position.x,
+-                                                              m_position.y,
+-                                                              m_position.z,
+-                                                              GeographicPositions::SPHERE);
++    // Both ends through DoGetGeocentricPosition(), which a subclass that does not keep
++    // m_position (e.g. LeoCircularOrbitMobilityModel) overrides
++    Vector cartesianCoordA = DoGetGeocentricPosition();
+     Vector cartesianCoordB = other->DoGetGeocentricPosition();
+ 
+     double distance = (cartesianCoordA - cartesianCoordB).GetLength();
+diff --git a/src/mobility/model/leo-circular-orbit-mobility-model.cc b/src/mobility/model/leo-circular-orbit-mobility-model.cc
+index ddd1e2afe4..8bc6b9b6b8 100644
+--- a/src/mobility/model/leo-circular-orbit-mobility-model.cc
++++ b/src/mobility/model/leo-circular-orbit-mobility-model.cc
+@@ -216,7 +216,7 @@ LeoCircularOrbitMobilityModel::DoDispose()
+     GeocentricConstantPositionMobilityModel::DoDispose();
+ }
+ 
+-// The below two methods return the same ECEF position because this model's
++// The below methods derive their result from the ECEF position because this model's
+ // state is contained in orbital data members only; it never populates the
+ // base class m_position (lat/lon/alt) member variable.  Without these overrides,
+ // the methods would return the unused (0,0,0) m_position.  It is not clear
+@@ -230,6 +230,14 @@ LeoCircularOrbitMobilityModel::DoGetGeocentricPosition() const
+     return CalcPosition(Simulator::Now());
+ }
+ 
++Vector
++LeoCircularOrbitMobilityModel::DoGetGeographicPosition() const
++{
++    // The orbit radius is taken from the same sphere, so the altitude is the orbit's own
++    return GeographicPositions::CartesianToGeographicCoordinates(DoGetGeocentricPosition(),
++                                                                 GeographicPositions::SPHERE);
++}
++
+ Vector
+ LeoCircularOrbitMobilityModel::DoGetPosition() const
+ {
+diff --git a/src/mobility/model/leo-circular-orbit-mobility-model.h b/src/mobility/model/leo-circular-orbit-mobility-model.h
+index 35f0e6b0e5..04589b0d10 100644
+--- a/src/mobility/model/leo-circular-orbit-mobility-model.h
++++ b/src/mobility/model/leo-circular-orbit-mobility-model.h
+@@ -115,6 +115,12 @@ class LeoCircularOrbitMobilityModel : public GeocentricConstantPositionMobilityM
+      */
+     Vector DoGetGeocentricPosition() const override;
+ 
++    /**
++     * @brief Returns the geographic position of the Node, derived from its ECEF position
++     * @return latitude (degrees), longitude (degrees) and altitude (meters) on the sphere
++     */
++    Vector DoGetGeographicPosition() const override;
++
+     // Inherited from MobilityModel
+     Ptr<MobilityModel> Copy() const override
+     {
+diff --git a/src/mobility/test/leo-mobility-test-suite.cc b/src/mobility/test/leo-mobility-test-suite.cc
+index 2133be9b77..b1692cb7f1 100644
+--- a/src/mobility/test/leo-mobility-test-suite.cc
++++ b/src/mobility/test/leo-mobility-test-suite.cc
+@@ -98,6 +98,69 @@ LeoInitialPositionTestCase::DoRun()
+     Simulator::Destroy();
+ }
+ 
++/**
++ * @ingroup mobility-test
++ * @ingroup leo
++ *
++ * @brief Test that the geographic position and the distance of a LEO satellite come from its
++ * orbit.
++ *
++ * The model keeps its state in orbital members and never sets the base class's lat/lon/alt, so
++ * both used to report a point on the equator at sea level. The altitude must be the orbit's,
++ * the geographic position must map back to the ECEF position, and the distance to a ground node
++ * must be the ECEF distance, whichever end it is asked from.
++ */
++class LeoGeographicPositionTestCase : public TestCase
++{
++  public:
++    LeoGeographicPositionTestCase();
++
++  private:
++    void DoRun() override;
++};
++
++LeoGeographicPositionTestCase::LeoGeographicPositionTestCase()
++    : TestCase("LEO geographic position and distance follow the orbit")
++{
++}
++
++void
++LeoGeographicPositionTestCase::DoRun()
++{
++    auto sat = CreateObject<LeoCircularOrbitMobilityModel>();
++    sat->SetAttribute("Altitude", DoubleValue(600.0));   // km
++    sat->SetAttribute("Inclination", DoubleValue(53.0)); // degrees
++    sat->SetAttribute("Resolution", TimeValue(Seconds(0)));
++    sat->SetPosition(Vector(20.0, 30.0, 0.0)); // longitude, orbital offset (degrees)
++
++    const Vector geo = sat->GetGeographicPosition();
++    NS_TEST_ASSERT_MSG_EQ_TOL(geo.z, 600e3, 1e-3, "Altitude is not the orbit's");
++    const Vector ecef = sat->GetGeocentricPosition();
++    const Vector back =
++        GeographicPositions::GeographicToCartesianCoordinates(geo.x,
++                                                              geo.y,
++                                                              geo.z,
++                                                              GeographicPositions::SPHERE);
++    NS_TEST_ASSERT_MSG_EQ_TOL((back - ecef).GetLength(),
++                              0,
++                              1e-3,
++                              "Geographic position does not map back to the ECEF position");
++
++    auto ground = CreateObject<GeocentricConstantPositionMobilityModel>();
++    ground->SetGeographicPosition(Vector(45.0, 20.0, 0.0));
++    const double expected = (ecef - ground->GetGeocentricPosition()).GetLength();
++    NS_TEST_ASSERT_MSG_EQ_TOL(sat->GetDistanceFrom(ground),
++                              expected,
++                              1e-3,
++                              "Distance asked from the satellite is not the ECEF distance");
++    NS_TEST_ASSERT_MSG_EQ_TOL(ground->GetDistanceFrom(sat),
++                              expected,
++                              1e-3,
++                              "Distance asked from the ground is not the ECEF distance");
++
++    Simulator::Destroy();
++}
++
+ /**
+  * @ingroup mobility-test
+  * @ingroup leo
+@@ -870,6 +933,7 @@ LeoMobilityTestSuite::LeoMobilityTestSuite()
+     : TestSuite("leo-mobility", Type::UNIT)
+ {
+     AddTestCase(new LeoInitialPositionTestCase, TestCase::Duration::QUICK);
++    AddTestCase(new LeoGeographicPositionTestCase, TestCase::Duration::QUICK);
+     AddTestCase(new LeoEarthRotationTestCase, TestCase::Duration::QUICK);
+     AddTestCase(new LeoLongitudeOffsetTestCase, TestCase::Duration::QUICK);
+     AddTestCase(new LeoOrbitalOffsetTestCase, TestCase::Duration::QUICK);
+diff --git a/src/propagation/model/three-gpp-propagation-loss-model.cc b/src/propagation/model/three-gpp-propagation-loss-model.cc
+index 78763290cb..13eb2f6890 100644
+--- a/src/propagation/model/three-gpp-propagation-loss-model.cc
++++ b/src/propagation/model/three-gpp-propagation-loss-model.cc
+@@ -1761,10 +1761,16 @@ ThreeGppNTNDenseUrbanPropagationLossModel::GetLossLos(Ptr<MobilityModel> a,
+     NS_ASSERT_MSG(m_frequency <= 100.0e9,
+                   "NTN communications are valid for frequencies between 0.5 and 100 GHz.");
+ 
+-    double distance3D = CalculateDistance(a->GetPosition(), b->GetPosition());
++    Vector posA = a->GetPosition();
++    Vector posB = b->GetPosition();
++    double distance3D = CalculateDistance(posA, posB);
+     auto [elevAngle, elevAngleQuantized] =
+         ThreeGppChannelConditionModel::GetQuantizedElevationAngle(a, b);
+ 
++    NS_LOG_INFO("3GPP NTN DenseUrban - PosA: (" << posA.x << ", " << posA.y << ", " << posA.z 
++                  << ") | PosB: (" << posB.x << ", " << posB.y << ", " << posB.z 
++                  << ") | distance3D: " << distance3D << " m, elevAngle: " << elevAngle );
++
+     // compute the pathloss (see 3GPP TR 38.811, Table 6.6.2)
+     double loss = ComputeNtnPathloss(m_frequency, distance3D);
+ 
+@@ -1786,7 +1792,12 @@ ThreeGppNTNDenseUrbanPropagationLossModel::GetLossNlos(Ptr<MobilityModel> a,
+     NS_ASSERT_MSG(m_frequency <= 100.0e9,
+                   "NTN communications are valid for frequencies between 0.5 and 100 GHz.");
+ 
+-    double distance3D = CalculateDistance(a->GetPosition(), b->GetPosition());
++    // Use ECEF coordinates for consistent distance computation (same as GetLossLos)
++    auto geoMobA = DynamicCast<const GeocentricConstantPositionMobilityModel>(a);
++    auto geoMobB = DynamicCast<const GeocentricConstantPositionMobilityModel>(b);
++    Vector pos_a = geoMobA ? geoMobA->GetGeocentricPosition() : a->GetPosition();
++    Vector pos_b = geoMobB ? geoMobB->GetGeocentricPosition() : b->GetPosition();
++    double distance3D = CalculateDistance(pos_a, pos_b);
+     auto [elevAngle, elevAngleQuantized] =
+         ThreeGppChannelConditionModel::GetQuantizedElevationAngle(a, b);
+ 
+@@ -1932,7 +1943,12 @@ ThreeGppNTNUrbanPropagationLossModel::GetLossNlos(Ptr<MobilityModel> a, Ptr<Mobi
+     NS_ASSERT_MSG(m_frequency <= 100.0e9,
+                   "NTN communications are valid for frequencies between 0.5 and 100 GHz.");
+ 
+-    double distance3D = CalculateDistance(a->GetPosition(), b->GetPosition());
++    // Use ECEF coordinates for consistent distance computation (same as GetLossLos)
++    auto geoMobA = DynamicCast<const GeocentricConstantPositionMobilityModel>(a);
++    auto geoMobB = DynamicCast<const GeocentricConstantPositionMobilityModel>(b);
++    Vector pos_a = geoMobA ? geoMobA->GetGeocentricPosition() : a->GetPosition();
++    Vector pos_b = geoMobB ? geoMobB->GetGeocentricPosition() : b->GetPosition();
++    double distance3D = CalculateDistance(pos_a, pos_b);
+     auto [elevAngle, elevAngleQuantized] =
+         ThreeGppChannelConditionModel::GetQuantizedElevationAngle(a, b);
+ 
+@@ -2081,7 +2097,12 @@ ThreeGppNTNSuburbanPropagationLossModel::GetLossNlos(Ptr<MobilityModel> a,
+     NS_ASSERT_MSG(m_frequency <= 100.0e9,
+                   "NTN communications are valid for frequencies between 0.5 and 100 GHz.");
+ 
+-    double distance3D = CalculateDistance(a->GetPosition(), b->GetPosition());
++    // Use ECEF coordinates for consistent distance computation (same as GetLossLos)
++    auto geoMobA = DynamicCast<const GeocentricConstantPositionMobilityModel>(a);
++    auto geoMobB = DynamicCast<const GeocentricConstantPositionMobilityModel>(b);
++    Vector pos_a = geoMobA ? geoMobA->GetGeocentricPosition() : a->GetPosition();
++    Vector pos_b = geoMobB ? geoMobB->GetGeocentricPosition() : b->GetPosition();
++    double distance3D = CalculateDistance(pos_a, pos_b);
+     auto [elevAngle, elevAngleQuantized] =
+         ThreeGppChannelConditionModel::GetQuantizedElevationAngle(a, b);
+ 
+@@ -2202,21 +2223,35 @@ ThreeGppNTNRuralPropagationLossModel::GetLossLos(Ptr<MobilityModel> a, Ptr<Mobil
+     NS_LOG_FUNCTION(this);
+     NS_ASSERT_MSG(m_frequency <= 100.0e9,
+                   "NTN communications are valid for frequencies between 0.5 and 100 GHz.");
+-
+-    double distance3D = CalculateDistance(a->GetPosition(), b->GetPosition());
++        // Get positions using consistent ECEF coordinate system
++    Vector pos_a, pos_b;
++    
++    // Try to cast to GeocentricConstantPositionMobilityModel for ECEF coordinates
++    auto geoMobA = DynamicCast<const GeocentricConstantPositionMobilityModel>(a);
++    pos_a = geoMobA ? geoMobA->GetGeocentricPosition() : a->GetPosition();
++    
++    auto geoMobB = DynamicCast<const GeocentricConstantPositionMobilityModel>(b);
++    pos_b = geoMobB ? geoMobB->GetGeocentricPosition() : b->GetPosition();
++    double distance3D = CalculateDistance(pos_a, pos_b);
++
++    NS_LOG_INFO("a: (" << pos_a.x<<"," << pos_a.y << "," << pos_a.z << ") b: (" << pos_b.x << "," << pos_b.y << "," << pos_b.z << ")");
+     auto [elevAngle, elevAngleQuantized] =
+         ThreeGppChannelConditionModel::GetQuantizedElevationAngle(a, b);
+-
++    NS_LOG_INFO("Ele: " << elevAngle << " EleQ: " << elevAngleQuantized<<
++                 " Dist3D: " << distance3D / 1000 << " km");
+     // compute the pathloss (see 3GPP TR 38.811, Table 6.6.2)
+     double loss = ComputeNtnPathloss(m_frequency, distance3D);
+-
++    NS_LOG_DEBUG("FSP Loss " << loss);
++        
+     // Apply Atmospheric Absorption Loss 3GPP 38.811 6.6.4
+-    loss += ComputeAtmosphericAbsorptionLoss(m_frequency, elevAngle);
++    double atm_loss= ComputeAtmosphericAbsorptionLoss(m_frequency, elevAngle);
++    loss += atm_loss;
++    NS_LOG_DEBUG("ATM Loss " << atm_loss);
+ 
+     // Apply Ionospheric plus Tropospheric Scintillation Loss
+-    loss += ComputeIonosphericPlusTroposphericScintillationLoss(m_frequency, elevAngleQuantized);
+-
+-    NS_LOG_DEBUG("Loss " << loss);
++    double Scin_loss= ComputeIonosphericPlusTroposphericScintillationLoss(m_frequency, elevAngleQuantized);
++    loss += Scin_loss;
++    NS_LOG_DEBUG("Scintillation Loss " << Scin_loss);
+     return loss;
+ }
+ 
+@@ -2227,23 +2262,32 @@ ThreeGppNTNRuralPropagationLossModel::GetLossNlos(Ptr<MobilityModel> a, Ptr<Mobi
+     NS_ASSERT_MSG(m_frequency <= 100.0e9,
+                   "NTN communications are valid for frequencies between 0.5 and 100 GHz.");
+ 
+-    double distance3D = CalculateDistance(a->GetPosition(), b->GetPosition());
++    // Use ECEF coordinates for consistent distance computation (same as GetLossLos)
++    auto geoMobA = DynamicCast<const GeocentricConstantPositionMobilityModel>(a);
++    auto geoMobB = DynamicCast<const GeocentricConstantPositionMobilityModel>(b);
++    Vector pos_a = geoMobA ? geoMobA->GetGeocentricPosition() : a->GetPosition();
++    Vector pos_b = geoMobB ? geoMobB->GetGeocentricPosition() : b->GetPosition();
++    double distance3D = CalculateDistance(pos_a, pos_b);
+     auto [elevAngle, elevAngleQuantized] =
+         ThreeGppChannelConditionModel::GetQuantizedElevationAngle(a, b);
+ 
+     // compute the pathloss (see 3GPP TR 38.811, Table 6.6.2)
+     double loss = ComputeNtnPathloss(m_frequency, distance3D);
++    NS_LOG_DEBUG("FSP Loss " << loss);
+ 
+     // Apply Clutter Loss
+-    loss += ComputeClutterLoss(m_frequency, m_SFCL_SuburbanRural, elevAngleQuantized);
+-
++    double c_loss= ComputeClutterLoss(m_frequency, m_SFCL_SuburbanRural, elevAngleQuantized);
++    loss +=c_loss;
++    NS_LOG_DEBUG("Clutter Loss " << c_loss);
+     // Apply Atmospheric Absorption Loss 3GPP 38.811 6.6.4
+-    loss += ComputeAtmosphericAbsorptionLoss(m_frequency, elevAngle);
++    double atm_loss= ComputeAtmosphericAbsorptionLoss(m_frequency, elevAngle);
++    loss +=atm_loss;
++    NS_LOG_DEBUG("ATM Loss " << atm_loss);
+ 
+     // Apply Ionospheric plus Tropospheric Scintillation Loss
+-    loss += ComputeIonosphericPlusTroposphericScintillationLoss(m_frequency, elevAngleQuantized);
+-
+-    NS_LOG_DEBUG("Loss " << loss);
++    double Scin_loss= ComputeIonosphericPlusTroposphericScintillationLoss(m_frequency, elevAngleQuantized);
++    loss +=Scin_loss;
++    NS_LOG_DEBUG("Scintillation Loss " << Scin_loss);
+     return loss;
+ }
+ 
+diff --git a/src/spectrum/CMakeLists.txt b/src/spectrum/CMakeLists.txt
+index 23a9e403f0..53818e89c5 100644
+--- a/src/spectrum/CMakeLists.txt
++++ b/src/spectrum/CMakeLists.txt
+@@ -165,6 +165,7 @@ build_lib(
+     ${libantenna}
+     ${libbuildings}
+   TEST_SOURCES
++    test/multi-model-spectrum-channel-test.cc
+     test/spectrum-ideal-phy-test.cc
+     test/spectrum-interference-test.cc
+     test/spectrum-value-test.cc
+diff --git a/src/spectrum/model/multi-model-spectrum-channel.cc b/src/spectrum/model/multi-model-spectrum-channel.cc
+index 3c03dccc93..f9ce194ebc 100644
+--- a/src/spectrum/model/multi-model-spectrum-channel.cc
++++ b/src/spectrum/model/multi-model-spectrum-channel.cc
+@@ -226,6 +226,16 @@ MultiModelSpectrumChannel::StartTx(Ptr<SpectrumSignalParameters> txParams)
+                                            // potential underlying DynamicCasts)
+     m_txSigParamsTrace(txParamsTrace);
+ 
++    // The beam the signal leaves on. By the time it arrives, after the propagation delay, the
++    // transmitter may be using another one: a satellite link's delay spans several slots, and
++    // NR changes beams within a slot.
++    PhasedArrayModel::ComplexVector txBeam;
++    if (auto txArray = DynamicCast<PhasedArrayModel>(txParams->txPhy->GetAntenna());
++        txArray && txArray->IsBeamformingVectorValid())
++    {
++        txBeam = txArray->GetBeamformingVector();
++    }
++
+     auto wraparound = GetObject<WraparoundModel>();
+     auto refTxMobility = txParams->txPhy->GetMobility();
+     auto txMobility = refTxMobility;
+@@ -370,7 +380,8 @@ MultiModelSpectrumChannel::StartTx(Ptr<SpectrumSignalParameters> txParams)
+                               .txAntennaGain = txAntennaGain,
+                               .params = rxParams,
+                               .receiver = *rxPhyIterator,
+-                              .availableConvertedPsds = convertedPsds};
++                              .availableConvertedPsds = convertedPsds,
++                              .txBeamformingVector = txBeam};
+                 if (rxNetDevice)
+                 {
+                     // the receiver has a NetDevice, so we expect that it is attached to a Node
+@@ -411,7 +422,9 @@ MultiModelSpectrumChannel::StartRx(const RxInfo& rxInfo)
+         if (itConvertedPsd != rxInfo.availableConvertedPsds.cend())
+         {
+             NS_LOG_LOGIC("converted PSD already exists for " << phySpectrumModelUid);
+-            rxParams->psd = itConvertedPsd->second;
++            // Copy: the entry is shared by every receiver of this signal (and is the
++            // transmitter's own PSD when the models match), and the path loss scales it in place
++            rxParams->psd = Copy<SpectrumValue>(itConvertedPsd->second);
+         }
+         else
+         {
+@@ -434,6 +447,13 @@ MultiModelSpectrumChannel::StartRx(const RxInfo& rxInfo)
+                 rxParams->psd = rxConverterIterator->second.Convert(rxInfo.txPsd);
+             }
+         }
++        // Same rule as StartTx: a precoder cut for the old model no longer fits the new one.
++        if (rxParams->precodingMatrix &&
++            (rxParams->precodingMatrix->GetNumPages() != rxParams->psd->GetValuesN()))
++        {
++            NS_LOG_WARN("Precoding matrix conversion not supported yet.");
++            rxParams->precodingMatrix = nullptr;
++        }
+     }
+ 
+     auto txMobility = rxParams->txMobility;
+@@ -496,12 +516,29 @@ MultiModelSpectrumChannel::StartRx(const RxInfo& rxInfo)
+                           "PhasedArrayModel instances should be installed at both TX and RX "
+                           "SpectrumPhy in order to use PhasedArraySpectrumPropagationLoss.");
+ 
++            // Evaluate the gain with the beam the signal was sent on, then put back the one the
++            // transmitter is using now.
++            PhasedArrayModel::ComplexVector currentTxBeam;
++            const bool restore = rxInfo.txBeamformingVector.GetSize() ==
++                                     txPhasedArrayModel->GetNumElems() &&
++                                 txPhasedArrayModel->IsBeamformingVectorValid() &&
++                                 txPhasedArrayModel->GetBeamformingVector() !=
++                                     rxInfo.txBeamformingVector;
++            if (restore)
++            {
++                currentTxBeam = txPhasedArrayModel->GetBeamformingVector();
++                txPhasedArrayModel->SetBeamformingVector(rxInfo.txBeamformingVector);
++            }
+             rxParams = m_phasedArraySpectrumPropagationLoss->CalcRxPowerSpectralDensity(
+                 rxParams,
+                 txMobility,
+                 rxMobility,
+                 txPhasedArrayModel,
+                 rxPhasedArrayModel);
++            if (restore)
++            {
++                txPhasedArrayModel->SetBeamformingVector(currentTxBeam);
++            }
+         }
+     }
+ 
+diff --git a/src/spectrum/model/multi-model-spectrum-channel.h b/src/spectrum/model/multi-model-spectrum-channel.h
+index 0736f14ed6..04ca74d9f9 100644
+--- a/src/spectrum/model/multi-model-spectrum-channel.h
++++ b/src/spectrum/model/multi-model-spectrum-channel.h
+@@ -14,6 +14,7 @@
+ #include "spectrum-propagation-loss-model.h"
+ #include "spectrum-value.h"
+ 
++#include "ns3/phased-array-model.h"
+ #include "ns3/propagation-delay-model.h"
+ 
+ #include <map>
+@@ -138,6 +139,8 @@ class MultiModelSpectrumChannel : public SpectrumChannel
+         Ptr<SpectrumPhy> receiver;            //!< pointer to the receiver SpectrumPhy
+         std::map<SpectrumModelUid_t, Ptr<SpectrumValue>>
+             availableConvertedPsds; //!< available converted PSDs from the TX PSD
++        PhasedArrayModel::ComplexVector
++            txBeamformingVector; //!< TX beam when the signal left, empty if none was set
+     };
+ 
+     /**
+diff --git a/src/spectrum/model/sionna-rt-channel-model.cc b/src/spectrum/model/sionna-rt-channel-model.cc
+index 4ae6c0556d..357fda8e1b 100644
+--- a/src/spectrum/model/sionna-rt-channel-model.cc
++++ b/src/spectrum/model/sionna-rt-channel-model.cc
+@@ -11,6 +11,7 @@
+ #include "pybind11/pybind11.h"
+ 
+ #include "ns3/antenna-model.h"
++#include "ns3/boolean.h"
+ #include "ns3/double.h"
+ #include "ns3/log.h"
+ #include "ns3/mobility-model.h"
+@@ -20,6 +21,7 @@
+ #include "ns3/simulator.h"
+ #include "ns3/string.h"
+ #include "ns3/three-gpp-antenna-model.h"
++#include "ns3/uinteger.h"
+ #include "ns3/uniform-planar-array.h"
+ 
+ #include <filesystem>
+@@ -34,6 +36,8 @@ NS_OBJECT_ENSURE_REGISTERED(SionnaRtChannelModel);
+ 
+ /// Conversion factor: degrees to radians
+ static constexpr double DEG2RAD = M_PI / 180.0;
++/// Conversion factor: radians to degrees
++static constexpr double RAD2DEG = 180.0 / M_PI;
+ 
+ SionnaRtChannelModel::SionnaRtChannelModel()
+ {
+@@ -109,6 +113,22 @@ SionnaRtChannelModel::GetTypeId()
+                 MakeDoubleAccessor(&SionnaRtChannelModel::SetMaxNumberOfPaths,
+                                    &SionnaRtChannelModel::GetMaxNumberOfPaths),
+                 MakeDoubleChecker<double>())
++            .AddAttribute("Diffraction",
++                          "Trace diffracted paths as well as direct, reflected and refracted ones. "
++                          "Off by default, as in Sionna RT; around buildings it is often the only "
++                          "path left when the direct one is blocked",
++                          BooleanValue(false),
++                          MakeBooleanAccessor(&SionnaRtChannelModel::SetDiffraction,
++                                              &SionnaRtChannelModel::GetDiffraction),
++                          MakeBooleanChecker())
++            .AddAttribute("SamplesPerSource",
++                          "Rays launched per source by the path solver. Paths are found by "
++                          "shooting rays, so a distant source or a small target such as a roof "
++                          "edge needs more than Sionna RT's default of one million",
++                          UintegerValue(1000000),
++                          MakeUintegerAccessor(&SionnaRtChannelModel::SetSamplesPerSource,
++                                               &SionnaRtChannelModel::GetSamplesPerSource),
++                          MakeUintegerChecker<uint32_t>(1))
+             .AddAttribute("NormalizeDelays",
+                           "Enable normalization of path delays in Sionna RT CIR output",
+                           BooleanValue(true),
+@@ -260,6 +280,9 @@ SionnaRtChannelModel::GetChannel(Ptr<const MobilityModel> aMob,
+     {
+         NS_LOG_DEBUG("channel matrix not found");
+         notFound = true;
++        // PhasedArrayModel expects this call when a channel is first created: it clears the
++        // pair's out-of-date flag, which otherwise regenerates the channel on the next call.
++        aAntenna->IsChannelOutOfDate(bAntenna);
+     }
+ 
+     // If the channel is not present in the map or if it has to be updated
+@@ -304,7 +327,7 @@ SionnaRtChannelModel::GetNewChannel(const py::object paths,
+ {
+     NS_LOG_FUNCTION(this);
+     NS_LOG_DEBUG("Creating new ChannelMatrix from path information");
+-    Complex3DVector hUsn = CalculateCirFromPaths(paths);
++    Complex3DVector hUsn = CalculateCirFromPaths(paths, sAntenna, uAntenna);
+ 
+     Ptr<ChannelMatrix> channelMatrix = CreateNewMatrixChannel(hUsn, sMob, uMob, sAntenna, uAntenna);
+     NS_LOG_DEBUG("Successfully created new ChannelMatrix");
+@@ -377,11 +400,13 @@ SionnaRtChannelModel::LoadScene(const py::module_ rt) const
+ 
+     if (isXmlFile)
+     {
+-        // Load from XML file using Scene constructor
++        // Sionna RT 1.x and later load a scene file through load_scene, the same entry point as
++        // the built-in scenes; the Scene constructor no longer takes a filename and raises
++        // TypeError on one.
+         NS_LOG_DEBUG("Loading scene from XML file: " << m_sceneConfigs.sceneName);
+-        py::object Scene = rt.attr("Scene");
+-        scene = Scene(py::arg("filename") = m_sceneConfigs.sceneName,
+-                      py::arg("merge_shapes") = m_sceneConfigs.mergeShapes);
++        py::object load_scene = rt.attr("load_scene");
++        scene = load_scene(m_sceneConfigs.sceneName,
++                           py::arg("merge_shapes") = m_sceneConfigs.mergeShapes);
+     }
+     else
+     {
+@@ -594,6 +619,30 @@ SionnaRtChannelModel::GetRtPathSolverConfig() const
+     return m_RtPathSolverConfig;
+ }
+ 
++void
++SionnaRtChannelModel::SetDiffraction(bool enable)
++{
++    m_RtPathSolverConfig.diffraction = enable;
++}
++
++bool
++SionnaRtChannelModel::GetDiffraction() const
++{
++    return m_RtPathSolverConfig.diffraction;
++}
++
++void
++SionnaRtChannelModel::SetSamplesPerSource(uint32_t samples)
++{
++    m_RtPathSolverConfig.samplesPerSrc = samples;
++}
++
++uint32_t
++SionnaRtChannelModel::GetSamplesPerSource() const
++{
++    return m_RtPathSolverConfig.samplesPerSrc;
++}
++
+ py::object
+ SionnaRtChannelModel::CalculatePaths(const py::module_ rt, const py::object scene)
+ {
+@@ -617,7 +666,8 @@ SionnaRtChannelModel::CalculatePaths(const py::module_ rt, const py::object scen
+                         py::arg("diffuse_reflection") = m_RtPathSolverConfig.diffuseReflection,
+                         py::arg("refraction") = m_RtPathSolverConfig.refraction,
+                         py::arg("synthetic_array") = m_RtPathSolverConfig.syntheticArray,
+-                        py::arg("seed") = m_RtPathSolverConfig.seed);
++                        py::arg("seed") = m_RtPathSolverConfig.seed,
++                        py::arg("samples_per_src") = m_RtPathSolverConfig.samplesPerSrc);
+     }
+     else
+     {
+@@ -631,14 +681,15 @@ SionnaRtChannelModel::CalculatePaths(const py::module_ rt, const py::object scen
+                         py::arg("diffraction") = m_RtPathSolverConfig.diffraction,
+                         py::arg("edge_diffraction") = m_RtPathSolverConfig.edgeDiffraction,
+                         py::arg("synthetic_array") = m_RtPathSolverConfig.syntheticArray,
+-                        py::arg("seed") = m_RtPathSolverConfig.seed);
++                        py::arg("seed") = m_RtPathSolverConfig.seed,
++                        py::arg("samples_per_src") = m_RtPathSolverConfig.samplesPerSrc);
+     }
+ 
+     NS_LOG_INFO("Path computation finished");
+ 
+     size_t num_paths = GetNumberOfPathsFromCir(paths);
+     NS_LOG_INFO("Number of generated paths: " << num_paths);
+-    if (DoesNumberOfPathsExceedMaximum(num_paths))
++    if (DoesNumberOfPathsExceedMaximum(num_paths) && m_RtPathSolverConfig.maxDepth > 0)
+     {
+         NS_LOG_WARN("Number of generated paths (" << num_paths
+                                                   << ") exceeds the configured maximum number of "
+@@ -646,8 +697,11 @@ SionnaRtChannelModel::CalculatePaths(const py::module_ rt, const py::object scen
+                                                   << m_maxNumberOfPaths
+                                                   << "). The excess paths will be ignored.");
+ 
++        // Retrace this link one level shallower; later links start from the configured depth.
++        const int configuredDepth = m_RtPathSolverConfig.maxDepth;
+         m_RtPathSolverConfig.maxDepth -= 1;
+         paths = CalculatePaths(rt, scene);
++        m_RtPathSolverConfig.maxDepth = configuredDepth;
+     }
+ 
+     if (m_isImageRendered && num_paths > 0)
+@@ -684,8 +738,36 @@ SionnaRtChannelModel::SceneRenderImageToFile(const py::module_ rt,
+     count += 1;
+ }
+ 
++/**
++ * Map a UniformPlanarArray element index to the index of the same element in the Sionna
++ * PlanarArray built from it. Both put the polarization outermost, but within a polarization
++ * UniformPlanarArray counts along each row starting from the bottom row, while PlanarArray
++ * counts down each column starting from the top row.
++ *
++ * @param antenna the array
++ * @param index the UniformPlanarArray element index
++ * @return the PlanarArray element index
++ */
++static size_t
++GetSionnaElementIndex(Ptr<const PhasedArrayModel> antenna, size_t index)
++{
++    auto upa = DynamicCast<const UniformPlanarArray>(antenna);
++    if (!upa)
++    {
++        return index; // modelled as a single element, see MakePlannarArray
++    }
++    const size_t rows = upa->GetNumRows();
++    const size_t cols = upa->GetNumColumns();
++    const size_t pol = index / (rows * cols);
++    const size_t row = (index % (rows * cols)) / cols;
++    const size_t col = index % cols;
++    return pol * rows * cols + col * rows + (rows - 1 - row);
++}
++
+ MatrixBasedChannelModel::Complex3DVector
+-SionnaRtChannelModel::CalculateCirFromPaths(const py::object paths) const
++SionnaRtChannelModel::CalculateCirFromPaths(const py::object paths,
++                                            Ptr<const PhasedArrayModel> sAntenna,
++                                            Ptr<const PhasedArrayModel> uAntenna) const
+ {
+     NS_LOG_FUNCTION(this);
+     py::module_ np = py::module_::import("numpy");
+@@ -693,28 +775,29 @@ SionnaRtChannelModel::CalculateCirFromPaths(const py::object paths) const
+     py::tuple cir = paths.attr("cir")(py::arg("normalize_delays") = m_normalizeDelays,
+                                       py::arg("out_type") = "numpy");
+ 
++    // a is [num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths, num_time_steps]
+     py::object a_py = np.attr("asarray")(cir[0], py::arg("dtype") = np.attr("complex128"));
+     py::buffer_info a_info = py::buffer(a_py).request();
+-    auto* data = static_cast<std::complex<double>*>(a_info.ptr);
++    const auto* data = static_cast<const std::complex<double>*>(a_info.ptr);
++    const auto stride = [&a_info](size_t dim) {
++        return static_cast<size_t>(a_info.strides[dim]) / sizeof(std::complex<double>);
++    };
+ 
+-    // Generate channel coefficients for each cluster n and each receiver
+-    //  and transmitter element pair u,s.
+-    // where n is cluster index, u and s are receive and transmit antenna element.
+-    // Create the Complex3DVector and copy data a_info.shape[1]:num_ant_rx,
+-    // a_info.shape[3]:num_ant_tx, a_info.shape[4]:num_paths
++    // Channel coefficient for each receive element u, transmit element s and path n
+     Complex3DVector hUsn(a_info.shape[1], a_info.shape[3], a_info.shape[4]);
+     NS_LOG_DEBUG("CIR numpy buffer shapes: shape[1]="
+                  << a_info.shape[1] << " shape[3]=" << a_info.shape[3]
+                  << " shape[4]=" << a_info.shape[4] << " total size=" << a_info.size);
+ 
+-    for (size_t cIndex = 0; cIndex < hUsn.GetNumPages(); cIndex++)
++    for (size_t u = 0; u < hUsn.GetNumRows(); u++)
+     {
+-        for (size_t rowIdx = 0; rowIdx < hUsn.GetNumRows(); rowIdx++)
++        const size_t uOffset = GetSionnaElementIndex(uAntenna, u) * stride(1);
++        for (size_t s = 0; s < hUsn.GetNumCols(); s++)
+         {
+-            for (size_t colIdx = 0; colIdx < hUsn.GetNumCols(); colIdx++)
++            const size_t sOffset = GetSionnaElementIndex(sAntenna, s) * stride(3);
++            for (size_t n = 0; n < hUsn.GetNumPages(); n++)
+             {
+-                size_t idx = (cIndex * hUsn.GetNumRows() + rowIdx) * hUsn.GetNumCols() + colIdx;
+-                hUsn(rowIdx, colIdx, cIndex) = data[idx];
++                hUsn(u, s, n) = data[uOffset + sOffset + n * stride(4)];
+             }
+         }
+     }
+@@ -808,10 +891,11 @@ SionnaRtChannelModel::CalculateAnglesFromPaths(const py::module_ np,
+     size_t angelSize = (m_RtPathSolverConfig.syntheticArray) ? size_t(angle_info.shape[2])
+                                                              : size_t(angle_info.shape[4]);
+ 
++    // Sionna reports radians; ChannelParams::m_angle holds degrees
+     MatrixBasedChannelModel::DoubleVector angleVector;
+     for (size_t i = 0; i < angelSize; ++i)
+     {
+-        angleVector.push_back(data[i]);
++        angleVector.push_back(data[i] * RAD2DEG);
+     }
+     NS_LOG_DEBUG("Extracted " << angleVector.size() << " values for angle type " << Angle);
+ 
+diff --git a/src/spectrum/model/sionna-rt-channel-model.h b/src/spectrum/model/sionna-rt-channel-model.h
+index e790239d4d..1bf61afed7 100644
+--- a/src/spectrum/model/sionna-rt-channel-model.h
++++ b/src/spectrum/model/sionna-rt-channel-model.h
+@@ -308,6 +308,12 @@ class SionnaRtChannelModel : public MatrixBasedChannelModel
+          * Random seed for stochastic components (e.g., diffuse scattering)
+          */
+         int seed = 41;
++
++        /**
++         * Rays launched per source. The solver finds paths by shooting rays, so a distant or
++         * small target (a proxy transmitter kilometres out, a roof edge) needs more of them.
++         */
++        uint32_t samplesPerSrc = 1000000;
+     };
+ 
+     /**
+@@ -464,6 +470,21 @@ class SionnaRtChannelModel : public MatrixBasedChannelModel
+      */
+     RtPathSolverConfig GetRtPathSolverConfig() const;
+ 
++    /**
++     * Enable or disable diffraction in the path solver.
++     * @param enable true to trace diffracted paths
++     */
++    void SetDiffraction(bool enable);
++    /** @return whether the path solver traces diffracted paths */
++    bool GetDiffraction() const;
++    /**
++     * Set the number of rays launched per source.
++     * @param samples rays per source
++     */
++    void SetSamplesPerSource(uint32_t samples);
++    /** @return the number of rays launched per source */
++    uint32_t GetSamplesPerSource() const;
++
+   protected:
+     /**
+      * @brief Load a Sionna RT scene using the configured scenario name.
+@@ -549,9 +570,13 @@ class SionnaRtChannelModel : public MatrixBasedChannelModel
+      * Doppler and delays from the paths object.
+      *
+      * @param paths Python object representing computed paths
++     * @param sAntenna the antenna array of the s node, the transmitter
++     * @param uAntenna the antenna array of the u node, the receiver
+      * @return Complex3DVector containing CIRs for Rx/Tx element pairs
+      */
+-    Complex3DVector CalculateCirFromPaths(const py::object paths) const;
++    Complex3DVector CalculateCirFromPaths(const py::object paths,
++                                          Ptr<const PhasedArrayModel> sAntenna,
++                                          Ptr<const PhasedArrayModel> uAntenna) const;
+ 
+     /**
+      * @brief Extract delays (tau) per path from RS paths object.
+diff --git a/src/spectrum/model/sionna-rt-spectrum-propagation-loss-model.cc b/src/spectrum/model/sionna-rt-spectrum-propagation-loss-model.cc
+index 40f3faf502..fb148322c5 100644
+--- a/src/spectrum/model/sionna-rt-spectrum-propagation-loss-model.cc
++++ b/src/spectrum/model/sionna-rt-spectrum-propagation-loss-model.cc
+@@ -233,13 +233,20 @@ SionnaRtSpectrumPropagationLossModel::CalcBeamformingGain(
+ 
+     NS_ASSERT(numCluster <= longTerm->GetNumPages());
+ 
+-    double slotTime = Simulator::Now().GetSeconds();
+-    double factor = 2 * M_PI * slotTime * GetFrequency() / 3e8;
++    // Per-path phase applied on top of the sub-band delay term of GenSpectrumChannelMatrix.
++    // Sionna's Doppler shifts are in Hz and the coefficients are those of the instant the
++    // channel was generated. The coefficients from Paths.cir() already carry the carrier phase
++    // exp(-j 2 pi fc tau), which GenSpectrumChannelMatrix applies again as part of
++    // exp(-j 2 pi f tau) at the absolute sub-band frequency f, so it is removed here once.
++    const double elapsed = (Simulator::Now() - sionnaRtChannelParams->m_generatedTime).GetSeconds();
++    const double carrierFrequency = GetFrequency();
+     for (size_t cIndex = 0; cIndex < numCluster; cIndex++)
+     {
+         doppler[cIndex] =
+-            std::complex<double>(cos(sionnaRtChannelParams->m_doppler[cIndex] * factor),
+-                                 sin(sionnaRtChannelParams->m_doppler[cIndex] * factor));
++            std::polar(1.0,
++                       2 * M_PI *
++                           (sionnaRtChannelParams->m_doppler[cIndex] * elapsed +
++                            carrierFrequency * sionnaRtChannelParams->m_delay[cIndex]));
+     }
+ 
+     NS_ASSERT(numCluster <= doppler.GetSize());
+diff --git a/src/spectrum/model/three-gpp-channel-model.cc b/src/spectrum/model/three-gpp-channel-model.cc
+index a265e049a6..1ca7794885 100644
+--- a/src/spectrum/model/three-gpp-channel-model.cc
++++ b/src/spectrum/model/three-gpp-channel-model.cc
+@@ -34,6 +34,27 @@ NS_LOG_COMPONENT_DEFINE("ThreeGppChannelModel");
+ 
+ NS_OBJECT_ENSURE_REGISTERED(ThreeGppChannelModel);
+ 
++/**
++ * \brief Get position in a consistent coordinate frame for channel model computations.
++ *
++ * For NTN (Non-Terrestrial Network) scenarios, LeoCircularOrbitMobilityModel returns
++ * ECEF coordinates from GetPosition(), while GeocentricConstantPositionMobilityModel
++ * returns topocentric coordinates. This mismatch causes wrong distance and angle
++ * computations in the channel model. This helper returns ECEF (via GetGeocentricPosition())
++ * for any GeocentricConstantPositionMobilityModel, and GetPosition() otherwise,
++ * ensuring both ends use the same coordinate frame.
++ */
++static Vector
++GetConsistentPosition(const Ptr<const MobilityModel>& mob)
++{
++    auto geoMob = DynamicCast<const GeocentricConstantPositionMobilityModel>(mob);
++    if (geoMob)
++    {
++        return geoMob->GetGeocentricPosition();
++    }
++    return mob->GetPosition();
++}
++
+ /// Conversion factor: degrees to radians
+ constexpr double DEG2RAD = M_PI / 180.0;
+ /**
+@@ -1274,11 +1295,15 @@ ThreeGppChannelModel::GetThreeGppTable(Ptr<const MobilityModel> aMob,
+ 
+     // NOTE we assume hUT = min (height(a), height(b)) and
+     // hBS = max (height (a), height (b))
+-    double hUT = std::min(aMob->GetPosition().z, bMob->GetPosition().z);
+-    double hBS = std::max(aMob->GetPosition().z, bMob->GetPosition().z);
++    // Use GetConsistentPosition() to ensure both nodes are in the same coordinate frame
++    // (ECEF for NTN scenarios where satellite and ground nodes would otherwise use different frames)
++    Vector aPosConsistent = GetConsistentPosition(aMob);
++    Vector bPosConsistent = GetConsistentPosition(bMob);
++    double hUT = std::min(aPosConsistent.z, bPosConsistent.z);
++    double hBS = std::max(aPosConsistent.z, bPosConsistent.z);
+ 
+-    double distance2D = sqrt(pow(aMob->GetPosition().x - bMob->GetPosition().x, 2) +
+-                             pow(aMob->GetPosition().y - bMob->GetPosition().y, 2));
++    double distance2D = sqrt(pow(aPosConsistent.x - bPosConsistent.x, 2) +
++                             pow(aPosConsistent.y - bPosConsistent.y, 2));
+ 
+     double fcGHz = m_frequency / 1.0e9;
+     Ptr<ParamsTable> table3gpp = Create<ParamsTable>();
+@@ -2928,8 +2953,8 @@ ThreeGppChannelModel::GenerateClusterAngles(Ptr<const ThreeGppChannelParams> cha
+         clusterZod[cIndex] = lsps.ZSD * angle;
+     }
+ 
+-    const Angles sAngle(bMob->GetPosition(), aMob->GetPosition());
+-    const Angles uAngle(aMob->GetPosition(), bMob->GetPosition());
++    const Angles sAngle(GetConsistentPosition(bMob), GetConsistentPosition(aMob));
++    const Angles uAngle(GetConsistentPosition(aMob), GetConsistentPosition(bMob));
+ 
+     for (uint8_t cIndex = 0; cIndex < channelParams->m_reducedClusterNumber; cIndex++)
+     {
+@@ -3609,8 +3634,9 @@ ThreeGppChannelModel::ComputeEndpointDisplacement2d(Ptr<const MobilityModel> aMo
+         std::swap(firstMob, secondMob);
+     }
+ 
+-    const Vector posFirst = firstMob->GetPosition();
+-    const Vector posSecond = secondMob->GetPosition();
++    // Both endpoints in one frame (ECEF for NTN): see GetConsistentPosition().
++    const Vector posFirst = GetConsistentPosition(firstMob);
++    const Vector posSecond = GetConsistentPosition(secondMob);
+ 
+     const double dispFirst =
+         std::hypot(posFirst.x - lastPositionFirst.x, posFirst.y - lastPositionFirst.y);
+@@ -3644,8 +3670,9 @@ ThreeGppChannelModel::UpdateLinkGeometry(Ptr<const MobilityModel> aMob,
+     }
+ 
+     // Obtain the new positions
+-    const Vector posFirst = firstMob->GetPosition();
+-    const Vector posSecond = secondMob->GetPosition();
++    // Both endpoints in one frame (ECEF for NTN): see GetConsistentPosition().
++    const Vector posFirst = GetConsistentPosition(firstMob);
++    const Vector posSecond = GetConsistentPosition(secondMob);
+ 
+     const double deltaX = posFirst.x - posSecond.x;
+     const double deltaY = posFirst.y - posSecond.y;
+@@ -4049,9 +4076,12 @@ ThreeGppChannelModel::GetNewChannel(Ptr<const ThreeGppChannelParams> channelPara
+     NS_ASSERT(table3gpp->m_raysPerCluster <= rayAodRadian[0].size());
+ 
+     double distance3D = channelParams->m_dis3D;
++    // Both endpoints in one frame (ECEF for NTN): see GetConsistentPosition().
++    const Vector sMobPos = GetConsistentPosition(sMob);
++    const Vector uMobPos = GetConsistentPosition(uMob);
+ 
+-    Angles sAngle(uMob->GetPosition(), sMob->GetPosition());
+-    Angles uAngle(sMob->GetPosition(), uMob->GetPosition());
++    Angles sAngle(uMobPos, sMobPos);
++    Angles uAngle(sMobPos, uMobPos);
+ 
+     Double2DVector sinCosA; // cached multiplications of sin and cos of the ZoA and AoA angles
+     Double2DVector sinSinA; // cached multiplications of sines of the ZoA and AoA angles
+@@ -4300,6 +4330,7 @@ ThreeGppChannelModel::GetNewChannel(Ptr<const ThreeGppChannelParams> channelPara
+                       std::complex(cos(txPhaseDiff), sin(txPhaseDiff));
+ 
+                 double kLinear = pow(10, channelParams->m_K_factor / 10.0);
++
+                 // the LOS path should be attenuated if blockage is enabled.
+                 hUsn(uIndex, sIndex, 0) =
+                     sqrt(1.0 / (kLinear + 1)) * hUsn(uIndex, sIndex, 0) +
+diff --git a/src/spectrum/test/multi-model-spectrum-channel-test.cc b/src/spectrum/test/multi-model-spectrum-channel-test.cc
+new file mode 100644
+index 0000000000..0d2973274c
+--- /dev/null
++++ b/src/spectrum/test/multi-model-spectrum-channel-test.cc
+@@ -0,0 +1,240 @@
++// Copyright (c) 2026 Jesse Chiu (Kuan-Po), University of Washington
++//
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include "ns3/constant-position-mobility-model.h"
++#include "ns3/matrix-array.h"
++#include "ns3/multi-model-spectrum-channel.h"
++#include "ns3/net-device.h"
++#include "ns3/propagation-delay-model.h"
++#include "ns3/propagation-loss-model.h"
++#include "ns3/simulator.h"
++#include "ns3/spectrum-phy.h"
++#include "ns3/spectrum-signal-parameters.h"
++#include "ns3/spectrum-value.h"
++#include "ns3/test.h"
++
++using namespace ns3;
++
++/**
++ * @ingroup spectrum-tests
++ *
++ * Minimal SpectrumPhy that records the last received signal and can re-tune to another
++ * receive spectrum model.
++ */
++class RetuneTestPhy : public SpectrumPhy
++{
++  public:
++    /**
++     * Constructor.
++     *
++     * @param model The initial receive spectrum model.
++     */
++    RetuneTestPhy(Ptr<const SpectrumModel> model)
++        : m_model(model)
++    {
++    }
++
++    /**
++     * Switch to another receive spectrum model and notify the channel, as a PHY that
++     * re-tunes must.
++     *
++     * @param model The new receive spectrum model.
++     */
++    void Retune(Ptr<const SpectrumModel> model)
++    {
++        m_model = model;
++        m_channel->AddRx(this);
++    }
++
++    void SetDevice(Ptr<NetDevice> d) override
++    {
++        m_device = d;
++    }
++
++    Ptr<NetDevice> GetDevice() const override
++    {
++        return m_device;
++    }
++
++    void SetMobility(Ptr<MobilityModel> m) override
++    {
++        m_mobility = m;
++    }
++
++    Ptr<MobilityModel> GetMobility() const override
++    {
++        return m_mobility;
++    }
++
++    void SetChannel(Ptr<SpectrumChannel> c) override
++    {
++        m_channel = c;
++    }
++
++    Ptr<const SpectrumModel> GetRxSpectrumModel() const override
++    {
++        return m_model;
++    }
++
++    Ptr<Object> GetAntenna() const override
++    {
++        return nullptr;
++    }
++
++    void StartRx(Ptr<SpectrumSignalParameters> params) override
++    {
++        m_rxParams = params;
++    }
++
++    Ptr<SpectrumSignalParameters> m_rxParams; ///< Last received signal
++
++  private:
++    Ptr<const SpectrumModel> m_model; ///< Receive spectrum model
++    Ptr<NetDevice> m_device;          ///< Device
++    Ptr<MobilityModel> m_mobility;    ///< Mobility model
++    Ptr<SpectrumChannel> m_channel;   ///< Channel
++};
++
++/**
++ * @ingroup spectrum-tests
++ *
++ * A receiver that switches spectrum model while a signal is in flight, as a PHY that
++ * re-tunes during a long propagation delay does. The channel converts the PSD to the new
++ * model on arrival; this checks what comes with it.
++ *
++ * - Precoder: a precoding matrix has one page per band of the model it was built for. After
++ *   the conversion it no longer fits and must be dropped, as StartTx already does for a
++ *   receiver whose model differs at transmission. A receiver that did not re-tune keeps it.
++ * - Shared PSD: when the new model already has a converted PSD for this signal, that PSD is
++ *   shared by every receiver (it is the transmitter's own PSD when the models match), so the
++ *   receiver must work on a copy. Otherwise its path loss is applied to the shared one, and
++ *   a second receiver on the same model gets both path losses.
++ */
++class MultiModelSpectrumChannelRetuneTestCase : public TestCase
++{
++  public:
++    MultiModelSpectrumChannelRetuneTestCase();
++
++  private:
++    void DoRun() override;
++};
++
++MultiModelSpectrumChannelRetuneTestCase::MultiModelSpectrumChannelRetuneTestCase()
++    : TestCase("Receiver switching spectrum model while a signal is in flight")
++{
++}
++
++void
++MultiModelSpectrumChannelRetuneTestCase::DoRun()
++{
++    // 10 MHz bands around 2 GHz: four for the transmitter, the two middle ones for the
++    // narrow receivers, so the two models overlap and a converter exists between them.
++    auto makeModel = [](double firstLowHz, int numBands) {
++        Bands bands;
++        for (int i = 0; i < numBands; ++i)
++        {
++            BandInfo b;
++            b.fl = firstLowHz + i * 10e6;
++            b.fc = b.fl + 5e6;
++            b.fh = b.fl + 10e6;
++            bands.push_back(b);
++        }
++        return Create<SpectrumModel>(bands);
++    };
++    Ptr<SpectrumModel> wide = makeModel(1.98e9, 4);
++    Ptr<SpectrumModel> narrow = makeModel(1.99e9, 2);
++
++    auto channel = CreateObject<MultiModelSpectrumChannel>();
++    channel->SetPropagationDelayModel(CreateObject<ConstantSpeedPropagationDelayModel>());
++    auto loss = CreateObject<FixedRssLossModel>();
++    loss->SetRss(-10); // dBm for 0 dBm sent: 10 dB, so every receiver gets 0.1 of the PSD
++    channel->AddPropagationLossModel(loss);
++
++    auto addPhy = [&](Ptr<const SpectrumModel> model, double xM) {
++        auto phy = CreateObject<RetuneTestPhy>(model);
++        auto mobility = CreateObject<ConstantPositionMobilityModel>();
++        mobility->SetPosition(Vector(xM, 0, 0));
++        phy->SetMobility(mobility);
++        phy->SetChannel(channel);
++        return phy;
++    };
++    auto txPhy = addPhy(wide, 0);
++    // 3 km: the signal is in flight for 10 us
++    auto stayPhy = addPhy(wide, 3000);    // never re-tunes
++    auto narrowPhy = addPhy(wide, 3000);  // wide -> narrow in flight
++    auto widePhyA = addPhy(narrow, 3000); // narrow -> wide in flight
++    auto widePhyB = addPhy(narrow, 3000); // narrow -> wide in flight
++    for (const auto& rx : {stayPhy, narrowPhy, widePhyA, widePhyB})
++    {
++        channel->AddRx(rx);
++    }
++
++    auto txPsd = Create<SpectrumValue>(wide);
++    *txPsd = 1.0;
++    auto params = Create<SpectrumSignalParameters>();
++    params->psd = txPsd;
++    params->duration = MicroSeconds(1);
++    params->txPhy = txPhy;
++    params->precodingMatrix = Create<const ComplexMatrixArray>(1, 1, wide->GetNumBands());
++
++    const Time txTime = MilliSeconds(1);
++    Simulator::Schedule(txTime, [&]() { channel->StartTx(params); });
++    Simulator::Schedule(txTime + MicroSeconds(5), [&]() {
++        narrowPhy->Retune(narrow);
++        widePhyA->Retune(wide);
++        widePhyB->Retune(wide);
++    });
++    Simulator::Run();
++
++    for (const auto& rx : {stayPhy, narrowPhy, widePhyA, widePhyB})
++    {
++        NS_TEST_ASSERT_MSG_NE(rx->m_rxParams, nullptr, "Expected one reception");
++    }
++
++    // Precoder
++    NS_TEST_ASSERT_MSG_EQ(narrowPhy->m_rxParams->psd->GetValuesN(),
++                          narrow->GetNumBands(),
++                          "PSD not converted to the receiver's new model");
++    NS_TEST_ASSERT_MSG_EQ(narrowPhy->m_rxParams->precodingMatrix,
++                          nullptr,
++                          "Precoder built for the old model was not dropped");
++    NS_TEST_ASSERT_MSG_NE(stayPhy->m_rxParams->precodingMatrix,
++                          nullptr,
++                          "Precoder dropped for a receiver whose model did not change");
++
++    // Shared PSD
++    for (const auto& rx : {stayPhy, widePhyA, widePhyB})
++    {
++        for (size_t i = 0; i < wide->GetNumBands(); ++i)
++        {
++            NS_TEST_ASSERT_MSG_EQ_TOL((*rx->m_rxParams->psd)[i],
++                                      0.1,
++                                      1e-12,
++                                      "Received PSD is not the transmitted PSD less one path loss");
++        }
++    }
++    NS_TEST_ASSERT_MSG_EQ_TOL((*txPsd)[0], 1.0, 1e-12, "The channel modified the transmitted PSD");
++
++    Simulator::Destroy();
++}
++
++/**
++ * @ingroup spectrum-tests
++ *
++ * MultiModelSpectrumChannel test suite.
++ */
++class MultiModelSpectrumChannelTestSuite : public TestSuite
++{
++  public:
++    MultiModelSpectrumChannelTestSuite();
++};
++
++MultiModelSpectrumChannelTestSuite::MultiModelSpectrumChannelTestSuite()
++    : TestSuite("multi-model-spectrum-channel", Type::UNIT)
++{
++    AddTestCase(new MultiModelSpectrumChannelRetuneTestCase(), TestCase::Duration::QUICK);
++}
++
++/// Static variable for test initialization
++static MultiModelSpectrumChannelTestSuite g_multiModelSpectrumChannelTestSuite;
+diff --git a/src/spectrum/test/sionna-channel-model-test.cc b/src/spectrum/test/sionna-channel-model-test.cc
+index 62d3aa7856..d7b4195c55 100644
+--- a/src/spectrum/test/sionna-channel-model-test.cc
++++ b/src/spectrum/test/sionna-channel-model-test.cc
+@@ -26,7 +26,9 @@
+ #include "ns3/boolean.h"
+ #include "ns3/config.h"
+ #include "ns3/constant-position-mobility-model.h"
++#include "ns3/constant-velocity-mobility-model.h"
+ #include "ns3/double.h"
++#include "ns3/isotropic-antenna-model.h"
+ #include "ns3/log.h"
+ #include "ns3/matrix-based-channel-model.h"
+ #include "ns3/node.h"
+@@ -34,12 +36,20 @@
+ #include "ns3/pointer.h"
+ #include "ns3/simulator.h"
+ #include "ns3/sionna-rt-channel-model.h"
++#include "ns3/sionna-rt-spectrum-propagation-loss-model.h"
++#include "ns3/spectrum-signal-parameters.h"
++#include "ns3/spectrum-value.h"
+ #include "ns3/string.h"
+ #include "ns3/test.h"
+ #include "ns3/uinteger.h"
+ #include "ns3/uniform-planar-array.h"
+ 
++#include <cmath>
++#include <complex>
++#include <pybind11/embed.h>
++#include <pybind11/numpy.h>
+ #include <pybind11/pybind11.h>
++#include <vector>
+ namespace py = pybind11;
+ 
+ using namespace ns3;
+@@ -49,6 +59,21 @@ NS_LOG_COMPONENT_DEFINE("SionnaRtChannelModelTest");
+ // ---------------------------------------------------------------------------
+ // Helpers
+ // ---------------------------------------------------------------------------
++
++/**
++ * Start the embedded Python interpreter once for the whole suite. The suite finalizes it after
++ * its last test case, because numpy, which Sionna loads, cannot be initialized a second time in
++ * one process, and Dr.Jit aborts at exit if the interpreter is still alive.
++ */
++static void
++EnsurePythonInterpreter()
++{
++    if (!Py_IsInitialized())
++    {
++        py::initialize_interpreter();
++    }
++}
++
+ static Ptr<UniformPlanarArray>
+ CreateUpa(uint32_t rows, uint32_t cols)
+ {
+@@ -58,6 +83,22 @@ CreateUpa(uint32_t rows, uint32_t cols)
+     return upa;
+ }
+ 
++/**
++ * Create a single-polarized uniform planar array of isotropic elements, so that every element
++ * and path sees the same element gain and only the geometry sets the phases.
++ *
++ * @param rows number of rows
++ * @param cols number of columns
++ * @return the array
++ */
++static Ptr<UniformPlanarArray>
++CreateIsotropicUpa(uint32_t rows, uint32_t cols)
++{
++    Ptr<UniformPlanarArray> upa = CreateUpa(rows, cols);
++    upa->SetAttribute("AntennaElement", PointerValue(CreateObject<IsotropicAntennaModel>()));
++    return upa;
++}
++
+ static Ptr<MobilityModel>
+ CreateMobility(double x, double y, double z)
+ {
+@@ -68,11 +109,35 @@ CreateMobility(double x, double y, double z)
+     return mob;
+ }
+ 
++/**
++ * Unit vector of a direction given by zenith and azimuth angles in degrees.
++ *
++ * @param zenithDeg zenith angle in degrees
++ * @param azimuthDeg azimuth angle in degrees
++ * @return the unit vector
++ */
++static Vector
++SphericalUnitVector(double zenithDeg, double azimuthDeg)
++{
++    const double theta = zenithDeg * M_PI / 180.0;
++    const double phi = azimuthDeg * M_PI / 180.0;
++    return Vector(std::sin(theta) * std::cos(phi),
++                  std::sin(theta) * std::sin(phi),
++                  std::cos(theta));
++}
++
++/// Scene, positions and velocity shared by the value tests: in Sionna's built-in "floor_wall"
++/// scene these give a line-of-sight path plus floor, wall and floor-wall reflections, with
++/// distinct delays, directions and Doppler shifts.
++const Vector g_txPosition(0.8, -1.0, 2.0); ///< transmitter position
++const Vector g_rxPosition(1.7, 1.0, 0.6);  ///< receiver position
++const Vector g_rxVelocity(30.0, 0.0, 0.0); ///< receiver velocity
++const double g_frequency = 3.5e9;          ///< carrier frequency in Hz
++
+ // ===========================================================================
+ // Test  – Full Sionna end-to-end: GetChannel returns valid matrix
+ //
+-//   Initialises the Python interpreter with py::scoped_interpreter (same
+-//   pattern as the example scripts), sets a known scenario, and verifies:
++//   Starts the shared Python interpreter, sets a known scenario, and verifies:
+ //     - GetChannel returns non-null
+ //     - H matrix has correct dimensions
+ //     - H matrix is non-zero (actual ray-tracing happened)
+@@ -98,9 +163,7 @@ class SionnaRtChannelEndToEndTest : public TestCase
+   private:
+     void DoRun() override
+     {
+-        // Initialise Python interpreter — must stay alive for entire test.
+-        // Uses the same guard pattern as the example scripts.
+-        py::scoped_interpreter guard{};
++        EnsurePythonInterpreter();
+ 
+         const uint32_t sTxRows = 2;
+         const uint32_t sTxCols = 2;
+@@ -169,6 +232,264 @@ class SionnaRtChannelEndToEndTest : public TestCase
+     }
+ };
+ 
++/**
++ * @ingroup spectrum-tests
++ * @brief Check the channel matrix element by element against the array geometry.
++ *
++ * For every path n and every receive and transmit element pair (u, s), TR 38.901 Eq. 7.5-22
++ * relates the coefficient to that of the first element pair by the array phase
++ * exp(j 2 pi (r_rx,n . d_u + r_tx,n . d_s)), where d are the element locations in wavelengths
++ * and r the unit vectors of the path's arrival and departure angles. The arrays have more than
++ * one row and the scene more than one path, so this fails if the matrix pages mix paths, if
++ * an ns-3 element index picks up the coefficient of another Sionna element, or if the path
++ * angles are not in degrees.
++ */
++class SionnaRtCirElementPhaseTest : public TestCase
++{
++  public:
++    SionnaRtCirElementPhaseTest()
++        : TestCase("SionnaRtChannelModel channel matrix follows the array geometry per path")
++    {
++    }
++
++  private:
++    void DoRun() override
++    {
++        EnsurePythonInterpreter();
++
++        Ptr<SionnaRtChannelModel> model = CreateObject<SionnaRtChannelModel>();
++        model->SetFrequency(g_frequency);
++        model->SetAttribute("Scenario", StringValue("floor_wall"));
++
++        Ptr<UniformPlanarArray> txAnt = CreateIsotropicUpa(2, 3);
++        Ptr<UniformPlanarArray> rxAnt = CreateIsotropicUpa(3, 2);
++        Ptr<MobilityModel> txMob = CreateMobility(g_txPosition.x, g_txPosition.y, g_txPosition.z);
++        Ptr<MobilityModel> rxMob = CreateMobility(g_rxPosition.x, g_rxPosition.y, g_rxPosition.z);
++
++        Ptr<const MatrixBasedChannelModel::ChannelMatrix> channel =
++            model->GetChannel(txMob, rxMob, txAnt, rxAnt);
++        Ptr<const MatrixBasedChannelModel::ChannelParams> params = model->GetParams(txMob, rxMob);
++        const auto& h = channel->m_channel;
++        const size_t numPaths = h.GetNumPages();
++        NS_TEST_ASSERT_MSG_GT(numPaths, 1U, "The scene must produce more than one path");
++
++        for (size_t n = 0; n < numPaths; n++)
++        {
++            const Vector rRx =
++                SphericalUnitVector(params->m_angle[MatrixBasedChannelModel::ZOA_INDEX][n],
++                                    params->m_angle[MatrixBasedChannelModel::AOA_INDEX][n]);
++            const Vector rTx =
++                SphericalUnitVector(params->m_angle[MatrixBasedChannelModel::ZOD_INDEX][n],
++                                    params->m_angle[MatrixBasedChannelModel::AOD_INDEX][n]);
++            const std::complex<double> ref = h(0, 0, n);
++            NS_TEST_ASSERT_MSG_GT(std::abs(ref), 0.0, "Path " << n << " has no power");
++
++            double worstError = 0;
++            size_t worstU = 0;
++            size_t worstS = 0;
++            for (size_t u = 0; u < h.GetNumRows(); u++)
++            {
++                for (size_t s = 0; s < h.GetNumCols(); s++)
++                {
++                    const Vector dU = rxAnt->GetElementLocation(u) - rxAnt->GetElementLocation(0);
++                    const Vector dS = txAnt->GetElementLocation(s) - txAnt->GetElementLocation(0);
++                    const double phase = 2 * M_PI * (rRx * dU + rTx * dS);
++                    const double error = std::abs(h(u, s, n) - ref * std::polar(1.0, phase));
++                    if (error > worstError)
++                    {
++                        worstError = error;
++                        worstU = u;
++                        worstS = s;
++                    }
++                }
++            }
++            NS_TEST_ASSERT_MSG_LT(worstError / std::abs(ref),
++                                  1e-3,
++                                  "Path " << n << ": worst at rx element " << worstU
++                                          << ", tx element " << worstS);
++        }
++
++        Simulator::Destroy();
++    }
++};
++
++/**
++ * @ingroup spectrum-tests
++ * @brief Check the received PSD against Sionna's own channel frequency response over time.
++ *
++ * A moving receiver sees several paths with different delays and Doppler shifts. The channel is
++ * generated at t0 > 0 and the received PSD is evaluated at t0 and t0 + dt, without regenerating
++ * it. Each sub-band must match |H(f, t - t0)|^2 from Sionna's Paths.cfr() for the same scene,
++ * which applies the carrier phase exp(-j 2 pi f tau) once and the Doppler phase
++ * exp(j 2 pi f_D (t - t0)) with f_D in Hz. Both terms change the relative phase of the paths
++ * and therefore the received power.
++ */
++class SionnaRtFrequencyResponseTest : public TestCase
++{
++  public:
++    SionnaRtFrequencyResponseTest()
++        : TestCase("SionnaRtSpectrumPropagationLossModel matches Sionna's frequency response")
++    {
++    }
++
++  private:
++    void DoRun() override
++    {
++        EnsurePythonInterpreter();
++
++        const Time t0 = MilliSeconds(100);
++        const Time dt = MilliSeconds(1);
++        const uint32_t numBands = 20;
++        const double bandWidth = 5e6;
++
++        Ptr<SionnaRtChannelModel> model = CreateObject<SionnaRtChannelModel>();
++        model->SetFrequency(g_frequency);
++        model->SetAttribute("Scenario", StringValue("floor_wall"));
++        Ptr<SionnaRtSpectrumPropagationLossModel> lossModel =
++            CreateObject<SionnaRtSpectrumPropagationLossModel>();
++        lossModel->SetChannelModel(model);
++
++        Ptr<UniformPlanarArray> txAnt = CreateIsotropicUpa(1, 1);
++        Ptr<UniformPlanarArray> rxAnt = CreateIsotropicUpa(1, 1);
++        PhasedArrayModel::ComplexVector unitWeight(1);
++        unitWeight[0] = 1.0;
++        txAnt->SetBeamformingVector(unitWeight);
++        rxAnt->SetBeamformingVector(unitWeight);
++        Ptr<MobilityModel> txMob = CreateMobility(g_txPosition.x, g_txPosition.y, g_txPosition.z);
++        Ptr<Node> rxNode = CreateObject<Node>();
++        Ptr<ConstantVelocityMobilityModel> rxMob = CreateObject<ConstantVelocityMobilityModel>();
++        rxNode->AggregateObject(rxMob);
++
++        std::vector<BandInfo> bands(numBands);
++        std::vector<double> basebandFrequencies(numBands);
++        for (uint32_t k = 0; k < numBands; k++)
++        {
++            bands[k].fl = g_frequency - numBands * bandWidth / 2 + k * bandWidth;
++            bands[k].fh = bands[k].fl + bandWidth;
++            bands[k].fc = (bands[k].fl + bands[k].fh) / 2;
++            basebandFrequencies[k] = bands[k].fc - g_frequency;
++        }
++        Ptr<SpectrumValue> txPsd = Create<SpectrumValue>(Create<SpectrumModel>(bands));
++        *txPsd = 1.0;
++        Ptr<SpectrumSignalParameters> txParams = Create<SpectrumSignalParameters>();
++        txParams->psd = txPsd;
++
++        std::vector<Ptr<const SpectrumValue>> rxPsd;
++        auto measure = [&]() {
++            rxPsd.push_back(
++                lossModel->CalcRxPowerSpectralDensity(txParams, txMob, rxMob, txAnt, rxAnt)->psd);
++        };
++        Simulator::Schedule(t0, [&]() {
++            rxMob->SetPosition(g_rxPosition);
++            rxMob->SetVelocity(g_rxVelocity);
++            measure();
++        });
++        Simulator::Schedule(t0 + dt, measure);
++        Simulator::Run();
++
++        // The same scene and path solver settings, straight through Sionna
++        py::module_ rt = py::module_::import("sionna.rt");
++        py::module_ np = py::module_::import("numpy");
++        py::object scene = rt.attr("load_scene")(rt.attr("scene").attr("floor_wall"),
++                                                 py::arg("merge_shapes") = false);
++        scene.attr("frequency") = g_frequency;
++        for (const char* array : {"tx_array", "rx_array"})
++        {
++            scene.attr(array) = rt.attr("PlanarArray")(py::arg("num_rows") = 1,
++                                                       py::arg("num_cols") = 1,
++                                                       py::arg("pattern") = "iso",
++                                                       py::arg("polarization") = "V");
++        }
++        scene.attr("add")(rt.attr("Transmitter")(
++            py::arg("name") = "tx",
++            py::arg("position") = py::make_tuple(g_txPosition.x, g_txPosition.y, g_txPosition.z)));
++        scene.attr("add")(rt.attr("Receiver")(
++            py::arg("name") = "rx",
++            py::arg("position") = py::make_tuple(g_rxPosition.x, g_rxPosition.y, g_rxPosition.z),
++            py::arg("velocity") = py::make_tuple(g_rxVelocity.x, g_rxVelocity.y, g_rxVelocity.z)));
++        const auto cfg = model->GetRtPathSolverConfig();
++        py::object paths =
++            rt.attr("PathSolver")()(py::arg("scene") = scene,
++                                    py::arg("max_depth") = cfg.maxDepth,
++                                    py::arg("los") = cfg.los,
++                                    py::arg("specular_reflection") = cfg.specularReflection,
++                                    py::arg("diffuse_reflection") = cfg.diffuseReflection,
++                                    py::arg("refraction") = cfg.refraction,
++                                    py::arg("diffraction") = cfg.diffraction,
++                                    py::arg("edge_diffraction") = cfg.edgeDiffraction,
++                                    py::arg("synthetic_array") = cfg.syntheticArray,
++                                    py::arg("seed") = cfg.seed);
++        py::object cfr = paths.attr("cfr")(
++            py::arg("frequencies") =
++                py::array_t<double>(basebandFrequencies.size(), basebandFrequencies.data()),
++            py::arg("sampling_frequency") = 1.0 / dt.GetSeconds(),
++            py::arg("num_time_steps") = 2,
++            py::arg("out_type") = "numpy");
++        auto h = np.attr("asarray")(cfr, py::arg("dtype") = np.attr("complex128"))
++                     .cast<py::array_t<std::complex<double>>>();
++        auto hView = h.unchecked<6>();
++
++        NS_TEST_ASSERT_MSG_EQ(rxPsd.size(), 2U, "The received PSD must be measured twice");
++        for (size_t t = 0; t < rxPsd.size(); t++)
++        {
++            for (uint32_t k = 0; k < numBands; k++)
++            {
++                const double expected = std::norm(hView(0, 0, 0, 0, t, k));
++                NS_TEST_ASSERT_MSG_EQ_TOL((*rxPsd[t])[k],
++                                          expected,
++                                          1e-3 * expected,
++                                          "Sub-band " << k << " at t0 + " << t << " ms");
++            }
++        }
++
++        Simulator::Destroy();
++    }
++};
++
++/**
++ * @ingroup spectrum-tests
++ * @brief Check that limiting the number of paths does not change the configured depth.
++ *
++ * When a link produces more paths than MaxNumberOfPaths, the path solver is rerun with a
++ * smaller maximum depth. That reduction applies to that link only: the configured depth must be
++ * unchanged afterwards, or every later link would be traced shallower.
++ */
++class SionnaRtPathDepthTest : public TestCase
++{
++  public:
++    SionnaRtPathDepthTest()
++        : TestCase("SionnaRtChannelModel path limit leaves the configured depth unchanged")
++    {
++    }
++
++  private:
++    void DoRun() override
++    {
++        EnsurePythonInterpreter();
++
++        Ptr<SionnaRtChannelModel> model = CreateObject<SionnaRtChannelModel>();
++        model->SetFrequency(g_frequency);
++        model->SetAttribute("Scenario", StringValue("floor_wall"));
++        model->SetAttribute("MaxNumberOfPaths", DoubleValue(2));
++        const int depth = model->GetRtPathSolverConfig().maxDepth;
++
++        Ptr<const MatrixBasedChannelModel::ChannelMatrix> channel =
++            model->GetChannel(CreateMobility(g_txPosition.x, g_txPosition.y, g_txPosition.z),
++                              CreateMobility(g_rxPosition.x, g_rxPosition.y, g_rxPosition.z),
++                              CreateIsotropicUpa(1, 1),
++                              CreateIsotropicUpa(1, 1));
++
++        NS_TEST_ASSERT_MSG_LT_OR_EQ(channel->m_channel.GetNumPages(),
++                                    2U,
++                                    "The path limit must hold for the link");
++        NS_TEST_ASSERT_MSG_EQ(model->GetRtPathSolverConfig().maxDepth,
++                              depth,
++                              "The configured maximum depth must be unchanged");
++
++        Simulator::Destroy();
++    }
++};
++
+ // ===========================================================================
+ // Test Suite
+ // ===========================================================================
+@@ -186,6 +507,18 @@ class SionnaRtChannelModelTestSuite : public TestSuite
+     {
+         // Requires Sionna + GPU — runs full ray-tracing pipeline
+         AddTestCase(new SionnaRtChannelEndToEndTest(), TestCase::Duration::QUICK);
++        AddTestCase(new SionnaRtCirElementPhaseTest(), TestCase::Duration::QUICK);
++        AddTestCase(new SionnaRtFrequencyResponseTest(), TestCase::Duration::QUICK);
++        AddTestCase(new SionnaRtPathDepthTest(), TestCase::Duration::QUICK);
++    }
++
++  private:
++    void DoTeardown() override
++    {
++        if (Py_IsInitialized())
++        {
++            py::finalize_interpreter();
++        }
+     }
+ };
+ 
