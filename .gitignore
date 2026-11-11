@@ -59,3 +59,7 @@ results/
 /home/
 *.rar
 ntnlab-backup-*.tgz
+
+# track my own scratch programs
+!scratch/*.cc
+!scratch/*.h
