@@ -10,6 +10,8 @@
 
 #include "nr-mac-scheduler-tdma.h"
 
+#include "nr-mac-short-bsr-ce.h"
+
 #include "ns3/log.h"
 
 #include <algorithm>
@@ -224,7 +226,7 @@ NrMacSchedulerTdma::AssignRBGTDMA(uint32_t symAvail,
     // them cross the minimum. Without this, when the active UEs outnumber the
     // available symbols and all of them are at a low MCS, every allocation is
     // discarded and the cell starves indefinitely.
-    const uint32_t minTbs = type == "DL" ? 10 : 12;
+    const uint32_t minTbs = type == "DL" ? 10 : NrMacShortBsrCe::MinUlGrantBytes();
     GetFirst GetUe;
     auto isStarved = [&](const UePtrAndBufferReq& ue) {
         return !GetRBGFn(GetUe(ue)).empty() && GetTBSFn(GetUe(ue)) < minTbs;
@@ -534,13 +536,14 @@ NrMacSchedulerTdma::CreateUlDci(NrMacSchedulerNs3::PointInFTPlane* spoint,
     uint32_t tbs =
         m_ulAmc->CalculateTbSize(mcs, ueInfo->m_ulRank, ueInfo->m_ulRBG.size() * GetNumRbPerRbg());
 
-    // If is less than 12, 7 (3 mac header, 2 rlc header, 2 data) + SHORT_BSR (5),
-    // then we can't transmit any new data, so don't create dci.
-    if (tbs < 12)
+    // Under 15 bytes (10 for the MAC subheader and what an RLC entity needs, 5 for the SHORT_BSR;
+    // 12 with the compact BSR) the UE sends no data (NrUeMac::SendNewData()): no dci.
+    if (tbs < NrMacShortBsrCe::MinUlGrantBytes())
     {
         NS_LOG_DEBUG("While creating UL DCI for UE " << ueInfo->m_rnti << " assigned "
                                                      << ueInfo->m_ulRBG.size()
-                                                     << " UL RBG, but TBS " << tbs << " < 12");
+                                                     << " UL RBG, but TBS " << tbs << " < "
+                                                     << NrMacShortBsrCe::MinUlGrantBytes());
         return nullptr;
     }
 

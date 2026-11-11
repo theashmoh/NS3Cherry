@@ -25,6 +25,9 @@ const uint16_t MI_64QAM_MAX_ID = 28; // 29,30 and 31 are reserved
 // const uint16_t MI_QPSK_BLER_MAX_ID = 12;   // MI_QPSK_MAX_ID + 3 RETX
 // const uint16_t MI_16QAM_BLER_MAX_ID = 22;
 const uint16_t MI_64QAM_BLER_MAX_ID = 37;
+// First ECR of each modulation in BlerCurvesEcrMap (the 3 lowest are those of HARQ retransmissions)
+const uint16_t MI_16QAM_FIRST_ECR_ID = 13;
+const uint16_t MI_64QAM_FIRST_ECR_ID = 23;
 
 // global table of the effective code rates (ECR)s that have BLER performance curves
 static const double BlerCurvesEcrMap[38] = {
@@ -1192,8 +1195,10 @@ NrLteMiErrorModel::GetTbBitDecodificationStats(const SpectrumValue& sinr,
         else if (mcs <= MI_16QAM_MAX_ID)
         {
             // Modulation order 4
+            // (no lower than the first 16QAM curve: below it are QPSK's; more than 4
+            // transmissions of a block, e.g. PUSCH repetition, take Reff below it)
             uint8_t i = MI_16QAM_MAX_ID;
-            while ((BlerCurvesEcrMap[i] > Reff) && (i > MI_QPSK_MAX_ID + 1))
+            while ((BlerCurvesEcrMap[i] > Reff) && (i > MI_16QAM_FIRST_ECR_ID))
             {
                 i--;
             }
@@ -1202,8 +1207,9 @@ NrLteMiErrorModel::GetTbBitDecodificationStats(const SpectrumValue& sinr,
         else
         {
             // Modulation order 6
+            // (no lower than the first 64QAM curve, as for 16QAM)
             uint8_t i = MI_64QAM_MAX_ID;
-            while ((BlerCurvesEcrMap[i] > Reff) && (i > MI_16QAM_MAX_ID + 1))
+            while ((BlerCurvesEcrMap[i] > Reff) && (i > MI_64QAM_FIRST_ECR_ID))
             {
                 i--;
             }
@@ -1212,17 +1218,26 @@ NrLteMiErrorModel::GetTbBitDecodificationStats(const SpectrumValue& sinr,
         NS_LOG_INFO("HARQ ECR " << static_cast<uint16_t>(ecrId));
     }
 
+    // Reff below the lowest curve of the modulation (over 4 transmissions of a block, e.g. PUSCH
+    // repetition): that curve, with the mutual information scaled by its ECR over Reff, as
+    // decoding goes with the ratio of the two (the curves' 50 % points grow with their ECR)
+    double miCurve = MI;
+    if (!history.empty() && Reff > 0.0 && Reff < BlerCurvesEcrMap[ecrId])
+    {
+        miCurve = MI * BlerCurvesEcrMap[ecrId] / Reff;
+    }
+
     if (C != 1)
     {
-        double cbler = MappingMiBler(MI, ecrId, Kplus);
+        double cbler = MappingMiBler(miCurve, ecrId, Kplus);
         errorRate *= pow(1.0 - cbler, Cplus);
-        cbler = MappingMiBler(MI, ecrId, Kminus);
+        cbler = MappingMiBler(miCurve, ecrId, Kminus);
         errorRate *= pow(1.0 - cbler, Cminus);
         errorRate = 1.0 - errorRate;
     }
     else
     {
-        errorRate = MappingMiBler(MI, ecrId, Kplus);
+        errorRate = MappingMiBler(miCurve, ecrId, Kplus);
     }
 
     NS_LOG_DEBUG(" Error rate " << errorRate);

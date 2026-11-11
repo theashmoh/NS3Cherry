@@ -121,9 +121,15 @@ class NR_EXPORT NrAmc : public Object
      *
      * @param sinr the sinr values
      * @param mcsWb The calculated MCS
+     * @param transmissions transmissions of the block the receiver combines (PUSCH repetition,
+     *        TS 38.214 6.1.2.1): with the error model, the MCS is the one the error model decodes
+     *        after that many transmissions at this SINR; with Shannon, the SINR is that many
+     *        times higher
      * @return The calculated CQI
      */
-    uint8_t CreateCqiFeedbackSiso(const SpectrumValue& sinr, uint8_t& mcsWb) const;
+    uint8_t CreateCqiFeedbackSiso(const SpectrumValue& sinr,
+                                  uint8_t& mcsWb,
+                                  uint8_t transmissions = 1) const;
 
     /**
      * @brief Get CQI from a SpectralEfficiency value
@@ -283,6 +289,14 @@ class NR_EXPORT NrAmc : public Object
      */
     double GetSinrFromSpectralEfficiency(double spectralEff) const;
 
+    /**
+     * \brief TS 38.214 5.1.3.2 transport block size
+     * \param nInfo unquantised information bits (N_RE x R x Qm x layers)
+     * \param codeRate target code rate R of the MCS
+     * \return the TBS in bytes
+     */
+    static uint32_t Tbs38214(double nInfo, double codeRate);
+
   private:
     /// @brief Find maximum MCS supported for this channel, using the NR error model
     /// @param sinrMat the MIMO SINR matrix (rank * nRbs)
@@ -319,6 +333,7 @@ class NR_EXPORT NrAmc : public Object
     uint8_t m_numRefScPerRb{1};                    //!< number of reference subcarriers per RB
     NrErrorModel::Mode m_emMode{NrErrorModel::DL}; //!< Error model mode
     static const unsigned int m_crcLen = 24 / 8;   //!< CRC length (in bytes)
+    bool m_tbsTable{false}; //!< TS 38.214 transport block sizes
     mutable std::unordered_map<uint8_t, uint8_t> m_cachedCqiToMcsMap; //!< Cached CQI to MCS
 };
 

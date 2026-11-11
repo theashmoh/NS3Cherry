@@ -270,7 +270,11 @@ NrGnbRrcProtocolIdeal::GetUeRrcSapProvider(uint16_t rnti)
 {
     std::map<uint16_t, NrUeRrcSapProvider*>::const_iterator it;
     it = m_gnbRrcSapProviderMap.find(rnti);
-    NS_ASSERT_MSG(it != m_gnbRrcSapProviderMap.end(), "could not find RNTI = " << rnti);
+    NS_ABORT_MSG_IF(it == m_gnbRrcSapProviderMap.end(), "could not find RNTI = " << rnti);
+    // (set when the UE sends its RRC connection request; before that, during the random access,
+    // the gNB has a context for the RNTI but no UE to send to)
+    NS_ABORT_MSG_IF(it->second == nullptr,
+                    "RNTI " << rnti << ": an RRC message for a UE still in random access");
     return it->second;
 }
 
@@ -380,6 +384,14 @@ NrGnbRrcProtocolIdeal::DoSendRrcConnectionReestablishmentReject(
 void
 NrGnbRrcProtocolIdeal::DoSendRrcConnectionRelease(uint16_t rnti, NrRrcSap::RrcConnectionRelease msg)
 {
+    const auto it = m_gnbRrcSapProviderMap.find(rnti);
+    if (it == m_gnbRrcSapProviderMap.end() || it->second == nullptr)
+    {
+        // a release for a UE that has not sent its RRC connection request yet: it has no RRC
+        // connection to release (before 2 Nov 2026 this called through a null pointer)
+        NS_LOG_WARN("RRC release for RNTI " << rnti << " still in random access: not sent");
+        return;
+    }
     Simulator::Schedule(RRC_IDEAL_MSG_DELAY,
                         &NrUeRrcSapProvider::RecvRrcConnectionRelease,
                         GetUeRrcSapProvider(rnti),

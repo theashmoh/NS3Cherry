@@ -1320,6 +1320,11 @@ class NR_EXPORT NrUePhy : public NrPhy
     /// configuration this UE has active, -1 = none. Set by the activation DCI it decoded.
     std::array<int16_t, 2> m_spsActiveConfig{{-1, -1}};
     std::array<uint32_t, 2> m_spsActiveSerial{{0, 0}}; ///< and which activation of it
+    /// PUSCH repetition: whether the UE missed the grant of the block now on each uplink HARQ
+    /// process; its further transmissions (PUSCH_REPETITION) share that fate
+    std::map<uint8_t, bool> m_ulBundleMissed;
+    /// the same for a downlink assignment repeated over m_repetitions slots (PDSCH_REPETITION)
+    std::map<uint8_t, bool> m_dlBundleMissed;
     Ptr<UniformRandomVariable> m_pdcchErrorRv; ///< PdcchErrorModel: made when first needed
     /// PdcchErrorModel, radio link monitoring: time (ns) and PDCCH block error rate of the
     /// control symbols of the last evaluation period

@@ -4,15 +4,40 @@
 
 #include "nr-mac-harq-vector.h"
 
+#include "ns3/log.h"
+#include "ns3/simulator.h"
+
+#include <sstream>
+
 namespace ns3
 {
 
+NS_LOG_COMPONENT_DEFINE("NrMacHarqVector");
+
+bool NrMacHarqVector::s_diagnostics = false;
+
 bool
-NrMacHarqVector::Erase(uint8_t id)
+NrMacHarqVector::Erase(uint8_t id, const char* site)
 {
+    if (s_diagnostics)
+    {
+        std::ostringstream o;
+        o << "process " << +id << " erased by " << site << " at " << Simulator::Now().As(Time::S)
+          << " (was active=" << at(id).m_active << " status=" << +at(id).m_status
+          << " timer=" << at(id).m_timer
+          << (at(id).m_dciElement ? " rv=" + std::to_string(at(id).m_dciElement->m_rv) : "")
+          << "); before: " << m_lastErase.substr(0, 160);
+        m_lastErase = o.str();
+    }
+    if (!at(id).m_active)
+    {
+        // (erased twice: nothing to do, and m_usedSize must not go down again)
+        NS_LOG_WARN("HARQ process " << +id << " erased twice (" << site << ")");
+        return false;
+    }
     at(id).Erase();
     --m_usedSize;
-
+#ifdef NS3_ASSERT_ENABLE
     uint32_t count = 0;
     for (const auto& v : *this)
     {
@@ -22,6 +47,7 @@ NrMacHarqVector::Erase(uint8_t id)
         }
     }
     NS_ASSERT(count == m_usedSize);
+#endif
     return true;
 }
 

@@ -16,6 +16,8 @@
 #include "ns3/nr-export.h"
 
 #include <functional>
+#include <limits>
+#include <map>
 
 namespace ns3
 {
@@ -253,9 +255,57 @@ class NR_EXPORT NrGnbPhy : public NrPhy
      *
      * With UniformPowerAllocUsed each RB in use gets TxPower / nTotalAllocRbs, but no more than
      * MaxRbBoostDb above TxPower / (RBs of the band): the power of the idle RBs goes to the RBs
-     * in use, up to that cap.
+     * in use, up to that cap. A UE with a cap of its own (SetUeMaxRbBoostDb()) gets no more than
+     * the lower of the two.
+     * @param rnti RNTI of the UE the allocation is for (0: none, only the MaxRbBoostDb cap)
+     * @return the power of each of these RBs, in dBm
      */
-    void SetSubChannels(const std::vector<int>& rbIndexVector, size_t nTotalAllocRbs);
+    double SetSubChannels(const std::vector<int>& rbIndexVector,
+                          size_t nTotalAllocRbs,
+                          uint16_t rnti = 0);
+
+    /**
+     * @brief Cap the power of the RBs of one UE's downlink data (UniformPowerAllocUsed)
+     *
+     * The RBs of the UE's allocations get no more than db above TxPower / (RBs of the band), or
+     * what MaxRbBoostDb allows, if that is less: a closed loop on the UE's SNR (or MCS) raises
+     * db when the UE is under its target and lowers it when it is over, so that power is not
+     * sent where the UE receives well. 0 = the RB's own share, no boost. The UE's control
+     * messages and the broadcast have no cap of their own. A UE without a cap is limited by
+     * MaxRbBoostDb alone.
+     * @param rnti RNTI of the UE
+     * @param db the most an RB of the UE may be over its share, in dB
+     */
+    void SetUeMaxRbBoostDb(uint16_t rnti, double db);
+
+    /**
+     * @brief The UE has no cap of its own any more (MaxRbBoostDb alone limits its RBs)
+     * @param rnti RNTI of the UE
+     */
+    void RemoveUeMaxRbBoostDb(uint16_t rnti);
+
+    /**
+     * @param rnti RNTI of the UE
+     * @return the cap of the UE (SetUeMaxRbBoostDb()), or NaN if it has none
+     */
+    double GetUeMaxRbBoostDb(uint16_t rnti) const;
+
+    /**
+     * @brief The most the RBs of a block of this UE can be sent over their share, in dB: the power
+     * of the idle RBs of the symbol if the block were alone in it, bound by MaxRbBoostDb and the
+     * UE's cap (SetUeMaxRbBoostDb: the downlink closed loop). For the scheduler, which lets the
+     * power go first and repeats a block (PDSCH aggregation) only for what it cannot give.
+     * @param rnti RNTI of the UE
+     * @param rbs the RBs of the block
+     * @return the boost, 0 or more
+     */
+    double GetDataBoostDb(uint16_t rnti, uint32_t rbs) const;
+
+    /**
+     * @param cellId a cell
+     * @return the gNB PHY of the cell (the last BWP that started a slot), or nullptr
+     */
+    static const NrGnbPhy* FindByCell(uint16_t cellId);
 
     /**
      * @brief Add the UE to the list of this gnb UEs.
@@ -457,6 +507,21 @@ class NR_EXPORT NrGnbPhy : public NrPhy
                                           const std::vector<int>& rbMap,
                                           uint16_t bwpId,
                                           uint16_t cellId);
+
+    /**
+     * @brief TracedCallback signature for the power of the RBs of a downlink allocation
+     *
+     * @param [in] rnti RNTI of the UE
+     * @param [in] rbs RBs of the allocation
+     * @param [in] powerDbm power of each of them, in dBm
+     */
+    typedef void (*DlDataPowerTracedCallback)(uint16_t rnti, uint32_t rbs, double powerDbm);
+
+    /**
+     * @brief TracedCallback signature for the power an allocation's RBs would have had without the
+     * cap of the UE (SetUeMaxRbBoostDb()): the same signature as DlDataPower
+     */
+    typedef void (*DlDataPowerFreeTracedCallback)(uint16_t rnti, uint32_t rbs, double powerDbm);
 
     /**
      * @brief Retrieve the number of RB per RBG
@@ -925,6 +990,12 @@ class NR_EXPORT NrGnbPhy : public NrPhy
     TracedCallback<const SfnSf&, uint8_t, const std::vector<int>&, uint16_t, uint16_t>
         m_rbStatistics;
 
+    TracedCallback<uint16_t, uint32_t, double> m_dlDataPowerTrace; //!< power of an allocation's RBs
+    TracedCallback<uint16_t, uint32_t, double>
+        m_dlDataPowerFreeTrace; //!< ... without the cap of the UE (only with UE caps set)
+    std::map<uint16_t, double> m_ueMaxRbBoostDb; //!< RNTI: its cap (SetUeMaxRbBoostDb())
+    double m_lastRbPowerFreeDbm{std::numeric_limits<double>::quiet_NaN()}; //!< see SetSubChannels
+
     std::map<uint32_t, std::vector<uint32_t>>
         m_toSendDl; //!< Map that indicates, for each slot, what DL DCI we have to send
     std::map<uint32_t, std::vector<uint32_t>>
@@ -964,6 +1035,8 @@ class NR_EXPORT NrGnbPhy : public NrPhy
     uint32_t m_n2Delay{0}; //!< minimum processing delay (in slots) needed to decode UL DCI and
                            //!< prepare UL data (UE side)
     uint32_t m_cellSpecificKoffset{0}; //!< NTN offset in 15 kHz reference slots (1 ms)
+    static std::map<uint16_t, const NrGnbPhy*> s_byCell; //!< FindByCell()
+    bool m_registered{false};                             //!< in s_byCell
     double m_maxRbBoostDb{100.0};      //!< UniformPowerAllocUsed: most power of an RB, in dB above
                                        //!< TxPower / RBs of the band (attribute MaxRbBoostDb)
 

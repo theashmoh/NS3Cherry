@@ -36,12 +36,12 @@ NrMacHeaderVs::GetInstanceTypeId() const
 }
 
 // With this on, every subheader of a MAC SDU has the 16-bit L field (F = 1), i.e. three octets
-// whatever the SDU size, in place of two octets for SDUs up to 127 bytes. The receiver reads
+// whatever the SDU size, in place of two octets for SDUs up to 255 bytes. The receiver reads
 // the F bit, so it needs no setting. Set it with
 // GlobalValue::Bind("NrMacSubheaderAlways3Bytes", BooleanValue(true)) or on the command line.
 static GlobalValue g_nrMacSubheaderAlways3Bytes(
     "NrMacSubheaderAlways3Bytes",
-    "MAC SDU subheader always with the 16-bit length field: 3 octets, also for SDUs up to 127 B",
+    "MAC SDU subheader always with the 16-bit length field: 3 octets, also for SDUs up to 255 B",
     BooleanValue(false),
     MakeBooleanChecker());
 
@@ -50,7 +50,8 @@ namespace
 bool
 LongLengthField(uint16_t size)
 {
-    if (size > 127)
+    // TS 38.321 6.1.2: the 8-bit L field covers SDUs up to 255 bytes (127 was E-UTRA's 7 bits)
+    if (size > 255)
     {
         return true;
     }
@@ -125,8 +126,14 @@ NrMacHeaderVs::Deserialize(Buffer::Iterator start)
 
     // A size above 127 needs the 16-bit field; a smaller one may have it too
     // (NrMacSubheaderAlways3Bytes)
-    NS_ASSERT(m_size <= 127 || readBytes == 3);
+    NS_ASSERT(m_size <= 255 || readBytes == 3);
     return readBytes;
+}
+
+uint32_t
+NrMacHeaderVs::SubheaderBytes(uint32_t sduSize)
+{
+    return LongLengthField(static_cast<uint16_t>(std::min<uint32_t>(sduSize, 65535))) ? 3 : 2;
 }
 
 uint32_t

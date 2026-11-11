@@ -12,6 +12,7 @@
 
 #include "nr-fh-control.h"
 #include "nr-mac-scheduler-ofdma-symbol-per-beam.h"
+#include "nr-mac-short-bsr-ce.h"
 
 #include "ns3/boolean.h"
 #include "ns3/log.h"
@@ -41,12 +42,12 @@ NrMacSchedulerOfdma::GetTypeId()
                                                           "ROUND_ROBIN",
                                                           SymPerBeamType::PROPORTIONAL_FAIR,
                                                           "PROPORTIONAL_FAIR"))
+            // true: a HARQ retransmission gets resource block groups over the data symbols of the slot,
+            // which new data of other UEs shares, as an OFDMA transmission does. false (the release): it
+            // gets symbols of its own, which no new data shares (a retransmission over all symbols of the
+            // slot leaves none)
             .AddAttribute("HarqRetxInFrequency",
-                          "true: a HARQ retransmission gets resource block groups over the data "
-                          "symbols of the slot, which new data of other UEs shares, as an OFDMA "
-                          "transmission does. false (the release): it gets symbols of its own, "
-                          "which no new data shares (a retransmission over all symbols of the "
-                          "slot leaves none)",
+                          "true: a HARQ retransmission gets RBGs over the data symbols that new data shares (OFDMA); false: symbols of its own.",
                           BooleanValue(true),
                           MakeBooleanAccessor(&NrMacSchedulerOfdma::m_harqRetxInFrequency),
                           MakeBooleanChecker())
@@ -225,7 +226,7 @@ NrMacSchedulerOfdma::ReapStarvedUeResources(std::vector<UePtrAndBufferReq>& ueVe
                                             const bool isDl) const
 {
     // The minimum TBS to create a DCI, as enforced by CreateDlDci and CreateUlDci
-    const uint32_t minTbs = isDl ? 10 : 12;
+    const uint32_t minTbs = isDl ? 10 : NrMacShortBsrCe::MinUlGrantBytes();
     auto tbsOf = [isDl](const UePtrAndBufferReq& u) {
         return isDl ? u.first->m_dlTbSize : u.first->m_ulTbSize;
     };
@@ -656,6 +657,10 @@ NrMacSchedulerOfdma::AssignULRBG(uint32_t symAvail, const ActiveUeMap& activeUl)
         }
 
         NS_ASSERT(!remainingRbgSet.empty());
+        // the RBGs of the band, for the load of the slot (UlWideLoadPct)
+        const auto bandMask = GetUlBitmask();
+        const auto bandRbgs =
+            static_cast<double>(std::count(bandMask.begin(), bandMask.end(), true));
 
         for (const auto& ue : GetUeVector(el))
         {
@@ -686,16 +691,40 @@ NrMacSchedulerOfdma::AssignULRBG(uint32_t symAvail, const ActiveUeMap& activeUl)
                 // holds what a scheduling request gets (SrGrantBytes, a voice frame): the rest of
                 // a larger buffer goes in later slots. A UE with UlGrantRbs gets no more, once
                 // the gNB has measured its uplink (before, its grant is as wide as it needs:
-                // the gNB has nothing to choose the MCS of a narrow one from)
+                // the gNB has nothing to choose the MCS of a narrow one from). With
+                // UlWideGrantRbs a UE whose SINR on one RB is high enough gets the wide grant
+                // while the slot has room: every UE waiting has its first RB and the slot's
+                // uplink RBs in use, with this one, are at most UlWideLoadPct of the band.
                 const uint32_t grantRbs = GetUlGrantRbs();
+                const uint32_t wideRbs = GetUlWideRbs();
+                bool wideRoom = false;
+                if (wideRbs > 0)
+                {
+                    const auto waiting = static_cast<size_t>(
+                        std::count_if(ueVector.begin(), ueVector.end(), [&GetUe](const auto& p) {
+                            return GetUe(p)->m_ulRBG.empty();
+                        }));
+                    wideRoom = remainingRbgSet.size() > waiting &&
+                               (bandRbgs - remainingRbgSet.size() + 1) * 100.0 <=
+                                   GetUlWideLoadPct() * bandRbgs;
+                }
                 while (schedInfoIt != ueVector.end())
                 {
                     uint32_t bufQueueSize = schedInfoIt->second;
                     const auto& ue = GetUe(*schedInfoIt);
                     const uint32_t least = std::max(std::min(bufQueueSize, GetSrGrantBytes()), 12U);
-                    if (ue->m_ulTbSize >= std::max(bufQueueSize, 12U) ||
-                        (ue->m_ulTbSize >= least && ue->GetUlRbs() >= ue->GetUlMaxRbs()) ||
-                        (grantRbs > 0 && !ue->m_ulSinrMeas.empty() && ue->GetUlRbs() >= grantRbs))
+                    const bool wide = wideRoom && ue->UlWideOk();
+                    const uint32_t ueGrantRbs = wide ? wideRbs : grantRbs;
+                    // With fixed repetitions the wide grant needs half of them for the same
+                    // bits, so a UE that may have it gets the second RB even if the first would
+                    // carry all it has
+                    const bool widen = wide && ue->UlWideHalvesReps() && ue->GetUlRbs() < wideRbs;
+                    if ((!widen &&
+                         (ue->m_ulTbSize >= std::max(bufQueueSize, 12U) ||
+                          (ue->m_ulTbSize >= least && ue->GetUlRbs() >= ue->GetUlMaxRbs()))) ||
+                        (ueGrantRbs > 0 && !ue->m_ulSinrMeas.empty() &&
+                         ue->GetUlRbs() >= ueGrantRbs) ||
+                        !UlGrantCanGrow(*schedInfoIt))
                     {
                         std::advance(schedInfoIt, 1);
                     }
@@ -843,14 +872,15 @@ NrMacSchedulerOfdma::CreateUlDci(PointInFTPlane* spoint,
     uint32_t tbs =
         m_ulAmc->CalculateTbSize(mcs, ueInfo->m_ulRank, ueInfo->m_ulRBG.size() * GetNumRbPerRbg());
 
-    // If is less than 12, i.e., 7 (3 mac header, 2 rlc header, 2 data) + 5 bytes for
-    // the SHORT_BSR. then we can't transmit any new data, so don't create dci.
-    if (tbs < 12)
+    // Under 15 bytes (10 for the MAC subheader and what an RLC entity needs, 5 for the SHORT_BSR;
+    // 12 with the compact BSR) the UE sends no data: NrUeMac::SendNewData() gives the
+    // logical channels what is left after the BSR, and 10 bytes at least. So don't create dci.
+    if (tbs < NrMacShortBsrCe::MinUlGrantBytes())
     {
         NS_LOG_DEBUG("While creating UL DCI for UE "
                      << ueInfo->m_rnti << " assigned "
                      << std::set<uint32_t>(ueInfo->m_ulRBG.begin(), ueInfo->m_ulRBG.end()).size()
-                     << " UL RBG, but TBS < 12");
+                     << " UL RBG, but TBS < " << NrMacShortBsrCe::MinUlGrantBytes());
         return nullptr;
     }
 
@@ -878,6 +908,8 @@ NrMacSchedulerOfdma::CreateUlDci(PointInFTPlane* spoint,
                                              GetTpc());
 
     dci->m_rbgBitmask = std::move(rbgBitmask);
+    // PUSCH repetition: the MCS above already counts on it
+    dci->m_repetitions = ueInfo->GetUlRepetitionsFor(ueInfo->GetUlRbs());
 
     std::ostringstream oss;
     for (auto x : dci->m_rbgBitmask)

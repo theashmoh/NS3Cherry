@@ -26,6 +26,42 @@ NrMacShortBsrCe::GetInstanceTypeId() const
     return GetTypeId();
 }
 
+namespace
+{
+bool g_compactBsr = false; //!< see NrMacShortBsrCe::SetCompact()
+}
+
+void
+NrMacShortBsrCe::SetCompact(bool compact)
+{
+    g_compactBsr = compact;
+}
+
+bool
+NrMacShortBsrCe::IsCompact()
+{
+    return g_compactBsr;
+}
+
+uint32_t
+NrMacShortBsrCe::OverheadBytes()
+{
+    return g_compactBsr ? 2 : 5;
+}
+
+uint32_t
+NrMacShortBsrCe::MinUlGrantBytes()
+{
+    return 10 + OverheadBytes();
+}
+
+void
+NrMacShortBsrCe::SetCompactLcg(uint8_t lcg)
+{
+    NS_ASSERT(lcg <= 3);
+    m_compactLcg = lcg;
+}
+
 NrMacShortBsrCe::NrMacShortBsrCe()
 {
     NS_LOG_FUNCTION(this);
@@ -45,6 +81,16 @@ NrMacShortBsrCe::Serialize(Buffer::Iterator start) const
     m_header.Serialize(start);
     start.Next(m_header.GetSerializedSize());
 
+    if (m_compactLcg >= 0)
+    {
+        // TS 38.321 6.1.3.1, short BSR: the LCG ID in 3 bits, the buffer size in 5
+        const uint8_t levels[4] = {m_bufferSizeLevel_0,
+                                   m_bufferSizeLevel_1,
+                                   m_bufferSizeLevel_2,
+                                   m_bufferSizeLevel_3};
+        start.WriteU8(static_cast<uint8_t>((m_compactLcg << 5) | levels[m_compactLcg]));
+        return;
+    }
     start.WriteU8(m_bufferSizeLevel_0);
     start.WriteU8(m_bufferSizeLevel_1);
     start.WriteU8(m_bufferSizeLevel_2);
@@ -60,6 +106,19 @@ NrMacShortBsrCe::Deserialize(Buffer::Iterator start)
     start.Next(readBytes);
     NS_ASSERT(m_header.GetLcId() == NrMacHeaderFsUl::SHORT_BSR);
 
+    if (start.GetRemainingSize() == 1)
+    {
+        // the compact form of SetCompact(): one LCG
+        const uint8_t octet = start.ReadU8();
+        const uint8_t lcg = octet >> 5;
+        const uint8_t level = octet & 0x1F;
+        m_compactLcg = lcg > 3 ? 3 : lcg;
+        m_bufferSizeLevel_0 = lcg == 0 ? level : 0;
+        m_bufferSizeLevel_1 = lcg == 1 ? level : 0;
+        m_bufferSizeLevel_2 = lcg == 2 ? level : 0;
+        m_bufferSizeLevel_3 = lcg == 3 ? level : 0;
+        return GetSerializedSize();
+    }
     m_bufferSizeLevel_0 = start.ReadU8();
     m_bufferSizeLevel_1 = start.ReadU8();
     m_bufferSizeLevel_2 = start.ReadU8();
@@ -72,7 +131,7 @@ uint32_t
 NrMacShortBsrCe::GetSerializedSize() const
 {
     NS_LOG_FUNCTION(this);
-    return m_header.GetSerializedSize() + 4;
+    return m_header.GetSerializedSize() + (m_compactLcg >= 0 ? 1 : 4);
 }
 
 void

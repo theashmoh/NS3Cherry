@@ -4,6 +4,9 @@
 
 #include "nr-mac-scheduler-lcg.h"
 
+#include "nr-mac-header-vs.h"
+
+#include "nr-mac-short-bsr-ce.h"
 #include "nr-qos-flow.h"
 
 #include "ns3/log.h"
@@ -167,7 +170,13 @@ NrMacSchedulerLCG::GetTotalSizeOfLCPlusOverheads(uint8_t lcId, bool isDl) const
         // segmentation which increases delay
         rlcOverhead = 4;
     }
-    return lcIdSize > 0 ? lcIdSize + rlcOverhead + MAC_SUBHEADER_SIZE : 0;
+    return lcIdSize > 0 ? lcIdSize + rlcOverhead + MacSubheaderFor(lcIdSize + rlcOverhead) : 0;
+}
+
+uint32_t
+MacSubheaderFor(uint32_t sduBytes)
+{
+    return NrMacHeaderVs::SubheaderBytes(sduBytes);
 }
 
 std::vector<uint8_t>
@@ -288,9 +297,9 @@ NrMacSchedulerLCG::AssignedData(uint8_t lcId, uint32_t size, std::string type)
         // bytes, because in the current TX opportunity 5 bytes is being spent on SHORT_BSR).
 
         if (type == "UL" && m_lcMap.at(lcId)->m_rlcTransmissionQueueSize > 0 &&
-            m_lcMap.at(lcId)->m_rlcTransmissionQueueSize < 12)
+            m_lcMap.at(lcId)->m_rlcTransmissionQueueSize < NrMacShortBsrCe::MinUlGrantBytes())
         {
-            m_lcMap.at(lcId)->m_rlcTransmissionQueueSize = 12;
+            m_lcMap.at(lcId)->m_rlcTransmissionQueueSize = NrMacShortBsrCe::MinUlGrantBytes();
         }
 
         // in order to take into account the MAC header of 3 bytes

@@ -666,6 +666,13 @@ class NR_EXPORT NrSpectrumPhy : public SpectrumPhy
      */
     void StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& params);
     /**
+     * @brief Whether a data signal that starts now, of this duration, is aligned with the first
+     * one of the reception in progress (the gNB decodes simultaneous signals over one window)
+     * @param duration the duration of the signal
+     * @return true if it starts and ends within a small part of the cyclic prefix of the first
+     */
+    bool AlignedWithFirstRx(Time duration) const;
+    /**
      * @brief Function that is called when is being received DL CTRL
      * @param params holds DL CTRL frame signal parameters structure
      */

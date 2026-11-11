@@ -359,6 +359,14 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
         const NrMacCschedSapProvider::CschedLcReleaseReqParameters& params) override;
     void DoSchedDlTriggerReq(
         const NrMacSchedSapProvider::SchedDlTriggerReqParameters& params) override;
+    /// DIAG: abort with a message if a pending UL retransmission has no live process
+    void DiagCheckUlFeedback(std::vector<UlHarqInfo>* ulHarqFeedback, const char* stage) const;
+    /// DIAG: keep the last events of the UL HARQ bookkeeping of this scheduler
+    void DiagLog(const std::string& event) const;
+    /// DIAG: the events kept, one per line
+    std::string DiagEvents(uint16_t rnti) const;
+    mutable std::deque<std::string> m_diagLog; //!< DIAG: the last UL HARQ events
+    bool m_diagUlHarq{false};                  //!< DiagUlHarq attribute
     void DoSchedUlTriggerReq(
         const NrMacSchedSapProvider::SchedUlTriggerReqParameters& params) override;
     void DoSchedUlSrInfoReq(
@@ -575,6 +583,14 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
      * @param v the MCS to be used for RACH UL grant
      */
     void SetRachUlGrantMcs(uint8_t v);
+    /**
+     * @brief Set the attribute PuschRepetitions: 0 or a number of repetitions of TS 38.331
+     * (NrMacSchedulerUeInfo::kPuschRepetitionValues); any other aborts
+     * @param k the repetitions
+     */
+    void SetPuschRepetitions(uint32_t k);
+    /// @return the attribute PuschRepetitions
+    uint32_t GetPuschRepetitions() const;
 
   protected:
     /**
@@ -881,12 +897,67 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
     void UpdateDlOlla(uint16_t rnti, bool ack) const;
     /**
      * @brief Move a UE's UL OLLA offset on one first-transmission outcome (UlOlla)
+     *
+     * Only the outcome of a grant whose MCS came from a measurement of the UE's uplink tells
+     * whether that choice was right: the starting MCS of a UE the gNB has not measured (yet, or
+     * after the measurement expired) is no choice of the link adaptation. And the offset does
+     * not move past the end of the MCS range: a NACK at MCS 0 cannot lower the MCS any more, so
+     * a lower offset would only delay the recovery (wind-up), and the same for an ACK at the
+     * highest MCS.
      * @param rnti RNTI of the UE
      * @param ack true if the gNB decoded the block
+     * @param mcs MCS of the block
+     * @param measured true if the grant's MCS came from a measurement of the UE's uplink
      */
-    void UpdateUlOlla(uint16_t rnti, bool ack) const;
+    void UpdateUlOlla(uint16_t rnti, bool ack, uint8_t mcs, bool measured) const;
+    /**
+     * @brief Put the level of a UE's newest uplink SINR report into the smoothed one
+     *
+     * Only with UlSinrAvgTime above 0. Called right after the report replaced the UE's
+     * m_ulSinrMeas; the report keeps its shape over the resource blocks and gets the level of the
+     * exponentially weighted mean (in the SINR of one resource block).
+     * @param ue the UE
+     */
+    void SmoothUlSinr(const std::shared_ptr<NrMacSchedulerUeInfo>& ue) const;
     /// HarqInFrequency() and all UEs of the cell in one beam
     bool UseHarqInFrequency() const;
+    /**
+     * @brief PUSCH repetition: place this slot's transmission of every block under repetition,
+     * on the RBGs of its first one if they are free, else on as many others, over the numSym
+     * data symbols before start (OFDMA: the region of the retransmissions, which new data
+     * shares); they leave m_ulRbgFreeForData. A block that finds no room, or whose UE has a
+     * PUSCH in this slot already, waits for the next uplink slot.
+     * @param start where the data symbols end
+     * @param numSym the data symbols
+     * @param allocInfo the slot's allocations
+     * @return the UEs that got one (one PUSCH per UE and slot)
+     */
+    std::set<uint16_t> PlaceUlRepetitions(const PointInFTPlane& start,
+                                          uint8_t numSym,
+                                          SlotAllocInfo* allocInfo);
+    /// PUSCH repetition: queue the further transmissions of the blocks this slot's grants (new
+    /// data and retransmissions) asked to repeat
+    void QueueUlRepetitions(const SlotAllocInfo& allocInfo);
+    /**
+     * @brief PDSCH aggregation: place this slot's transmission of every downlink block under
+     * repetition, over the numSym data symbols from start, on as many RBGs as keep its resource
+     * elements (its own first, as a non-adaptive retransmission); they leave m_dlRbgFreeForData.
+     * A block that finds no room, or whose UE has a PDSCH in this slot already, waits.
+     * @param start where the data symbols begin
+     * @param numSym the data symbols
+     * @param allocInfo the slot's allocations
+     * @return the UEs that got one (one PDSCH per UE and slot)
+     */
+    std::set<uint16_t> PlaceDlRepetitions(const PointInFTPlane& start,
+                                          uint8_t numSym,
+                                          SlotAllocInfo* allocInfo);
+    /// PDSCH aggregation: give this slot's new downlink blocks their number of transmissions
+    /// (PdschAggregation) and queue the further transmissions of those that repeat
+    void QueueDlRepetitions(const SlotAllocInfo& allocInfo);
+    /// PDSCH aggregation: the transmissions of a new block of this UE, fixed or from its SINR
+    uint8_t DlAggregationFor(const DciInfoElementTdma& dci, bool sps) const;
+    /// the UEs with a downlink block under repetition, whose next transmission is still to come
+    std::set<uint16_t> DlRepeatingUes() const;
 
     template <typename T>
     void ProcessHARQFeedbacks(std::vector<T>* harqInfo,
@@ -1079,7 +1150,8 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
     //     scheduling request, away from the occasions of the silence configuration, that tells:
     //     it gets its DCI and the talk configuration takes over with the next packet
     //   - the UE confirms every activation and release with a MAC CE in its next block, 1 byte
-    //     with one configuration and 6 with two (DciInfoElementTdma::m_cgConfirmBytes); a block
+    //     with one configuration and CgMultiEntryCeBytes (5) with two
+    //     (DciInfoElementTdma::m_cgConfirmBytes); a block
     //     is that much larger, and by the 5 bytes of the buffer status report of this module
 
     /// What the gNB keeps of one direction of one UE
@@ -1095,6 +1167,7 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
         uint16_t numRbg{0};       //!< resource block groups,
         uint8_t mcs{0};           //!< MCS,
         uint8_t rank{1};          //!< rank
+        uint8_t reps{1};          //!< uplink: transmissions of each block (repK, TS 38.331)
         uint32_t tbs{0};          //!< and with these the bytes its resources hold
         uint32_t usable{0};       //!< its size: the bytes it carries (see above)
         bool dynamicUntilDrained{false}; //!< a packet too large for the block is being sent
@@ -1110,6 +1183,7 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
             uint8_t harqId{0};                       //!< its HARQ process
             bool retx{false};                        //!< it was not received and is being
                                                      //!< retransmitted on that process
+            std::vector<uint64_t> repSfns; //!< the slots (SfnSf encoding) of its repetitions
         };
         std::deque<Sent> blocks; //!< the blocks whose HARQ feedback is awaited
         std::shared_ptr<DciInfoElementTdma> releaseDci; //!< the last release sent
@@ -1140,8 +1214,20 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
         uint8_t pieces{0};          //!< downlink: it is being sent in pieces (the same bits)
         int8_t switchFrom{-1};      //!< a release was sent without the activation of the other
                                     //!< configuration, which is still to come: of this one
+        // uplink: when a configured grant is activated again (CgHysteresis)
+        Time lastActivation{Time::Min()}; //!< its last activation, Time::Min() = none yet
+        Time worseSince{Time::Min()};     //!< the link has been short of its K since then
+        Time betterSince{Time::Min()};    //!< it could have done with fewer since then
+        uint8_t failRun{0};               //!< first transmissions of its blocks failed in a row
+        std::deque<std::pair<Time, double>> sinrDb; //!< the UE's SINR (dB) once a talk period
+        uint64_t sinrSlot{0};             //!< the slot of the last of them
+        double cgMargin{0.0};             //!< the margin (dB) of the next activation
         uint64_t voiceToSilencePdus{0}; //!< uplink: the RLC PDUs the first silence descriptors
         uint64_t voiceToVoicePdus{0};   //!< and the first voice frames came in
+        bool aheadSent{false}; //!< CgBlockPacketOnly: the next activation is confirmed ahead
+        uint8_t startFails{0};      //!< uplink: slots in a row an activation's block was not placed
+        uint64_t startRetrySlot{0}; //!< ... after 2: no new try before this slot (DCIs meanwhile)
+        bool switchNow{false}; //!< uplink, CgSilenceSwitch: a silence just seen on the talk configuration
         bool gaveDci{false};        //!< uplink: since the last packet of the bearer came in, the
                                     //!< gNB gave a grant with a DCI: for the rest a block left,
                                     //!< or for a scheduling request
@@ -1164,6 +1250,7 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
         uint16_t numRbg{0};
         uint8_t mcs{0};
         uint8_t rank{1};
+        uint8_t reps{1}; //!< uplink: transmissions of the block (repK)
         uint32_t tbs{0};
         uint32_t usable{0};
     };
@@ -1233,6 +1320,12 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
      * @return the bytes: the packet, the buffer status report and the confirmation MAC CE
      */
     uint32_t SpsUlTbBytes(uint8_t config) const;
+    /// SpsUlTbBytes() with room for the activation's confirmation (CgBlockPacketOnly)
+    uint32_t SpsUlTbBytesWithCe(uint8_t config) const;
+    /// The grant for a scheduling request of a UE (SrGrantLearned)
+    uint32_t LearnedSrGrant(uint16_t rnti) const;
+    /// Downlink SPS reactivation with hysteresis (DlSpsHysteresis): -1 worse, 1 better, 0 keep
+    int DlSpsOutOfDate(SpsState& st, const std::shared_ptr<NrMacSchedulerUeInfo>& ue) const;
     /**
      * @brief Reserve the PDCCH candidates of the releases and activations planned
      * @param isDl true for downlink
@@ -1287,6 +1380,7 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
      * @param needTb the bytes a block has to hold
      * @param mcs the MCS of the UE
      * @param rank its rank
+     * @param reps uplink: the transmissions of each block, in as many slots in a row
      * @return true if there is; the room is then taken for this slot (m_spsPlanned)
      */
     bool SpsHasRoom(bool isDl,
@@ -1295,7 +1389,8 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
                     uint8_t config,
                     uint32_t needTb,
                     uint8_t mcs,
-                    uint8_t rank) const;
+                    uint8_t rank,
+                    uint8_t reps = 1) const;
     /**
      * @brief Symbols of a slot that blocks of configurations may take
      * @param isDl true for downlink
@@ -1327,6 +1422,53 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
      */
     uint8_t SpsUlMcs(const std::shared_ptr<NrMacSchedulerUeInfo>& ue) const;
     /**
+     * @brief The MCS and the repetitions of a block of a configured grant
+     *
+     * With PUSCH repetition on (PuschRepetitions other than 1) and narrow blocks (UlGrantRbs),
+     * a configured grant repeats each block too, in repK slots in a row (TS 38.214 6.1.2.3,
+     * TS 38.331 ConfiguredGrantConfig: 1, 2, 4 or 8): the fewest that bring repK times the
+     * UE's SINR over the block's resource blocks to PuschRepetitionSinrDb plus `marginDb`
+     * (PuschRepetitions = 0; else the fewest that are at least PuschRepetitions), and the MCS
+     * the error model decodes after them; more of them, up to 8, if a block of `needTb` bytes
+     * does not fit into its resource blocks at that MCS. Otherwise one transmission at
+     * SpsUlMcs().
+     * @param ue the UE
+     * @param needTb the bytes a block has to hold, 0 = not looked at
+     * @param marginDb more SINR to ask for (to go down to fewer repetitions only with a margin)
+     * @param reps if not 0: these repetitions, and the MCS for them
+     * @return the MCS and the repetitions
+     */
+    /**
+     * @brief Uplink configured grant (CgHysteresis): record the UE's SINR once a talk period and
+     * return the margin of the activation, its mean less the CgSinrPercentile of the window
+     * @param st the UE's configured-grant state
+     * @param ue the UE
+     * @param slot the slot being planned
+     * @return the margin in dB (0 if there is none to take)
+     */
+    double CgMarginDb(SpsState& st,
+                      const std::shared_ptr<NrMacSchedulerUeInfo>& ue,
+                      uint64_t slot) const;
+    /**
+     * @brief The uplink SINR of the UE on the resource blocks of a configured-grant block
+     * @param ue the UE
+     * @return the mean linear SINR, 0 without a measurement
+     */
+    double SpsUlSinr(const std::shared_ptr<NrMacSchedulerUeInfo>& ue) const;
+    /**
+     * @brief Uplink configured grant (CgHysteresis): whether to activate it anew at this
+     * occasion, and the timers that decide it
+     * @param st the UE's configured-grant state
+     * @param ue the UE
+     * @return -1 for more repetitions or a lower MCS, 1 for fewer or a higher MCS, 0 as it is
+     */
+    int CgOutOfDate(SpsState& st, const std::shared_ptr<NrMacSchedulerUeInfo>& ue) const;
+    std::pair<uint8_t, uint8_t> SpsUlLink(const std::shared_ptr<NrMacSchedulerUeInfo>& ue,
+                                          uint32_t needTb,
+                                          double marginDb = 0.0,
+                                          uint8_t reps = 0,
+                                          double mcsMarginDb = 0.0) const;
+    /**
      * @brief HARQ feedback for a block: if the UE did not know of it, the configuration is lost
      * @param rnti the UE
      * @param isDl true for downlink
@@ -1351,6 +1493,15 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
     // The MAC sub header size defined in nr-mac-scheduler-lcg.h
 
   protected:
+    /**
+     * @brief Whether a new downlink block's MCS is lowered to fill its resource blocks
+     * @return the attribute DlMcsFill
+     */
+    bool GetDlMcsFill() const
+    {
+        return m_dlMcsFill;
+    }
+
     /**
      * @brief Get the bwp id of this MAC
      * @return the bwp id
@@ -1420,6 +1571,20 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
     uint32_t GetUlGrantRbs() const
     {
         return SpsUsesFullBand() ? 0 : m_ulGrantRbs;
+    }
+
+    /// The resource blocks of a wide uplink grant, 0 = none (attribute UlWideGrantRbs; it needs
+    /// UlGrantRbs, below it, and UlMcsPerRbs)
+    uint32_t GetUlWideRbs() const
+    {
+        return GetUlGrantRbs() > 0 && m_ulMcsPerRbs && m_ulWideRbs > GetUlGrantRbs() ? m_ulWideRbs
+                                                                                     : 0;
+    }
+
+    /// The most uplink load of a slot at which a wide grant is given, % (UlWideLoadPct)
+    double GetUlWideLoadPct() const
+    {
+        return m_ulWideLoadPct;
     }
 
     /**
@@ -1525,6 +1690,8 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
     uint64_t m_pdcchRound{0};          //!< the count: scheduling calls so far
 
     uint8_t m_spsScenario{0};          //!< SpsScenario attribute: 0 = off, 1, 2
+    bool m_spsDlOn{true};              //!< SpsDl attribute
+    bool m_spsUlOn{true};              //!< SpsUl attribute
     uint8_t m_spsFiveQi{1};            //!< SpsFiveQi attribute
     uint32_t m_spsPeriodMs{20};        //!< SpsPeriodMs attribute
     uint32_t m_spsSilencePeriodMs{160}; //!< SpsSilencePeriodMs attribute
@@ -1532,6 +1699,21 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
     uint32_t m_spsSilenceTbBytes{0};   //!< SpsSilenceTbBytes attribute
     uint32_t m_spsFitExtraBytes{0};    //!< SpsFitExtraBytes attribute
     uint8_t m_spsMcsTolerance{3};      //!< SpsMcsTolerance attribute
+    uint32_t m_cgMultiEntryCeBytes{6}; //!< CgMultiEntryCeBytes attribute
+    bool m_cgBlockPacketOnly{false};   //!< CgBlockPacketOnly attribute
+    bool m_cgStartAfterIr{false};      //!< CgStartAfterIr attribute
+    bool m_cgStartRetry{false};        //!< CgStartRetry attribute
+    bool m_srGrantLearned{false};      //!< SrGrantLearned attribute
+    uint32_t m_srGrantL2Bytes{3};      //!< SrGrantL2Bytes attribute
+    uint32_t m_spsSidGapMs{0};         //!< SpsSidGapMs attribute
+    bool m_spsDlSilenceAtSecondSid{false}; //!< SpsDlSilenceAtSecondSid attribute
+    bool m_dlSpsHysteresis{false};     //!< DlSpsHysteresis attribute
+    Time m_dlSpsRaiseTime;             //!< DlSpsRaiseTime attribute
+    Time m_dlSpsLowerTime;             //!< DlSpsLowerTime attribute
+    Time m_dlSpsMinInterval;           //!< DlSpsMinInterval attribute
+    uint32_t m_dlSpsUrgentSteps{6};    //!< DlSpsUrgentSteps attribute
+    uint32_t m_dlSpsFailures{2};       //!< DlSpsFailures attribute
+    bool m_cgSilenceSwitchNow{false};  //!< CgSilenceSwitch attribute: true = immediate
     uint8_t m_dlSpsSymsSlot{0};        //!< symbols the SPS blocks take in the DL slot at hand
     uint64_t m_ulSlotAtHand{0};        //!< the uplink slot being scheduled, counted from frame 0
     mutable std::map<uint16_t, SpsState> m_spsDl; //!< downlink SPS of each UE
@@ -1573,13 +1755,49 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
     double m_ollaStepUp{0.0};     //!< DL OLLA step applied on ACK, in MCS units. 0 disables OLLA
     double m_ollaTargetBler{0.1}; //!< DL OLLA target initial BLER; sets the down/up step ratio
     double m_ollaMaxOffset{4.0};  //!< DL OLLA offset clamp, in MCS units
+    bool m_dlMcsFill{false};      //!< DlMcsFill: lower a new DL block's MCS to fill its RBs
+    bool m_cgHysteresis{true};    //!< CgHysteresis: the reactivation policy below; false = as before
+    double m_cgRaiseDb{1.0};      //!< CgRaiseDb: short of the SINR target by this much ...
+    Time m_cgRaiseTime{MilliSeconds(100)}; //!< CgRaiseTime: ... this long: more repetitions
+    double m_cgUrgentDb{3.0};     //!< CgUrgentDb: short by this much: at once, any interval
+    double m_cgLowerDb{2.0};      //!< CgLowerDb: fewer repetitions with this much to spare ...
+    Time m_cgLowerTime{MilliSeconds(400)}; //!< CgLowerTime: ... this long
+    double m_cgSinrPercentile{0.0}; //!< CgSinrPercentile: K and MCS for this percentile, 0 = now
+    Time m_cgSinrWindow{MilliSeconds(500)}; //!< CgSinrWindow: of the SINR over this window
+    Time m_cgMinInterval{MilliSeconds(200)}; //!< CgMinInterval: between activations
+    uint32_t m_cgFailures{2};     //!< CgFailures: failed first transmissions in a row: at once
 
     /// DL OLLA offset after each update: rnti, offset in MCS units, ack, clamped
     TracedCallback<uint16_t, double, bool, bool> m_dlOllaUpdate;
     bool m_ulOlla{false};        //!< UL OLLA on (attribute UlOlla), same steps as the DL one
+    Time m_ulSinrAvgTime{Seconds(0)}; //!< UlSinrAvgTime: time constant of the UL SINR smoothing
+    /// UL HARQ processes, as (RNTI, process), whose grant took its MCS from a measurement of the
+    /// UE's uplink: only their first transmissions move the UL OLLA (UpdateUlOlla())
+    mutable std::set<std::pair<uint16_t, uint8_t>> m_ulMeasuredHarq;
+
+    /// PUSCH repetition: a block whose grant asked for repetitions, with the transmissions of it
+    /// that are still to be placed, one per uplink slot (PlaceUlRepetitions())
+    struct UlRepetition
+    {
+        std::shared_ptr<DciInfoElementTdma> dci; //!< the grant of the block (or its retransmission)
+        uint8_t next{1};                         //!< the next transmission of it to place
+    };
+
+    std::list<UlRepetition> m_ulRepetitions; //!< the blocks under repetition, oldest first
+    std::list<UlRepetition> m_dlRepetitions; //!< PDSCH aggregation: the same, downlink
+    uint32_t m_pdschAggregation{1};          //!< attribute PdschAggregation
+    double m_pdschAggSinrDb{2.0};            //!< attribute PdschAggregationSinrDb
+    /// PDSCH aggregation of each UE's SPS configuration, set at its activation (RRC, SPS-Config)
+    std::unordered_map<uint16_t, uint8_t> m_dlSpsAggregation;
+    uint32_t m_puschRepetitions{1};          //!< attribute PuschRepetitions
+    double m_puschRepSinrDb{2.0};            //!< attribute PuschRepetitionSinrDb
+    uint32_t m_puschMinBlockBytes{0};        //!< attribute PuschMinBlockBytes
     bool m_ulMcsPerRbs{false};   //!< UL MCS for the RBs of each grant (attribute UlMcsPerRbs)
     uint32_t m_srGrantBytes{17}; //!< Grant after a scheduling request (attribute SrGrantBytes)
     uint32_t m_ulGrantRbs{0};    //!< Most RBs of an uplink grant, 0 = all (attribute UlGrantRbs)
+    uint32_t m_ulWideRbs{0};     //!< RBs of a wide uplink grant, 0 = none (UlWideGrantRbs)
+    double m_ulWideSinrDb{5.0};  //!< SINR on one RB for a wide grant (attribute UlWideSinrDb)
+    double m_ulWideLoadPct{50.0}; //!< most slot load for a wide grant (attribute UlWideLoadPct)
     std::vector<bool> m_dlRbgFreeForData; //!< Slot being scheduled: DL RBGs left for new data
     std::vector<bool> m_ulRbgFreeForData; //!< Slot being scheduled: UL RBGs left for new data
 

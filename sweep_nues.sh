@@ -36,7 +36,10 @@
 #   DIR/calls.csv       a line per flow of a call (dir: dl, ul; two of them for two-way calls)
 #                       and per bearer of it (bearer = 0: the call, 1, 2, ...: its bearers):
 #                       losses, 5QI 1 (on bearer, late, PER, delay percentiles, missed, satisfied),
-#                       the DCIs of the UE, the far end's stretch, end to end
+#                       the DCIs of the UE, the far end's stretch, end to end, and whether
+#                       the call was admitted, blocked or released
+#   DIR/control.csv     a line per run: calls offered, admitted, blocked (by resource),
+#                       released, and what the admitted calls reserved
 #   DIR/delays.csv      per flow: delivered packets per 1 ms of UE-UPF delay (for delay CDFs)
 #   DIR/pdcch.csv       a line per run: CCEs, DCIs and blocking by purpose, aggregation levels,
 #                       missed DCIs, SPS / configured grant counters
@@ -285,7 +288,7 @@ done
 wait
 
 # Join the files of the runs that finished: one header, then the lines of every run
-for kind in calls delays packets pdcch rohc rohc_types; do
+for kind in calls control delays packets pdcch rohc rohc_types; do
     files=()
     for d in "$outdir"/runs/*/; do
         if [ -f "$d/done" ] && [ -f "$d/run_$kind.csv" ]; then

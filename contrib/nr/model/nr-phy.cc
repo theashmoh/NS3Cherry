@@ -763,13 +763,17 @@ NrPhy::PushBackSlotAllocInfo(const SlotAllocInfo& slotAllocInfo)
         NS_LOG_DEBUG("Pushing allocation at the end of the list");
     }
 
-    std::stringstream output;
-
-    for (const auto& alloc : m_slotAllocInfo)
+    // (the allocations are formatted only when the log reads them: the loop below cost 5 % of
+    // an optimized multi-cell run)
+    if (g_log.IsEnabled(ns3::LOG_DEBUG))
     {
-        output << alloc;
+        std::stringstream output;
+        for (const auto& alloc : m_slotAllocInfo)
+        {
+            output << alloc;
+        }
+        NS_LOG_DEBUG(output.str());
     }
-    NS_LOG_DEBUG(output.str());
 }
 
 void

@@ -289,6 +289,16 @@ NrUeRrc::GetTypeId()
                           BooleanValue(false),
                           MakeBooleanAccessor(&NrUeRrc::m_rlcMaxRetxTriggersRlf),
                           MakeBooleanChecker())
+            .AddAttribute("ReconnectAfterRelease",
+                          "If false (the default), a UE whose RRC connection the network released "
+                          "goes to RRC_IDLE, looks for a cell and camps on it, and connects again "
+                          "only when its NAS asks for a connection (TS 38.331 5.3.8). If true, it "
+                          "connects again by itself as soon as it camps: the stock behaviour of "
+                          "the nr module, which handles the release like the recovery from a "
+                          "radio link failure. A radio link failure always connects again.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&NrUeRrc::m_reconnectAfterRelease),
+                          MakeBooleanChecker())
             .AddAttribute(
                 "Tr36839HandoverFailure",
                 "Prototype TR 36.839 (5.3.2) handover-failure model: if the handover "
@@ -1127,6 +1137,9 @@ NrUeRrc::DoConnect()
 {
     NS_LOG_FUNCTION(this << "IMSI " << m_imsi);
 
+    // The NAS (or the camping code above) asks for a connection: the release is over
+    m_releasedByNetwork = false;
+
     switch (m_state)
     {
     case IDLE_START:
@@ -1749,6 +1762,9 @@ NrUeRrc::DoRecvRrcConnectionRelease(NrRrcSap::RrcConnectionRelease msg)
     if (!m_leaveConnectedMode)
     {
         m_leaveConnectedMode = true;
+        // The UE goes to RRC_IDLE and stays there: unlike after a radio link failure, nothing
+        // may start a new connection until the NAS does (see the camping code and DoConnect)
+        m_releasedByNetwork = true;
         NS_LOG_DEBUG("Switch to CONNECTED_PHY_PROBLEM. Reason: Received connection release message "
                      "for IMSI: "
                      << m_imsi << " rnti: " << m_rnti << " cellId: " << m_cellId
@@ -2202,7 +2218,9 @@ NrUeRrc::EvaluateCellForSelection()
         // UE state is instantly change to IDLE_WAIT_SIB2.
         // This will make the UE to read the SIB2 message
         // and start random access.
-        if (!m_connectionPending)
+        // (After an RrcConnectionRelease of the network this is not done: the UE stays camped in
+        // RRC_IDLE until its NAS asks for a connection, unless ReconnectAfterRelease is set.)
+        if (!m_connectionPending && (m_reconnectAfterRelease || !m_releasedByNetwork))
         {
             NS_LOG_DEBUG("Calling DoConnect in state = " << ToString(m_state));
             DoConnect();
@@ -2489,6 +2507,8 @@ NrUeRrc::ApplyRadioResourceConfigDedicated(NrRrcSap::RadioResourceConfigDedicate
             ObjectFactory rlcObjectFactory;
             rlcObjectFactory.SetTypeId(rlcTypeId);
             Ptr<NrRlc> rlc = rlcObjectFactory.Create()->GetObject<NrRlc>();
+            rlc->SetAttributeFailSafe("UeSide", BooleanValue(true)); // (RLC UM only)
+            rlc->SetAttributeFailSafe("UeCellId", UintegerValue(m_cellId)); // (RLC UM only)
             rlc->SetNrMacSapProvider(m_macSapProvider);
             rlc->SetRnti(m_rnti);
             rlc->SetLcId(dtamIt->logicalChannelIdentity);

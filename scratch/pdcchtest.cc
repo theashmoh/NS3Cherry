@@ -26,6 +26,17 @@ struct TestConfig
     double ulShare;
     bool raise;
     const char* candidates;
+    // the cell's own DCIs
+    const char* siPeriodsMs;
+    uint32_t pagingCycleMs;
+    uint32_t pagingFrames;
+    double pagingRate;
+    uint32_t tpcPeriodMs;
+    uint32_t tpcUesPerDci;
+    const char* rrcSetupDcis;
+    const char* rrcCallDcis;
+    uint32_t rrcStepMs;
+    uint32_t measReportPeriodMs;
 };
 
 struct Asked
@@ -67,9 +78,23 @@ Slot(Ptr<NrPdcch> pdcch, const TestConfig* cfg, Ptr<UniformRandomVariable> rv, u
         a.released = false;
         asked.push_back(a);
     };
+    // The UEs with SPS or configured grants (DCI 2_2), as the schedulers tell them
+    const uint32_t dlConfigured = rv->GetInteger(0, nUes);
+    const uint32_t ulConfigured = rv->GetInteger(0, nUes);
+    pdcch->SetConfiguredUes(true, dlConfigured);
+    pdcch->SetConfiguredUes(false, ulConfigured);
+    std::cout << "CONFIGURED " << cfg->name << " " << slot + 2 << " " << dlConfigured << " "
+              << ulConfigured << "\n";
     // The uplink scheduler first, as in the nr module with NrPdcch. (Nothing is asked for in
     // the very first slot: NrPdcch learns there which slot the schedulers work on.)
     pdcch->StartUplink();
+    // Now and then a call starts: the RRC messages of its QoS flow
+    if (slot > 0 && rv->GetValue() < 0.02)
+    {
+        const auto rnti = static_cast<uint16_t>(rv->GetInteger(1, nUes));
+        pdcch->CallStarts(rnti);
+        std::cout << "CALL " << cfg->name << " " << slot + 2 << " " << rnti << "\n";
+    }
     if (slot > 0 && rv->GetValue() < 0.05)
     {
         ask(0, NrPdcch::RAR);
@@ -142,14 +167,29 @@ main(int argc, char* argv[])
     cmd.AddValue("slots", "Slots per configuration", slots);
     cmd.Parse(argc, argv);
 
+    // The cell's own DCIs: the defaults in A, B, C, F; others in D and E
+    // clang-format off
     const TestConfig configs[] = {
-        {"A", 26, 1, 34, 0, 0.5, true, "6,6,4,2,1"},  // 5 MHz, 4 CCEs
-        {"B", 52, 0, 34, 0, 0.5, true, "6,6,4,2,1"},  // 10 MHz, 8/16/24 CCEs, dynamic
-        {"C", 160, 1, 34, 0, 0.5, true, "6,6,4,2,1"}, // 30 MHz, 26 CCEs
-        {"D", 106, 2, 60, 48, 0.25, false, "4,4,2,2,0"}, // other settings: 48 RB x 2 = 16 CCEs
-        {"E", 79, 3, 12, 0, 1.0, true, "8,8,8,8,8"},  // 15 MHz, 3 symbols: 39 CCEs
-        {"F", 160, 0, 34, 0, 0.0, true, "6,6,4,2,1"}, // dynamic, no share for the uplink
+        // 5 MHz, 4 CCEs
+        {"A", 26, 1, 34, 0, 0.5, true, "6,6,4,2,1",
+         "160,160,320", 1280, 0, 5, 40, 13, "4:5", "1:1", 20, 0},
+        // 10 MHz, 8/16/24 CCEs, dynamic
+        {"B", 52, 0, 34, 0, 0.5, true, "6,6,4,2,1",
+         "160,160,320", 1280, 0, 5, 40, 13, "4:5", "1:1", 20, 0},
+        // 30 MHz, 26 CCEs
+        {"C", 160, 1, 34, 0, 0.5, true, "6,6,4,2,1",
+         "160,160,320", 1280, 0, 5, 40, 13, "4:5", "1:1", 20, 0},
+        // other settings: 48 RB x 2 = 16 CCEs
+        {"D", 106, 2, 60, 48, 0.25, false, "4,4,2,2,0",
+         "80,640", 640, 16, 60, 10, 5, "2:3", "2:1", 7, 50},
+        // 15 MHz, 3 symbols: 39 CCEs
+        {"E", 79, 3, 12, 0, 1.0, true, "8,8,8,8,8",
+         "", 320, 32, 200, 0, 13, "0:0", "0:2", 1, 30},
+        // dynamic, no share for the uplink
+        {"F", 160, 0, 34, 0, 0.0, true, "6,6,4,2,1",
+         "160,160,320", 1280, 0, 5, 40, 13, "4:5", "1:1", 20, 0},
     };
+    // clang-format on
     std::cout << std::setprecision(10);
     for (const TestConfig& cfg : configs)
     {
@@ -161,12 +201,27 @@ main(int argc, char* argv[])
         pdcch->SetAttribute("UlMaxShare", DoubleValue(cfg.ulShare));
         pdcch->SetAttribute("RaiseAl", BooleanValue(cfg.raise));
         pdcch->SetAttribute("Candidates", StringValue(cfg.candidates));
+        pdcch->SetAttribute("SiPeriodsMs", StringValue(cfg.siPeriodsMs));
+        pdcch->SetAttribute("PagingCycleMs", UintegerValue(cfg.pagingCycleMs));
+        pdcch->SetAttribute("PagingFrames", UintegerValue(cfg.pagingFrames));
+        pdcch->SetAttribute("PagingRate", DoubleValue(cfg.pagingRate));
+        pdcch->SetAttribute("TpcPeriodMs", UintegerValue(cfg.tpcPeriodMs));
+        pdcch->SetAttribute("TpcUesPerDci", UintegerValue(cfg.tpcUesPerDci));
+        pdcch->SetAttribute("RrcSetupDcis", StringValue(cfg.rrcSetupDcis));
+        pdcch->SetAttribute("RrcCallDcis", StringValue(cfg.rrcCallDcis));
+        pdcch->SetAttribute("RrcStepMs", UintegerValue(cfg.rrcStepMs));
+        pdcch->SetAttribute("MeasReportPeriodMs", UintegerValue(cfg.measReportPeriodMs));
         pdcch->SetCarrier(cfg.rbs, 0);
         std::cout << "CONFIG " << cfg.name << " " << cfg.rbs << " " << cfg.symbols << " "
                   << cfg.dciBits << " " << cfg.coresetRbs << " " << cfg.ulShare << " " << cfg.raise
                   << " " << cfg.candidates << " " << pdcch->GetCoresetRbs() << " "
                   << pdcch->GetNumCce(1) << " " << pdcch->GetNumCce(2) << " " << pdcch->GetNumCce(3)
                   << " " << +pdcch->GetCommonAl() << "\n";
+        std::cout << "CELL " << cfg.name << " " << (*cfg.siPeriodsMs ? cfg.siPeriodsMs : "-") << " "
+                  << cfg.pagingCycleMs << " " << cfg.pagingFrames << " " << cfg.pagingRate << " "
+                  << cfg.tpcPeriodMs << " " << cfg.tpcUesPerDci << " " << cfg.rrcSetupDcis << " "
+                  << cfg.rrcCallDcis << " " << cfg.rrcStepMs << " " << cfg.measReportPeriodMs
+                  << "\n";
         for (const uint8_t al : {1, 2, 4, 8, 16})
         {
             std::cout << "LEVEL " << cfg.name << " " << +al << " " << pdcch->GetCandidates(al) << " "
@@ -187,6 +242,11 @@ main(int argc, char* argv[])
             const double sinr = std::floor(rv->GetValue(-15.0, 6.0) * 2.0) / 2.0;
             pdcch->ReportSinr(rnti, sinr);
             std::cout << "UE " << cfg.name << " " << rnti << " " << sinr << "\n";
+        }
+        // Every UE has just connected: the DCIs of its RRC messages follow
+        for (uint16_t rnti = 1; rnti <= nUes; ++rnti)
+        {
+            pdcch->AddUe(rnti);
         }
         for (uint64_t slot = 0; slot < slots; ++slot)
         {

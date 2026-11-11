@@ -350,6 +350,7 @@ NrMacSchedulerHarqRr::ScheduleDlHarq(
             dci->m_harqProcess = dciInfoReTx->m_harqProcess;
 
             harqProcess.m_dciElement = dci;
+            harqProcess.m_txSlot = slotAlloc->m_sfnSf.Normalize();
             dciInfoReTx = harqProcess.m_dciElement;
 
             VarTtiAllocInfo slotInfo(dciInfoReTx);
@@ -483,7 +484,10 @@ NrMacSchedulerHarqRr::ScheduleUlHarq(
                                                      dciInfoReTx->m_tpc);
             dci->m_rbgBitmask = harqProcess.m_dciElement->m_rbgBitmask;
             dci->m_harqProcess = harqId;
+            // A retransmission of a repeated block is repeated too (TS 38.214 6.1.2.1)
+            dci->m_repetitions = dciInfoReTx->m_repetitions;
             harqProcess.m_dciElement = dci;
+            harqProcess.m_txSlot = slotAlloc->m_sfnSf.Normalize();
             dciInfoReTx = harqProcess.m_dciElement;
 
             startingPoint->m_sym -= dciInfoReTx->m_numSym;
@@ -626,7 +630,10 @@ NrMacSchedulerHarqRr::ScheduleDlHarqInFrequency(
                                                             before->m_tpc);
             dci->m_rbgBitmask = rbgs;
             dci->m_harqProcess = before->m_harqProcess;
+            // A retransmission of a repeated block is repeated too (PdschAggregation)
+            dci->m_repetitions = before->m_repetitions;
             harqProcess.m_dciElement = dci;
+            harqProcess.m_txSlot = slotAlloc->m_sfnSf.Normalize();
 
             VarTtiAllocInfo slotInfo(dci);
             for (const auto& rlcPdu : harqProcess.m_rlcPduInfo)
@@ -703,7 +710,10 @@ NrMacSchedulerHarqRr::ScheduleUlHarqInFrequency(
                                                         before->m_tpc);
         dci->m_rbgBitmask = rbgs;
         dci->m_harqProcess = harqInfo.m_harqProcessId;
+        // A retransmission of a repeated block is repeated too (TS 38.214 6.1.2.1)
+        dci->m_repetitions = before->m_repetitions;
         harqProcess.m_dciElement = dci;
+            harqProcess.m_txSlot = slotAlloc->m_sfnSf.Normalize();
 
         slotAlloc->m_varTtiAllocInfo.push_front(VarTtiAllocInfo(dci));
         ueMap.find(rnti)->second->m_ulMRBRetx =
@@ -736,6 +746,17 @@ NrMacSchedulerHarqRr::SortDlHarq(NrMacSchedulerNs3::ActiveHarqMap* activeDlHarq)
 
     for (auto& it : *activeDlHarq)
     {
+        // A process without a DCI (reclaimed meanwhile) cannot be compared or retransmitted:
+        // it is left out (the scheduler drops such entries before; this is the last guard)
+        std::erase_if(it.second, [](const NrMacSchedulerNs3::HarqVectorIterator& p) {
+            if (!p->second.m_active || p->second.m_dciElement == nullptr)
+            {
+                NS_LOG_WARN("HARQ process " << +p->first
+                                            << " in the retransmission list without a DCI: left out");
+                return true;
+            }
+            return false;
+        });
         std::stable_sort(it.second.begin(), it.second.end(), CompareNumSym);
     }
 }

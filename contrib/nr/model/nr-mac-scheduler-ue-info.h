@@ -140,13 +140,78 @@ class NR_EXPORT NrMacSchedulerUeInfo
      * @return the MCS
      */
     uint8_t GetUlMcsFor(uint32_t rbs) const;
-    /// MCS and CQI the last UL measurement gives over `rbs` resource blocks (no OLLA)
-    std::pair<uint8_t, uint8_t> UlLinkFor(uint32_t rbs) const;
+
+    /**
+     * @brief The numbers of PUSCH repetitions that exist: numberOfRepetitionsExt-r17 of
+     * TS 38.331 (PUSCH-TimeDomainResourceAllocation), which TS 38.214 6.1.2.1 and 6.1.2.3 take as
+     * K: 1, 2, 3, 4, 7, 8, 12, 16, 20, 24, 28, 32 (Rel-16 has the first eight)
+     */
+    static constexpr uint8_t kPuschRepetitionValues[12] = {1, 2, 3, 4, 7, 8, 12, 16, 20, 24, 28, 32};
+    /// Whether `k` is one of kPuschRepetitionValues
+    static bool IsPuschRepetitionValue(uint32_t k);
+    /// The fewest of kPuschRepetitionValues that is at least `k` (the most, 32, for more)
+    static uint8_t PuschRepetitionsAtLeast(uint32_t k);
+
+    /// What the last UL measurement gives a grant of a number of resource blocks (no OLLA)
+    struct UlLink
+    {
+        uint8_t mcs{0};  //!< MCS the error model decodes after the repetitions
+        uint8_t cqi{0};  //!< CQI of the same
+        uint8_t reps{1}; //!< PUSCH repetitions (m_puschRepetitions)
+    };
+
+    /// MCS, CQI and repetitions the last UL measurement gives over `rbs` resource blocks
+    UlLink UlLinkFor(uint32_t rbs) const;
+    /**
+     * @brief The MCS the last UL measurement gives over `rbs` resource blocks with `reps`
+     * transmissions of the block, which the gNB combines (no OLLA); m_ulMcs without a
+     * measurement. For a configured grant too, whose repetitions are among
+     * kPuschRepetitionValues, not more than the slots of its period (TS 38.214 6.1.2.3.1).
+     * @param rbs resource blocks of the grant
+     * @param reps transmissions of the block
+     * @param scale factor on the measured SINR (a margin: below 1), 1 = as measured
+     * @return the MCS
+     */
+    uint8_t GetUlMcsForReps(uint32_t rbs, uint8_t reps, double scale = 1.0) const;
+    /**
+     * @brief Mean linear SINR of the last UL measurement over `rbs` resource blocks (the UE's
+     * power spread over them)
+     * @param rbs resource blocks
+     * @return the SINR; 0 without a measurement
+     */
+    double GetUlMeanSinrFor(uint32_t rbs) const;
+    /**
+     * @brief PUSCH repetitions for a grant of `rbs` resource blocks: m_puschRepetitions if it is
+     * not 0; with 0, from the last measurement, the fewest of TS 38.214's values (1, 2, 3, 4, 7,
+     * 8, 12, 16, 20, 24, 28, 32) that bring the mean SINR of the RBs, times the repetitions (the
+     * gNB combines them), to m_puschRepSinr, or more if the block of a slot at the MCS they give
+     * would be under the least block the UE sends data in (NrMacShortBsrCe::MinUlGrantBytes():
+     * 15 B, 12 B with the compact BSR); 1 without a measurement
+     * @param rbs resource blocks of the grant
+     * @return the repetitions
+     */
+    uint8_t GetUlRepetitionsFor(uint32_t rbs) const;
     /**
      * @brief Resource blocks of the uplink resource block groups assigned in this slot
      * (m_ulRBG lists an RBG once per symbol)
      */
     uint32_t GetUlRbs() const;
+    /**
+     * @brief Whether the UE may get a wide uplink grant (m_ulWideRbs): its last measurement,
+     * scaled to one resource block, is at least m_ulWideSinr, and its power still carries MCS 0
+     * over the wide grant (GetUlMaxRbs()). With the repetitions per measurement
+     * (m_puschRepetitions 0) also only while the wide grant, with the K its lower SINR per RB
+     * needs, takes no more resource block slots than the narrow grant with its K.
+     */
+    bool UlWideOk() const;
+    /**
+     * @brief Whether a wide grant halves the repetitions of the UE: they are fixed
+     * (m_puschRepetitions above 1) and UlLinkFor() divides them by how many times wider the
+     * grant is, so that the wide one carries the same bits in fewer slots for as many resource
+     * block slots. With the repetitions per measurement (0) the wide grant has the K its own,
+     * lower, SINR needs.
+     */
+    bool UlWideHalvesReps() const;
     /**
      * @brief With m_ulMcsPerRbs: the most resource blocks over which the UE's power still
      * carries MCS 0 (at the AMC's 10 % block errors), from its last measurement; more would
@@ -357,6 +422,10 @@ class NR_EXPORT NrMacSchedulerUeInfo
      * its logical channels look active.
      */
     uint32_t m_srBytesPending{0};
+    /// CgBlockPacketOnly: bytes of the CG confirmation the grant for the pending request carries
+    uint8_t m_srConfirmAhead{0};
+    /// ... and the serial of the activation that confirmation is for
+    uint32_t m_srConfirmAheadSerial{0};
 
     uint32_t m_dlMRBRetx{0};       //!< MRB assigned for retx. To update the name,
                                    //!< what is MRB is not defined
@@ -381,10 +450,25 @@ class NR_EXPORT NrMacSchedulerUeInfo
     double m_ulOllaMax{0.0}; //!< Absolute clamp on m_ulOlla; 0 disables UL OLLA
     bool m_ulMcsPerRbs{false};          //!< see GetUlMcsFor()
     std::vector<double> m_ulSinrMeas;   //!< linear SINR of each RB of the last UL measurement
+    /// Smoothed uplink SINR (UlSinrAvgTime): the exponentially weighted mean of the reports, as
+    /// the SINR of one resource block (the SINR of a report times its resource blocks, linear);
+    /// 0 = none yet. m_ulSinrMeas then carries the shape of the last report at this level.
+    double m_ulSinrFilt{0.0};
+    int64_t m_ulSinrFiltAtNs{-1}; //!< time of the last report that went into m_ulSinrFilt (ns)
     Ptr<const SpectrumModel> m_ulModel; //!< spectrum model of the UL measurements
-    /// MCS and CQI of the last measurement over a number of resource blocks (GetUlMcsFor())
-    mutable std::unordered_map<uint32_t, std::pair<uint8_t, uint8_t>> m_ulMcsByRbs;
+    /// MCS, CQI and repetitions of the last measurement over a number of resource blocks
+    /// (GetUlMcsFor())
+    mutable std::unordered_map<uint32_t, UlLink> m_ulMcsByRbs;
+    /// GetUlMcsForReps() of the last measurement, by (resource blocks << 8) + transmissions
+    mutable std::unordered_map<uint32_t, uint8_t> m_ulMcsByRbsReps;
+    uint8_t m_puschRepetitions{1};  //!< see GetUlRepetitionsFor(): K, or 0 per measurement
+    double m_puschRepSinr{1.0};     //!< see GetUlRepetitionsFor(): linear
+    uint32_t m_puschMinBlock{0};    //!< see GetUlRepetitionsFor(): least block (0: the least a UE
+                                    //!< sends data in)
     mutable uint32_t m_ulMaxRbs{0}; //!< GetUlMaxRbs() of the last measurement; 0 = not yet
+    uint32_t m_ulWideRbs{0};        //!< RBs of a wide uplink grant, 0 = none (UlWideGrantRbs)
+    uint32_t m_ulNarrowRbs{1};      //!< RBs of an uplink grant without it (UlGrantRbs)
+    double m_ulWideSinr{1.0};       //!< UlWideSinrDb, linear
 
     struct NR_EXPORT SbMcsInfo
     {
@@ -431,6 +515,14 @@ class NR_EXPORT NrMacSchedulerUeInfo
     uint32_t GetNumRbPerRbg() const;
 
   private:
+    /**
+     * @brief The SINR of each RB of the last UL measurement over `rbs` resource blocks
+     * @param rbs resource blocks
+     * @param mean set to the mean linear SINR of them
+     * @return the SINR of each
+     */
+    SpectrumValue UlSinrFor(uint32_t rbs, double* mean) const;
+
     const GetRbPerRbgFn m_getNumRbPerRbg; //!< Function that points to a method which knows the
                                           //!< number of RB per RBG.
 };

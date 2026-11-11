@@ -132,15 +132,16 @@ NrUePhy::GetTypeId()
                           TimeValue(MicroSeconds(100)),
                           MakeTimeAccessor(&NrPhy::SetTbDecodeLatency, &NrPhy::GetTbDecodeLatency),
                           MakeTimeChecker())
+            // Ideal timing advance: the UE's estimate of the one-way propagation delay to its serving gNB
+            // (a Rel-17 NTN UE derives it from GNSS and the SIB19 ephemeris). The UE's slot clock runs
+            // this much ahead of the gNB's, so every uplink transmission (data, control, SRS, PRACH)
+            // reaches the gNB in the slot it was scheduled for, and the slot offsets carried by downlink
+            // messages (K1, K2, the Msg3 grant) are counted from the gNB slot that carried them. Can be
+            // changed at run time. Zero keeps the terrestrial timeline. In FDD set it on every BWP PHY of
+            // the UE.
             .AddAttribute(
                 "TimingAdvance",
-                "Ideal timing advance: the UE's estimate of the one-way propagation delay to its "
-                "serving gNB (a Rel-17 NTN UE derives it from GNSS and the SIB19 ephemeris). The "
-                "UE's slot clock runs this much ahead of the gNB's, so every uplink transmission "
-                "(data, control, SRS, PRACH) reaches the gNB in the slot it was scheduled for, "
-                "and the slot offsets carried by downlink messages (K1, K2, the Msg3 grant) are "
-                "counted from the gNB slot that carried them. Can be changed at run time. Zero "
-                "keeps the terrestrial timeline. In FDD set it on every BWP PHY of the UE.",
+                "Ideal timing advance: the UE's one-way delay estimate, by which its slot clock runs ahead of the gNB's (0 = terrestrial timeline).",
                 TimeValue(Seconds(0)),
                 MakeTimeAccessor(&NrUePhy::SetTimingAdvance, &NrUePhy::GetTimingAdvance),
                 MakeTimeChecker(Seconds(0)))
@@ -804,7 +805,9 @@ NrUePhy::PhyCtrlMessagesReceived(const Ptr<NrControlMessage>& msg)
 
         m_phySapUser->ReceiveControlMessage(msg);
 
-        if (m_enableUplinkPowerControl)
+        // (a PDSCH repetition has no DCI of its own, so no TPC command either)
+        if (m_enableUplinkPowerControl &&
+            dciInfoElem->m_sps != DciInfoElementTdma::PDSCH_REPETITION)
         {
             m_powerControl->ReportTpcPusch(dciInfoElem->m_tpc);
             m_powerControl->ReportTpcPucch(dciInfoElem->m_tpc);
@@ -835,7 +838,9 @@ NrUePhy::PhyCtrlMessagesReceived(const Ptr<NrControlMessage>& msg)
                 m_phySapUser->ReceiveControlMessage(msg);
             }
         }
-        else if (dciInfoElem->m_sps != DciInfoElementTdma::DYNAMIC && dciInfoElem->m_pdcchMissed)
+        else if (dciInfoElem->m_sps != DciInfoElementTdma::DYNAMIC &&
+                 dciInfoElem->m_sps != DciInfoElementTdma::PUSCH_REPETITION &&
+                 dciInfoElem->m_pdcchMissed)
         {
             // A block of a configured grant the UE does not know of: it missed the DCI that
             // activated the configuration. It sends nothing and keeps its data, and the gNB
@@ -1475,6 +1480,10 @@ NrUePhy::DlData(const std::shared_ptr<DciInfoElementTdma>& dci)
                           m_currentSlot};
     // PdcchErrorModel: this UE did not decode the assignment, so it does not receive the block
     expectedTb.m_pdcchMissed = dci->m_pdcchMissed;
+    // PDSCH repetition: the block decodes after its last transmission
+    expectedTb.m_repLeft = dci->m_repetitions > dci->m_repIndex + 1
+                               ? static_cast<uint8_t>(dci->m_repetitions - dci->m_repIndex - 1)
+                               : 0;
     m_spectrumPhy->AddExpectedTb(expectedTb);
     m_reportDlTbSize(m_netDevice->GetObject<NrUeNetDevice>()->GetImsi(), dci->m_tbSize);
     NS_LOG_INFO("UE" << m_rnti << " RXing DL DATA frame for symbols " << +dci->m_symStart << "-"
@@ -2562,6 +2571,22 @@ NrUePhy::MarkMissedDcis(const std::list<Ptr<NrControlMessage>>& msgs)
         }
         auto& activeConfig = m_spsActiveConfig[uplinkGrant ? 1 : 0];
         auto& activeSerial = m_spsActiveSerial[uplinkGrant ? 1 : 0];
+        if (dci->m_sps == DciInfoElementTdma::PUSCH_REPETITION)
+        {
+            // One more transmission of the block of an uplink grant: no PDCCH, so nothing to
+            // miss, but the UE sends it only if it decoded that grant
+            const auto bundle = m_ulBundleMissed.find(dci->m_harqProcess);
+            dci->m_pdcchMissed = bundle != m_ulBundleMissed.end() && bundle->second;
+            continue;
+        }
+        if (dci->m_sps == DciInfoElementTdma::PDSCH_REPETITION)
+        {
+            // One more transmission of the block of a downlink assignment: no PDCCH, and the
+            // UE receives it only if it decoded that assignment (or the SPS activation)
+            const auto bundle = m_dlBundleMissed.find(dci->m_harqProcess);
+            dci->m_pdcchMissed = bundle != m_dlBundleMissed.end() && bundle->second;
+            continue;
+        }
         if (dci->m_sps == DciInfoElementTdma::SPS_OCCASION)
         {
             // A block of a semi-persistent configuration (downlink) or of a configured grant
@@ -2577,6 +2602,11 @@ NrUePhy::MarkMissedDcis(const std::list<Ptr<NrControlMessage>>& msgs)
                                                  : NrPdcch::DL_SPS_LOST_CONFIG);
                 }
             }
+            if (dci->m_repetitions > 1)
+            {
+                (uplinkGrant ? m_ulBundleMissed : m_dlBundleMissed)[dci->m_harqProcess] =
+                    dci->m_pdcchMissed;
+            }
             continue;
         }
         if (errors)
@@ -2591,12 +2621,19 @@ NrUePhy::MarkMissedDcis(const std::list<Ptr<NrControlMessage>>& msgs)
             }
             const double sinrDb = 10 * log10(ComputeAvgSinr(m_ctrlSinrForRlf));
             // With the PDCCH model on: the block error rate of the aggregation level this DCI
-            // was sent at. Without: the curve through Qout and Qin.
-            const double bler = pdcch && dci->m_pdcchAl > 0
-                                    ? pdcch->GetBler(dci->m_pdcchAl, sinrDb)
-                                    : PdcchBlockErrorRate(sinrDb, m_qOut, m_qIn);
+            // was sent at, and of its copies (NrPdcch Repetitions). Without: the curve through
+            // Qout and Qin.
+            const double bler =
+                pdcch && dci->m_pdcchAl > 0
+                    ? pdcch->GetBler(dci->m_pdcchAl, sinrDb, dci->m_pdcchBoostDb, 0, dci->m_pdcchReps)
+                    : PdcchBlockErrorRate(sinrDb, m_qOut, m_qIn);
             dci->m_pdcchMissed = m_pdcchErrorRv->GetValue() < bler;
             m_pdcchReceptionTrace(m_rnti, sinrDb, uplinkGrant, dci->m_pdcchMissed);
+        }
+        if (dci->m_repetitions > 1)
+        {
+            (uplinkGrant ? m_ulBundleMissed : m_dlBundleMissed)[dci->m_harqProcess] =
+                dci->m_pdcchMissed;
         }
         if (pdcch && dci->m_pdcchAl > 0)
         {

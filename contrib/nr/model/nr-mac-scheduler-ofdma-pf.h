@@ -182,10 +182,21 @@ class NR_EXPORT NrMacSchedulerOfdmaPF : public NrMacSchedulerOfdmaRR
     void BeforeUlSched(const UePtrAndBufferReq& ue,
                        const FTResources& assignableInIteration) const override;
 
+    /**
+     * @brief With UlMarginalRate, a UE whose next resource block group would add nothing to
+     * its transport block gets no more groups in the slot (its power is spread as thin as it
+     * pays to).
+     * @param ue the UE
+     * @return false for that UE
+     */
+    bool UlGrantCanGrow(const UePtrAndBufferReq& ue) const override;
+
   private:
     double m_timeWindow{
         99.0}; //!< Time window to calculate the throughput. Better to make it an attribute.
     double m_alpha{0.0}; //!< PF Fairness index
+    bool m_repAware{false}; //!< count the K slots of a PUSCH repetition (RepetitionAware)
+    bool m_marginalUl{false}; //!< uplink potential rate = the worth of the next group (UlMarginalRate)
 };
 
 } // namespace ns3

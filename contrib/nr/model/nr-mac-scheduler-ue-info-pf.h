@@ -110,6 +110,20 @@ class NR_EXPORT NrMacSchedulerUeInfoPF : public NrMacSchedulerUeInfo
     void UpdateUlPFMetric(const NrMacSchedulerNs3::FTResources& totAssigned, double timeWindow);
 
     /**
+     * @brief The uplink potential rate as the worth of the next resource block group
+     * @param beamSym the symbols of the grant
+     *
+     * A UE's power is spread over the resource blocks of its grant, so with the MCS of the
+     * grant's width (UlMcsPerRbs) the transport block does not grow in step with the blocks:
+     * for a UE at low SINR it hardly grows, or shrinks, past some width. The potential is the
+     * bytes the next group adds to the block at the MCS of the wider grant, per symbol (0 if it
+     * adds none). With an MCS that does not depend on the width the block is linear in the
+     * groups, up to the rounding of the transport block size, and the potential is the same for
+     * each of them, as it was.
+     */
+    void UpdateUlMarginal(uint32_t beamSym);
+
+    /**
      * @brief Calculate the Potential throughput for downlink
      * @param assignableInIteration resources assignable
      */
@@ -185,6 +199,11 @@ class NR_EXPORT NrMacSchedulerUeInfoPF : public NrMacSchedulerUeInfo
     double m_potentialTputDl{0.0}; //!< Potential throughput in downlink in one assignable resource
                                    //!< (can be a symbol or a RBG)
     float m_alpha{0.0};            //!< PF fairness metric
+    bool m_marginalUl{false};       //!< the uplink potential is the worth of the next group
+                                   //!< (NrMacSchedulerOfdmaPF attribute UlMarginalRate)
+    bool m_repAware{false};         //!< PUSCH repetition: an uplink grant of K repetitions costs K
+                                   //!< slots of the cell, so its rate per symbol is a Kth of the
+                                   //!< block's (NrMacSchedulerOfdmaPF attribute RepetitionAware)
 
     double m_currTputUl{0.0};      //!< Current slot throughput in uplink
     double m_avgTputUl{0.0};       //!< Average throughput in uplink during all the slots

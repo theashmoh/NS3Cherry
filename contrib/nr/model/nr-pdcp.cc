@@ -130,6 +130,19 @@ std::map<BearerKey, NrPdcp::VoiceActivity> g_voiceActivity;
 uint32_t g_sduPdus = 1;
 
 // One more SDU of a bearer: a silence descriptor or a voice frame
+// The PDCP PDU of a packet of a bearer, as the gNB sends it or receives it: its size and
+// whether it is a ROHC IR packet (first octet 1111110D, RFC 3095 5.7.7.1)
+void
+NoteSduPdu(uint16_t cellId, uint16_t rnti, uint8_t lcid, bool downlink, Ptr<const Packet> pdu,
+           uint32_t pdcpHeaderBytes)
+{
+    NrPdcp::VoiceActivity& activity = g_voiceActivity[BearerKey(rnti, lcid, downlink, cellId)];
+    activity.lastPduBytes = pdu->GetSize();
+    uint8_t octets[8] = {0};
+    const uint32_t n = pdu->CopyData(octets, std::min<uint32_t>(sizeof(octets), pdu->GetSize()));
+    activity.lastIr = n > pdcpHeaderBytes && (octets[pdcpHeaderBytes] & 0xfe) == 0xfc;
+}
+
 void
 NoteSduKind(uint16_t cellId, uint16_t rnti, uint8_t lcid, bool downlink, bool silence)
 {
@@ -143,6 +156,7 @@ NoteSduKind(uint16_t cellId, uint16_t rnti, uint8_t lcid, bool downlink, bool si
             (silence ? activity.toSilencePdus : activity.toVoicePdus) += g_sduPdus;
         }
     }
+    activity.run = activity.last == kind ? activity.run + 1 : 1;
     activity.last = kind;
     ++activity.sdus;
 }
@@ -332,6 +346,20 @@ NrPdcp::NotePduDiscarded()
     }
 }
 
+void
+NrPdcp::NoteUeStaleDiscard(uint16_t cellId, uint16_t rnti, uint8_t lcid)
+{
+    for (auto& [key, counts] : g_bearerCounts)
+    {
+        if (std::get<0>(key) == rnti && std::get<1>(key) == lcid && !std::get<2>(key) &&
+            std::get<3>(key) == cellId)
+        {
+            counts.n.discarded++;
+            return;
+        }
+    }
+}
+
 #ifdef NR_ROHC
 // ---------------------------------------------------------------------------------------------
 // The size-table model of ROHC (`RohcModel` = Table): no compressor runs. The IPv4/UDP[/RTP]
@@ -341,14 +369,20 @@ NrPdcp::NotePduDiscarded()
 //
 // The table (compressor):
 //   IR            the header chain minus one byte (what RFC 3095 needs for static plus dynamic
-//                 chain: 39 bytes for IP/UDP/RTP, 27 for IP/UDP). `RohcTableIrPackets` of them in
-//                 a row at the start of a flow; one on a periodic IR refresh, one after a
-//                 STATIC-NACK.
-//   UOR-2-EXT-3   a context update, `RohcTableUpdateSize` bytes (13): the first packet whose
-//                 length differs from the one before, or with the RTP marker bit (for a voice
-//                 source with DTX: the first SID packet after the hangover and the first voice
-//                 packet after a silence); also one on a periodic FO refresh and one after a NACK.
+//                 chain: 39 bytes for IP/UDP/RTP, 27 for IP/UDP). `RohcTableIrPackets` (4) of
+//                 them in a row at the start of a flow and on a periodic IR refresh (U-mode),
+//                 where nothing tells the compressor whether one has arrived;
+//                 `RohcTableRepairIrPackets` (1) after a STATIC-NACK, which is the answer to a
+//                 decompressor that has asked. An ACK ends a row early.
+//   UOR-2-EXT-3   a context update, `RohcTableUpdateSize` bytes (13), `RohcTableUpdatePackets`
+//                 (4) of them in a row from the first packet whose length differs from the one
+//                 before, or with the RTP marker bit (for a voice source with DTX: the first SID
+//                 packet after the hangover and the first voice packet after a silence); also on
+//                 a periodic FO refresh and after a NACK.
 //   UO-0          every other packet, `RohcTableUo0Size` bytes (3)
+// Sending new context information several times in a row is the optimistic approach of RFC 3095
+// 5.3.1.1.1: without an acknowledgement, the compressor repeats it until it is fairly sure that
+// one copy has arrived (the ROHC library sends each 4 times).
 //
 // The context (decompressor), as W-LSB decoding of the sequence number behaves: every packet has
 // a number; "gap" is how many packets are missing between the last packet that was restored and
@@ -363,25 +397,32 @@ NrPdcp::NotePduDiscarded()
 //
 // The repair, by `RohcMode` (the mode of the decompressor; the compressor starts in U-mode and
 // is in O-mode from the first feedback it receives, RFC 3095 5.6.1):
-//   U   no feedback. The compressor sends one IR `RohcIrRefresh` packets after the last IR, and
-//       a context update `RohcFoRefresh` packets after the last update (and by time, if
-//       `RohcIrRefreshTime` is set); a damaged context waits for the next of these or for the
-//       next regular update.
+//   U   no feedback. The compressor starts its IR packets `RohcIrRefresh` packets after the
+//       last IR, and its context updates `RohcFoRefresh` packets after the last update (and by
+//       time, if `RohcIrRefreshTime` is set); a damaged context waits for the next of these or
+//       for the next regular update.
 //   O   feedback: RFC 3095 FEEDBACK-2 with the CRC option, 5 bytes, in a PDCP control PDU on the
 //       reverse link, where it can be late or lost. The decompressor answers every IR packet
 //       with an ACK. After `RohcNackFailures` packets in a row that it could not restore, and
 //       again every `RohcFeedbackSpacing` packets while that lasts, it sends a NACK (dynamic
-//       context) or a STATIC-NACK (static context). The compressor answers a NACK with one
-//       context update, a STATIC-NACK with one IR.
+//       context) or a STATIC-NACK (static context). The compressor answers a NACK with its
+//       context updates, a STATIC-NACK with its IR packets.
 //
-// The mode of the compressor (RFC 3095 5.6.2): all feedback of the decompressor says "O-mode"
-// and has the CRC option, which a mode request needs. The compressor is in O-mode, and stops its
-// periodic refreshes, as soon as any of it arrives: normally the ACK of the first IR packet. If
-// that ACK is lost on the reverse link, the compressor stays in U-mode until other feedback
-// arrives: a NACK or STATIC-NACK, or the ACK of the IR packet of its next refresh. It does not
-// go back to U-mode. A new PDCP entity, as a UE gets with every new connection after a radio
-// link failure, starts in U-mode again (TS 38.323 5.1.2: ROHC is reset when PDCP is
-// re-established).
+// The mode of the compressor (RFC 3095 5.6): the decompressor decides it, by the Mode field of
+// its feedback, which must have the CRC option. All feedback says "O-mode". The compressor is in
+// O-mode, and stops its periodic refreshes, as soon as any of it arrives: normally the ACK of
+// the first IR packet. If that ACK is lost on the reverse link, the compressor stays in U-mode
+// until other feedback arrives: a NACK or STATIC-NACK, or the ACK of the IR packet of its next
+// refresh.
+// It goes back to U-mode only if `RohcFallbackFailures` is set: a decompressor in O-mode that
+// has not restored that many packets in a row gives up on the feedback and asks for U-mode (Mode
+// field 1; its feedback goes on saying so until a packet of the compressor, an IR or a context
+// update, says that the compressor is in U-mode). The compressor then repeats its context updates
+// as for a NACK, starts the counts of its periodic refreshes anew, and the decompressor sends no
+// more feedback. The pair stays in U-mode. The ROHC library cannot do this: its compressor and
+// decompressor do not implement the transition from O-mode to U-mode. A new PDCP entity, as a UE
+// gets with every new connection after a radio link failure, starts in U-mode again (TS 38.323
+// 5.1.2: ROHC is reset when PDCP is re-established).
 //
 // The header chain travels in a byte tag, as ns-3 tags do: unseen by the layers below, which
 // see only the size.
@@ -394,7 +435,9 @@ class NrRohcSizeTableTag : public Tag
     {
         UO_0 = 0,
         UPDATE = 1,
-        IR = 2
+        IR = 2,
+        SPURT_UOR2 = 3, ///< RohcTableSpurtStartSize: a UOR-2 without extension, an update (6 SN bits)
+        SPURT_UO1 = 4   ///< ... smaller: a UO-1-TS, which only UO-0's window allows (4 SN bits)
     };
 
     static TypeId GetTypeId()
@@ -413,12 +456,13 @@ class NrRohcSizeTableTag : public Tag
 
     uint32_t GetSerializedSize() const override
     {
-        return 7 + m_header.size();
+        return 8 + m_header.size();
     }
 
     void Serialize(TagBuffer i) const override
     {
         i.WriteU8(m_type);
+        i.WriteU8(m_mode);
         i.WriteU32(m_number);
         i.WriteU8(m_compressedSize);
         i.WriteU8(m_header.size());
@@ -428,6 +472,7 @@ class NrRohcSizeTableTag : public Tag
     void Deserialize(TagBuffer i) override
     {
         m_type = i.ReadU8();
+        m_mode = i.ReadU8();
         m_number = i.ReadU32();
         m_compressedSize = i.ReadU8();
         m_header.resize(i.ReadU8());
@@ -441,6 +486,7 @@ class NrRohcSizeTableTag : public Tag
     }
 
     uint8_t m_type{UO_0};          ///< the row of the table
+    uint8_t m_mode{1};             ///< the mode of the compressor, 1 U or 2 O (IR, UPDATE carry it)
     uint32_t m_number{0};          ///< the number of the packet in its flow
     uint8_t m_compressedSize{0};   ///< bytes that stand for the header chain in the PDU
     std::vector<uint8_t> m_header; ///< the header chain
@@ -569,6 +615,12 @@ struct RohcReport
         double arrived = -1; // s, when it reached the compressor; -1: it did not
     };
     std::vector<FeedbackSent> feedbackLog; // every feedback the decompressor sent
+    // RohcFallbackFailures: the decompressor asked for U-mode after so many failed packets in a
+    // row, and a packet of the compressor then told it that U-mode had begun
+    double fallbackAskedAt = -1;     // s, -1: it did not ask
+    uint64_t fallbackAskedAfter = 0; // the packets in a row that had failed by then
+    double fallbackDoneAt = -1;      // s, -1: no packet told it yet
+
     // A context loss as the decompressor lives it: packets in a row that it cannot restore
     struct ContextLoss
     {
@@ -813,14 +865,14 @@ RohcCrc8(const uint8_t* d, uint32_t len)
 }
 
 // The feedback of the size-table model, 5 bytes (RFC 3095 5.7.6.1): 11110 and the size, 4; then
-// FEEDBACK-2 with Acktype (0 ACK, 1 NACK, 2 STATIC-NACK), Mode (2: O-mode) and 12 bits of the
-// number of the packet; then the CRC option, 0x11 and the CRC over these four octets with the
-// CRC octet as zero (5.7.6.3). Only feedback with the CRC option may change the mode of the
+// FEEDBACK-2 with Acktype (0 ACK, 1 NACK, 2 STATIC-NACK), Mode (2 O-mode, 1 U-mode) and 12 bits
+// of the number of the packet; then the CRC option, 0x11 and the CRC over these four octets with
+// the CRC octet as zero (5.7.6.3). Only feedback with the CRC option may change the mode of the
 // compressor (5.6.1); the ROHC library takes exactly these bytes as a request for O-mode.
 std::array<uint8_t, 5>
-RohcTableFeedback(uint8_t ackType, uint32_t number)
+RohcTableFeedback(uint8_t ackType, uint32_t number, uint8_t mode = 2)
 {
-    const uint8_t first = (ackType << 6) | (2 << 4) | ((number >> 8) & 0x0f);
+    const uint8_t first = (ackType << 6) | (mode << 4) | ((number >> 8) & 0x0f);
     std::array<uint8_t, 5> f = {0xf4, first, static_cast<uint8_t>(number & 0xff), 0x11, 0x00};
     f[4] = RohcCrc8(f.data() + 1, 4);
     return f;
@@ -1259,11 +1311,13 @@ PrintRohcModeTable(std::ostream& o)
             continue;
         }
         PrintRohcBearerColumns(o, r.ue, std::to_string(std::get<0>(key)), key);
-        // What the two models do: U, or U and then O. Anything else is listed as it was.
+        // What the two models do: U, or U and then O, or (RohcFallbackFailures) U, O and U
+        // again. Anything else is listed as it was.
         const bool startsInU = r.modes[0].mode == 'U';
-        const bool thenO = r.modes.size() == 2 && r.modes[1].mode == 'O';
+        const bool thenO = r.modes.size() >= 2 && r.modes[1].mode == 'O';
+        const bool backInU = r.modes.size() == 3 && r.modes[2].mode == 'U';
         o << std::setprecision(3);
-        if (startsInU && (r.modes.size() == 1 || thenO))
+        if (startsInU && (r.modes.size() == 1 || (thenO && (r.modes.size() == 2 || backInU))))
         {
             o << std::setw(11) << r.modes[0].from << std::setw(9) << r.modes[0].packets;
             if (thenO)
@@ -1276,6 +1330,14 @@ PrintRohcModeTable(std::ostream& o)
             }
             o << std::setw(16) << r.lastTx << "  "
               << (thenO ? r.modes[1].startedBy : WhyNoRohcFeedbackMode(r));
+            if (backInU)
+            {
+                o << "\n"
+                  << std::string(13, ' ') << "back in U-mode from " << r.modes[2].from << " s ("
+                  << r.modes[2].packets << " packets)\n"
+                  << std::string(13, ' ') << "asked for after " << r.fallbackAskedAfter
+                  << " failed packets in a row: " << r.modes[2].startedBy;
+            }
         }
         else
         {
@@ -1291,9 +1353,24 @@ PrintRohcModeTable(std::ostream& o)
         }
         o << "\n";
     }
+    bool anyBack = false;
+    for (const auto& [key, report] : OrderedRohcReports())
+    {
+        anyBack = anyBack || report->fallbackAskedAt >= 0;
+    }
     o << "U-mode from its first packet (U from), O-mode once feedback that asks for it has "
-         "arrived (O from). It does not go back to\n"
-      << "U-mode; the next connection of the UE starts in U-mode again.\n";
+         "arrived (O from). ";
+    if (anyBack)
+    {
+        o << "It goes back to U-mode only\n"
+          << "when its decompressor asks (RohcFallbackFailures); ";
+    }
+    else
+    {
+        o << "It does not go back to\n"
+          << "U-mode; ";
+    }
+    o << "the next connection of the UE starts in U-mode again.\n";
 }
 
 void
@@ -1351,7 +1428,7 @@ PrintRohcReports()
         {
             // The mode of the compressor over time: a new period when feedback changed it
             o << "Mode          : ";
-            const char* sep = "";
+            std::string sep;
             for (const auto& period : r.modes)
             {
                 o << sep << period.mode << "-mode from " << std::setprecision(3) << period.from
@@ -1361,7 +1438,8 @@ PrintRohcReports()
                     o << ", started by the " << period.startedBy;
                 }
                 o << ")";
-                sep = ", ";
+                // (a third period, back in U-mode, goes on a line of its own)
+                sep = &period == &r.modes.front() ? ", " : ",\n" + std::string(16, ' ');
             }
             o << "\n";
         }
@@ -1501,6 +1579,22 @@ PrintRohcReports()
                 sep = ", ";
             }
             o << "\n";
+        }
+        if (r.fallbackAskedAt >= 0)
+        {
+            o << "Fallback      : the decompressor asked for U-mode at " << std::setprecision(3)
+              << r.fallbackAskedAt << " s, after " << r.fallbackAskedAfter
+              << " packets in a row that it could not restore;\n"
+              << std::string(16, ' ');
+            if (r.fallbackDoneAt >= 0)
+            {
+                o << "a packet told it at " << r.fallbackDoneAt
+                  << " s that the compressor was in U-mode\n";
+            }
+            else
+            {
+                o << "no packet has told it that the compressor is in U-mode\n";
+            }
         }
         o << "=====================================================\n";
     }
@@ -1823,7 +1917,30 @@ NrPdcp::ReceiveControlPdu(Ptr<Packet> p)
         // repairs it. STATIC-NACK (2): the static context is gone, an IR packet is due.
         for (const RohcFeedbackElement& element : elements)
         {
-            if (element.mode == 2 && element.crc && !m_tableOMode)
+            if (element.mode == 1 && element.crc)
+            {
+                // RFC 3095 5.6: the decompressor asks for U-mode. Feedback of an older request
+                // for O-mode that is still on its way must not undo it.
+                m_tableUModeSentNs = std::max(m_tableUModeSentNs, sentAt.GetNanoSeconds());
+                if (m_tableOMode)
+                {
+                    m_tableOMode = false;
+                    r.mode = "U-mode";
+                    NoteRohcMode(r, 'U', now, startedBy.str());
+                    // The refreshes of U-mode count from here. A context update carries the
+                    // new mode, repeated as for a NACK: it is also what the decompressor,
+                    // which is in trouble, needs.
+                    m_tableSinceIr = 0;
+                    m_tableSinceUpdate = 0;
+                    m_tableLastIr = Simulator::Now();
+                    m_tableLastUpdate = Simulator::Now();
+                    m_tableUpdateLeft = std::max(m_tableUpdateLeft, m_rohcTableUpdatePackets);
+                    m_tableUpdateFo = true;
+                    m_tableUpdateSpurt = false;
+                }
+            }
+            else if (element.mode == 2 && element.crc && !m_tableOMode &&
+                     sentAt.GetNanoSeconds() > m_tableUModeSentNs)
             {
                 // RFC 3095 5.6.2: the compressor is in O-mode as soon as any feedback with the
                 // mode parameter O and a CRC reaches it
@@ -1831,13 +1948,23 @@ NrPdcp::ReceiveControlPdu(Ptr<Packet> p)
                 r.mode = "O-mode";
                 NoteRohcMode(r, 'O', now, startedBy.str());
             }
-            if (element.kind == 1)
+            if (element.kind == 0)
             {
-                m_tableUpdateDue = true;
+                // The decompressor has restored an IR: the context is there, the other IR
+                // packets of the optimistic approach are not needed
+                m_tableIrLeft = 0;
+            }
+            else if (element.kind == 1)
+            {
+                m_tableUpdateLeft = std::max(m_tableUpdateLeft, m_rohcTableUpdatePackets);
+                m_tableUpdateFo = true;
+                m_tableUpdateSpurt = false;
             }
             else if (element.kind == 2)
             {
-                m_tableIrLeft = std::max<uint32_t>(m_tableIrLeft, 1);
+                // The decompressor asked for the repair: one IR packet is enough for it; the
+                // optimistic approach, which repeats it, is for senders that hear nothing
+                m_tableIrLeft = std::max(m_tableIrLeft, m_rohcTableRepairIrPackets);
             }
         }
         return;
@@ -1901,10 +2028,44 @@ NrPdcp::CompressWithTable(Ptr<Packet> p)
     const bool marker = rtp && (udpPayload[1] & 0x80) != 0;
     const uint32_t chain = ipHeader + 8 + (rtp ? 12 : 0);
     const Time now = Simulator::Now();
+    // RTP timestamp jump (DTX): more than one stride since the last packet of the flow. With
+    // RohcTableSidUpdateSize set, the first packet after a jump that is not a talk-spurt start
+    // (the first SID_UPDATE) is a context update, the later ones a UOR-2-TS of that size.
+    bool tsJump = false;
+    if (rtp && udpPayloadSize >= 8)
+    {
+        const uint32_t ts = (uint32_t(udpPayload[4]) << 24) | (uint32_t(udpPayload[5]) << 16) |
+                            (uint32_t(udpPayload[6]) << 8) | uint32_t(udpPayload[7]);
+        if (m_tableTsValid)
+        {
+            const uint32_t delta = ts - m_tableLastTs;
+            if (delta > 0 && (m_tableTsStride == 0 || delta < m_tableTsStride))
+            {
+                m_tableTsStride = delta;
+            }
+            tsJump = m_tableTsStride > 0 && delta > m_tableTsStride + m_tableTsStride / 2;
+        }
+        m_tableLastTs = ts;
+        m_tableTsValid = true;
+    }
+    const bool sidRule = m_rohcTableSidUpdateSize > 0;
+    if (marker)
+    {
+        m_tableJumps = 0;
+    }
+    else if (sidRule && tsJump)
+    {
+        ++m_tableJumps;
+    }
+    // (v9: a change of the payload size, voice to SID and back, is a context update)
+    const bool sizeChange = m_rohcTableSizeChangeUpdate && sduSize != m_tableLastSize;
 
     // What is due: the RohcTableIrPackets IR packets of a new flow; in U-mode (as long as no
-    // feedback asked for O-mode) the periodic refreshes, one IR or one context update, counted
-    // in packets since the last one and, if RohcIrRefreshTime is set, also in time
+    // feedback asked for O-mode) the periodic refreshes, IR or context updates, counted in
+    // packets since the last one and, if RohcIrRefreshTime is set, also in time. Each sends
+    // its packets several times in a row (RFC 3095 5.3.1.1.1, the optimistic approach: without
+    // an acknowledgement the compressor repeats new context information to be fairly sure it
+    // arrives); so does a change of the header, below.
     const std::string flow = FlowOf(sdu.data(), sduSize);
     if (flow != m_tableFlow)
     {
@@ -1916,13 +2077,17 @@ NrPdcp::CompressWithTable(Ptr<Packet> p)
         const bool byTime = m_rohcIrRefreshTime.IsStrictlyPositive();
         const Time foTime =
             m_rohcFoRefreshTime.IsStrictlyPositive() ? m_rohcFoRefreshTime : m_rohcIrRefreshTime / 2;
-        if (m_tableSinceIr >= m_rohcIrRefresh || (byTime && now - m_tableLastIr >= m_rohcIrRefreshTime))
+        if (m_tableSinceIr >= m_rohcIrRefresh ||
+            (byTime && now - m_tableLastIr >= m_rohcIrRefreshTime))
         {
-            m_tableIrLeft = std::max<uint32_t>(m_tableIrLeft, 1);
+            m_tableIrLeft = std::max(m_tableIrLeft, m_rohcTableIrPackets);
         }
-        else if (m_tableSinceUpdate >= m_rohcFoRefresh || (byTime && now - m_tableLastUpdate >= foTime))
+        else if (m_tableSinceUpdate >= m_rohcFoRefresh ||
+                 (byTime && now - m_tableLastUpdate >= foTime))
         {
-            m_tableUpdateDue = true;
+            m_tableUpdateLeft = std::max(m_tableUpdateLeft, m_rohcTableUpdatePackets);
+            m_tableUpdateFo = true;
+            m_tableUpdateSpurt = false;
         }
     }
 
@@ -1941,23 +2106,69 @@ NrPdcp::CompressWithTable(Ptr<Packet> p)
         compressed = chain - 1;
         firstOctet = 0xfd; // RFC 3095 5.7.7.1: 1111110D
         st = 1;
-        m_tableUpdateDue = false;
+        // (an IR carries everything: no context update is due after it)
+        m_tableUpdateLeft = 0;
+        m_tableUpdateFo = false;
         m_tableSinceIr = 0;
         m_tableSinceUpdate = 0;
         m_tableLastIr = now;
         m_tableLastUpdate = now;
     }
-    else if (m_tableUpdateDue || marker || sduSize != m_tableLastSize)
+    else if (sidRule && tsJump && !marker && m_tableUpdateLeft == 0)
     {
-        type = "UOR-2-EXT-3";
-        row = NrRohcSizeTableTag::UPDATE;
-        compressed = m_rohcTableUpdateSize;
+        // DTX with RohcTableSidUpdateSize: the first SID_UPDATE changes the timestamp pattern
+        // (a context update), the later ones carry their jump in a UOR-2-TS
+        const bool first = m_tableJumps == 1;
+        type = first ? "UOR-2-EXT-3 (first SID_UPDATE)" : "UOR-2-TS (SID_UPDATE)";
+        row = first ? NrRohcSizeTableTag::UPDATE : NrRohcSizeTableTag::SPURT_UOR2;
+        compressed = first ? m_rohcTableUpdateSize : m_rohcTableSidUpdateSize;
         firstOctet = 0xc0; // RFC 3095 5.7.4: 110 ...
-        st = m_tableUpdateDue ? 2 : 3;
-        m_tableUpdateDue = false;
+        st = 3;
         ++m_tableSinceIr;
         m_tableSinceUpdate = 0;
         m_tableLastUpdate = now;
+    }
+    else if (m_tableUpdateLeft > 0 || marker || sizeChange)
+    {
+        if (marker || sizeChange)
+        {
+            // A change of the header: the context update of it, repeated. The start of a talk
+            // spurt (the RTP marker) has a size of its own (RohcTableSpurtStartSize): its
+            // timestamp jump fits the base header, its stride stays (RFC 3095 5.7.4, UOR-2-TS)
+            m_tableUpdateSpurt = marker;
+            m_tableUpdateLeft = marker && m_rohcTableSpurtStartPackets > 0
+                                    ? m_rohcTableSpurtStartPackets
+                                    : m_rohcTableUpdatePackets;
+            m_tableUpdateFo = false;
+        }
+        --m_tableUpdateLeft;
+        // (a UOR-2 is two octets more than a UO-0: anything smaller is a UO-1-TS)
+        const bool spurtUor2 = m_rohcTableSpurtStartSize >= m_rohcTableUo0Size + 2;
+        if (m_tableUpdateSpurt)
+        {
+            type = spurtUor2 ? "UOR-2 (talk spurt)" : "UO-1-TS (talk spurt)";
+            row = spurtUor2 ? NrRohcSizeTableTag::SPURT_UOR2 : NrRohcSizeTableTag::SPURT_UO1;
+            compressed = m_rohcTableSpurtStartSize;
+            firstOctet = spurtUor2 ? 0xc0 : 0xa0; // RFC 3095 5.7.4: 110 ...; 5.7.3: 10 ...
+        }
+        else
+        {
+            type = "UOR-2-EXT-3";
+            row = NrRohcSizeTableTag::UPDATE;
+            compressed = m_rohcTableUpdateSize;
+            firstOctet = 0xc0; // RFC 3095 5.7.4: 110 ...
+        }
+        st = m_tableUpdateFo ? 2 : 3;
+        ++m_tableSinceIr;
+        if (!m_tableUpdateSpurt || spurtUor2)
+        {
+            m_tableSinceUpdate = 0;
+            m_tableLastUpdate = now;
+        }
+        else
+        {
+            ++m_tableSinceUpdate;
+        }
     }
     else
     {
@@ -1979,6 +2190,7 @@ NrPdcp::CompressWithTable(Ptr<Packet> p)
     CopyTags(p, out);
     NrRohcSizeTableTag tag;
     tag.m_type = row;
+    tag.m_mode = m_tableOMode ? 2 : 1;
     tag.m_number = m_tableNumber++;
     tag.m_compressedSize = compressed;
     tag.m_header.assign(sdu.begin(), sdu.begin() + chain);
@@ -2052,7 +2264,8 @@ NrPdcp::DecompressWithTable(Ptr<Packet> p)
             m_tableRxDynamic = false;
             failure = "needs IR";
         }
-        else if (tag.m_type == NrRohcSizeTableTag::UPDATE)
+        else if (tag.m_type == NrRohcSizeTableTag::UPDATE ||
+                 tag.m_type == NrRohcSizeTableTag::SPURT_UOR2)
         {
             m_tableRxDynamic = true;
         }
@@ -2078,14 +2291,30 @@ NrPdcp::DecompressWithTable(Ptr<Packet> p)
                         tag.m_number > m_tableRxNumber ? tag.m_number - m_tableRxNumber - 1 : 0);
         ++m_tableRxFailed;
         ++m_tableRxSinceFeedback;
+        // RohcFallbackFailures: this many packets in a row that failed, and the feedback has not
+        // repaired the context. The decompressor asks for U-mode, where the compressor repairs
+        // by its own refreshes. Its feedback says so, at once, and until a packet of the
+        // compressor says that U-mode has begun.
+        bool askNow = false;
+        if (m_rohcMode == ROHC_OPTIMISTIC && m_rohcFallbackFailures > 0 && !m_tableRxUMode &&
+            !m_tableRxAskedU && m_tableRxFailed >= m_rohcFallbackFailures)
+        {
+            m_tableRxAskedU = true;
+            askNow = true;
+            r.fallbackAskedAt = Simulator::Now().GetSeconds();
+            r.fallbackAskedAfter = m_tableRxFailed;
+        }
         // O-mode: ask the compressor for what the context needs now, a NACK (1) for a context
         // update or a STATIC-NACK (2) for an IR packet: after RohcNackFailures packets in a
         // row that failed, and the same kind again every RohcFeedbackSpacing packets
         const uint8_t ackType = m_tableRxStatic ? 1 : 2;
-        if (m_rohcMode == ROHC_OPTIMISTIC && m_tableRxFailed >= m_rohcNackFailures &&
-            (ackType != m_tableRxLastFeedback || m_tableRxSinceFeedback >= m_rohcFeedbackSpacing))
+        if (m_rohcMode == ROHC_OPTIMISTIC && !m_tableRxUMode &&
+            (askNow || (m_tableRxFailed >= m_rohcNackFailures &&
+                        (ackType != m_tableRxLastFeedback ||
+                         m_tableRxSinceFeedback >= m_rohcFeedbackSpacing))))
         {
-            const std::array<uint8_t, 5> feedback = RohcTableFeedback(ackType, m_tableRxNumber);
+            const std::array<uint8_t, 5> feedback =
+                RohcTableFeedback(ackType, m_tableRxNumber, m_tableRxAskedU ? 1 : 2);
             QueueRohcFeedback(feedback.data(), feedback.size());
             m_tableRxLastFeedback = ackType;
             m_tableRxSinceFeedback = 0;
@@ -2098,11 +2327,35 @@ NrPdcp::DecompressWithTable(Ptr<Packet> p)
     {
         m_tableRxNumber = tag.m_number;
     }
-    if (tag.m_type == NrRohcSizeTableTag::IR && m_rohcMode == ROHC_OPTIMISTIC)
+    bool askAgain = false;
+    if (m_rohcFallbackFailures > 0 && m_rohcMode == ROHC_OPTIMISTIC &&
+        (tag.m_type == NrRohcSizeTableTag::IR || tag.m_type == NrRohcSizeTableTag::UPDATE))
+    {
+        // Only an IR and a context update carry the mode of the compressor (RFC 3095 5.7; a
+        // UOR-2 without extension has no Mode field).
+        if (tag.m_mode == 1 && m_tableRxAskedU)
+        {
+            // the compressor is in U-mode, as asked: no more feedback
+            m_tableRxAskedU = false;
+            m_tableRxUMode = true;
+            r.fallbackDoneAt = Simulator::Now().GetSeconds();
+        }
+        else if (tag.m_mode == 2 && m_tableRxUMode)
+        {
+            // the compressor is in O-mode after all (it took an older request for O-mode as
+            // the last): ask again
+            m_tableRxUMode = false;
+            m_tableRxAskedU = true;
+            askAgain = true;
+        }
+    }
+    if ((tag.m_type == NrRohcSizeTableTag::IR || askAgain) && m_rohcMode == ROHC_OPTIMISTIC &&
+        !m_tableRxUMode)
     {
         // RFC 3095 5.4.2.2: an IR packet that was restored is answered with an ACK(O). It is
         // also what moves the compressor from U-mode to O-mode (5.6.2), if it arrives.
-        const std::array<uint8_t, 5> feedback = RohcTableFeedback(0, tag.m_number);
+        const std::array<uint8_t, 5> feedback =
+            RohcTableFeedback(0, tag.m_number, m_tableRxAskedU ? 1 : 2);
         QueueRohcFeedback(feedback.data(), feedback.size());
     }
 
@@ -2117,9 +2370,11 @@ NrPdcp::DecompressWithTable(Ptr<Packet> p)
     r.rxBytesOut += sdu.size();
     NoteRohcRestored(r,
                      Simulator::Now().GetSeconds(),
-                     tag.m_type == NrRohcSizeTableTag::IR       ? "IR"
-                     : tag.m_type == NrRohcSizeTableTag::UPDATE ? "UOR-2-EXT-3"
-                                                                : "UO-0");
+                     tag.m_type == NrRohcSizeTableTag::IR           ? "IR"
+                     : tag.m_type == NrRohcSizeTableTag::UPDATE     ? "UOR-2-EXT-3"
+                     : tag.m_type == NrRohcSizeTableTag::SPURT_UOR2 ? "UOR-2 (talk spurt)"
+                     : tag.m_type == NrRohcSizeTableTag::SPURT_UO1  ? "UO-1-TS (talk spurt)"
+                                                                    : "UO-0");
     return out;
 #else
     return p;
@@ -2174,8 +2429,16 @@ NrPdcp::~NrPdcp()
 //                           row carry new context information before the compressor takes it as
 //                           received. It is the number of IR packets at the start, of packets
 //                           after each change or refresh, and the width of the W-LSB window.
-//   RohcTableIrPackets      Only the start of a flow: an IR refresh (U-mode) and the answer to a
-//                           STATIC-NACK (O-mode) are one IR packet each.
+//   RohcTableIrPackets      The start of a flow and an IR refresh (U-mode): nobody tells the
+//                           compressor whether one has arrived, so it repeats the IR.
+//   RohcTableRepairIrPackets  The answer to a STATIC-NACK (O-mode): the decompressor asked, one IR
+//                           restores the context. If that one is lost the decompressor asks again
+//                           after RohcFeedbackSpacing failed packets; more IR packets in a row
+//                           make that less likely, and cost 56 bytes each instead of 3.
+//   RohcFallbackFailures    O-mode, Table: the packets in a row that the decompressor could not
+//                           restore before it gives up and asks for U-mode (RFC 3095 5.6, Mode
+//                           1), where the compressor repairs by its own refreshes, whatever
+//                           happens to the feedback. 0 = never. The library cannot do this.
 //   RohcIrRefresh           Library: back to the IR state (full headers) every this many packets.
 //                           Table: one IR goes out this many packets after the last IR. Without
 //                           feedback this is what repairs a lost static context.
@@ -2229,10 +2492,49 @@ NrPdcp::GetTypeId()
                                           UintegerValue(13),
                                           MakeUintegerAccessor(&NrPdcp::m_rohcTableUpdateSize),
                                           MakeUintegerChecker<uint32_t>(1, 255))
+                            // Table: the start of a talk spurt (RTP marker bit): the timestamp jumps over the silence, the
+                            // stride stays, so the 5 TS bits, M and 6 SN bits of UOR-2-TS carry it, 3 octets plus the UDP
+                            // checksum (RFC 3095 5.7.4). Under UO-0 + 2 bytes it is a UO-1-TS (5.7.3, 4 SN bits), which repairs
+                            // nothing beyond UO-0's window. The ROHC library relearns the stride here and sends 11 B
+                            // UOR-2-TS-EXT-3, 5 times (traced, 2 Nov 2026): RohcTableSpurtStartSize=11, ...Packets=5.
+                            .AddAttribute("RohcTableSpurtStartSize",
+                                          "Table: bytes of the compressed header of the first packet of a talk spurt (RTP marker); 5 = UOR-2-TS.",
+                                          UintegerValue(5),
+                                          MakeUintegerAccessor(&NrPdcp::m_rohcTableSpurtStartSize),
+                                          MakeUintegerChecker<uint32_t>(1, 255))
+                            .AddAttribute("RohcTableSizeChangeUpdate",
+                                          "Table: a change of the payload size (voice to SID and back) sends a context update (v9); false: UO-0",
+                                          BooleanValue(true),
+                                          MakeBooleanAccessor(&NrPdcp::m_rohcTableSizeChangeUpdate),
+                                          MakeBooleanChecker())
+                            .AddAttribute("RohcTableSidUpdateSize",
+                                          "Table: header bytes of a SID_UPDATE after the first (UOR-2-TS); the first is RohcTableUpdateSize; 0 = off (v9)",
+                                          UintegerValue(0),
+                                          MakeUintegerAccessor(&NrPdcp::m_rohcTableSidUpdateSize),
+                                          MakeUintegerChecker<uint32_t>(0, 255))
+                            .AddAttribute("RohcTableSpurtStartPackets",
+                                          "Table: packets in a row with RohcTableSpurtStartSize at a talk-spurt start; 0 = RohcTableUpdatePackets.",
+                                          UintegerValue(0),
+                                          MakeUintegerAccessor(&NrPdcp::m_rohcTableSpurtStartPackets),
+                                          MakeUintegerChecker<uint32_t>(0, 255))
+                            // Table: IR packets in a row at the start of a flow and at an IR refresh (RFC 3095 5.3.1.1.1,
+                            // optimistic approach); an ACK ends them
                             .AddAttribute("RohcTableIrPackets",
-                                          "Table: IR packets in a row at the start of a flow",
-                                          UintegerValue(1),
+                                          "Table model: IR packets in a row at the start of a flow and at an IR refresh (RFC 3095 5.3.1.1.1); an ACK ends them.",
+                                          UintegerValue(4),
                                           MakeUintegerAccessor(&NrPdcp::m_rohcTableIrPackets),
+                                          MakeUintegerChecker<uint32_t>(1, 255))
+                            .AddAttribute("RohcTableRepairIrPackets",
+                                          "Table: IR packets in a row that answer a STATIC-NACK",
+                                          UintegerValue(1),
+                                          MakeUintegerAccessor(&NrPdcp::m_rohcTableRepairIrPackets),
+                                          MakeUintegerChecker<uint32_t>(1, 255))
+                            // Table: context updates in a row for each change of the header (marker, size), each NACK and
+                            // each FO refresh (optimistic approach)
+                            .AddAttribute("RohcTableUpdatePackets",
+                                          "Table model: context updates in a row per header change (marker, size), per NACK and per FO refresh.",
+                                          UintegerValue(4),
+                                          MakeUintegerAccessor(&NrPdcp::m_rohcTableUpdatePackets),
                                           MakeUintegerChecker<uint32_t>(1, 255))
                             .AddAttribute("RohcTableDynamicWindow",
                                           "Table: packets missing in a row that UO-0 survives; "
@@ -2315,6 +2617,12 @@ NrPdcp::GetTypeId()
                                           UintegerValue(32),
                                           MakeUintegerAccessor(&NrPdcp::m_rohcFeedbackSpacing),
                                           MakeUintegerChecker<uint32_t>(1, 32))
+                            .AddAttribute("RohcFallbackFailures",
+                                          "Table, O-mode: packets in a row that failed before "
+                                          "the decompressor asks for U-mode; 0 = never",
+                                          UintegerValue(0),
+                                          MakeUintegerAccessor(&NrPdcp::m_rohcFallbackFailures),
+                                          MakeUintegerChecker<uint32_t>())
                             .AddAttribute("SilenceSduMaxBytes",
                                           "An SDU up to this size is a silence descriptor, a "
                                           "larger one a voice frame; 0 = not told apart",
@@ -2545,6 +2853,10 @@ NrPdcp::DoTransmitPdcpSdu(NrPdcpSapProvider::TransmitPdcpSduParameters params)
     p->AddByteTag(pdcpTag, 0, pdcpHeader.GetSerializedSize()); // on the header bytes, see NrRlcUm
 
     m_txPdu(m_rnti, m_lcid, p->GetSize());
+    if (m_lcid >= 3 && !IsUeSide(m_pdcpSapUser))
+    {
+        NoteSduPdu(m_cellId, m_rnti, m_lcid, true, p, SnSizeBits() > 7 ? 2 : 1);
+    }
 
     NrRlcSapProvider::TransmitPdcpPduParameters txParams;
     txParams.rnti = m_rnti;
@@ -2588,6 +2900,10 @@ NrPdcp::DoReceivePdu(Ptr<Packet> p)
     }
 #endif
 
+    if (m_lcid >= 3 && !IsUeSide(m_pdcpSapUser))
+    {
+        NoteSduPdu(m_cellId, m_rnti, m_lcid, false, p, SnSizeBits() > 7 ? 2 : 1);
+    }
     NrPdcpHeader pdcpHeader;
     pdcpHeader.SetSnSizeBits(SnSizeBits());
     p->RemoveHeader(pdcpHeader);

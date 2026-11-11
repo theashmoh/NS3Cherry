@@ -13,6 +13,8 @@
 
 #include "nr-control-messages.h"
 #include "nr-mac-header-vs.h"
+
+#include <cstdlib>
 #include "nr-mac-short-bsr-ce.h"
 #include "nr-pdcch.h"
 #include "nr-phy-sap.h"
@@ -231,6 +233,50 @@ NrUeMac::GetTypeId()
                           "to transmit the scheduling request on every occasion.",
                           TimeValue(MilliSeconds(10)),
                           MakeTimeAccessor(&NrUeMac::m_srProhibitTimer),
+                          MakeTimeChecker())
+            // The buffer status report the UE puts in every uplink transport block. False: the module's, 5
+            // bytes (the MAC subheader and the buffer levels of the 4 logical channel groups). True: the
+            // short BSR of TS 38.321 6.1.3.1, 2 bytes (the subheader and one octet with the LCG ID and the
+            // buffer level), for the logical channel group with the most data. On the small blocks of a
+            // power-limited uplink the 3 bytes matter: with the BSR of 5 bytes no block under 15 bytes
+            // carries data (10 bytes for a MAC subheader and an RLC entity, 5 for the BSR), with 2 bytes
+            // no block under 12. The setting is global: every UE.
+            .AddAttribute("CompactBsr",
+                          "true: the 2-byte short BSR of TS 38.321 6.1.3.1 in every uplink block instead of the module's 5-byte report (global).",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&NrUeMac::SetCompactBsr, &NrUeMac::GetCompactBsr),
+                          MakeBooleanChecker())
+            // False (the default): the UE puts a buffer status report in every transport block of a grant,
+            // new data or retransmission, and asks for a grant again whenever it is backlogged. True: as
+            // TS 38.321 5.4.5. A report goes in a new block of a dynamic grant only when one is triggered:
+            // data arrived in an empty buffer (regular BSR, which also triggers the scheduling request),
+            // retxBSR-Timer ran out with data in the buffer (regular BSR), or periodicBSR-Timer ran out
+            // (periodic BSR). A retransmission repeats the block with the report it had. A scheduling
+            // request is repeated while the regular BSR is pending, not because the buffer is backlogged.
+            // The blocks of a configured grant keep their report: the gNB reads them.
+            .AddAttribute("CgBsrWhenRoom",
+                          "A configured-grant block carries a BSR when the packet leaves 2 B for it or does not fit (TS 38.321 5.4.5); false: always (v9)",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&NrUeMac::m_cgBsrWhenRoom),
+                          MakeBooleanChecker())
+            .AddAttribute("BsrOnDemand",
+                          "true: BSRs only when triggered (TS 38.321 5.4.5: regular, retx-timer, periodic) and SRs only while a regular BSR is pending; false: a BSR in every block.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&NrUeMac::m_bsrOnDemand),
+                          MakeBooleanChecker())
+            .AddAttribute("PeriodicBsrTimer",
+                          "periodicBSR-Timer (TS 38.331 BSR-Config): restarted when a BSR is "
+                          "sent. Zero is infinity. Used with BsrOnDemand.",
+                          TimeValue(MilliSeconds(20)),
+                          MakeTimeAccessor(&NrUeMac::m_periodicBsrTimer),
+                          MakeTimeChecker())
+            // retxBSR-Timer (TS 38.331 BSR-Config): restarted when a BSR is sent and when a grant for new
+            // data arrives; when it runs out with data in the buffer a regular BSR is triggered. Zero is
+            // infinity. Used with BsrOnDemand.
+            .AddAttribute("RetxBsrTimer",
+                          "retxBSR-Timer (TS 38.331 BSR-Config): a regular BSR when it runs out with data in the buffer; 0 = infinity (with BsrOnDemand).",
+                          TimeValue(MilliSeconds(80)),
+                          MakeTimeAccessor(&NrUeMac::m_retxBsrTimer),
                           MakeTimeChecker())
             .AddAttribute("SrTransMax",
                           "Maximum number of transmissions of a pending scheduling request "
@@ -453,6 +499,7 @@ NrUeMac::DoTransmitBufferStatusReport(NrMacSapProvider::BufferStatusReportParame
 {
     NS_LOG_FUNCTION(this << static_cast<uint32_t>(params.lcid));
 
+    const bool bufferWasEmpty = GetTotalBufSize() == 0;
     auto it = m_ulBsrReceived.find(params.lcid);
 
     NS_LOG_INFO("Received BSR for LC Id" << static_cast<uint32_t>(params.lcid));
@@ -473,6 +520,23 @@ NrUeMac::DoTransmitBufferStatusReport(NrMacSapProvider::BufferStatusReportParame
     // the last received UL DCI (HARQ process 0, or rv 3), which deadlocks the uplink when the
     // bootstrap BSR TBs are lost: the gNB stops granting without a BSR, the stale m_ulDci
     // never satisfies the condition, and no SR is ever sent again.
+    if (m_bsrOnDemand)
+    {
+        // Regular BSR (TS 38.321 5.4.5): UL data became available while no logical channel had
+        // any. It triggers a scheduling request (5.4.4) if there is no UL-SCH resource for it.
+        // The request is repeated in DoSlotIndication() while the BSR is pending; it is not
+        // re-armed here whenever the buffer changes.
+        if (bufferWasEmpty && GetTotalBufSize() > 0)
+        {
+            m_regularBsrPending = true;
+            if (m_srState == INACTIVE)
+            {
+                m_srCounter = 0;
+                m_srState = TO_SEND;
+            }
+        }
+        return;
+    }
     if (m_srState == INACTIVE || (m_srState == ACTIVE && GetTotalBufSize() > 0))
     {
         if (m_srState == INACTIVE)
@@ -546,10 +610,17 @@ NrUeMac::SendBufferStatusReport(const SfnSf& dataSfn, uint8_t symStart)
         queue.at(lcg) +=
             ((*it).second.txQueueSize + (*it).second.retxQueueSize + (*it).second.statusPduSize);
 
+        // The reported size is the data plus what it takes to send it: the BSR itself and 3 bytes
+        // for each MAC subheader. This is the nr module's own, kept so that the grant that
+        // answers the report has room for the headers. TS 38.321 6.1.3.1 does not count them
+        // ("the size of the RLC headers and MAC subheaders are not considered"); a gNB adds its
+        // own allowance to what it reads. Checked against V19.4.0: a few bytes of difference
+        // per grant, now one level of Table 6.1.3.1-1 more, now less.
         if (queue.at(lcg) != 0)
         {
-            NS_LOG_DEBUG("Adding 5 bytes for SHORT_BSR for LCID:" << +lcid);
-            queue.at(lcg) += 5;
+            NS_LOG_DEBUG("Adding " << NrMacShortBsrCe::OverheadBytes()
+                                   << " bytes for SHORT_BSR for LCID:" << +lcid);
+            queue.at(lcg) += NrMacShortBsrCe::OverheadBytes();
         }
         if ((*it).second.txQueueSize > 0)
         {
@@ -595,6 +666,21 @@ NrUeMac::SendBufferStatusReport(const SfnSf& dataSfn, uint8_t symStart)
     header.m_bufferSizeLevel_2 = NrMacShortBsrCe::FromBytesToLevel(queue.at(2));
     header.m_bufferSizeLevel_3 = NrMacShortBsrCe::FromBytesToLevel(queue.at(3));
 
+    if (NrMacShortBsrCe::IsCompact())
+    {
+        // the short BSR of TS 38.321 6.1.3.1 reports one LCG: the one with the most data
+        // (the 2 bytes it takes were kept in the grant; a UE with data in several LCGs reports
+        // the largest, as a truncated BSR does)
+        uint8_t big = 0;
+        for (uint8_t i = 1; i < 4; ++i)
+        {
+            if (queue.at(i) > queue.at(big))
+            {
+                big = i;
+            }
+        }
+        header.SetCompactLcg(big);
+    }
     p->AddHeader(header);
 
     NrRadioBearerTag bearerTag(m_rnti, NrMacHeaderFsUl::SHORT_BSR, 0);
@@ -613,6 +699,15 @@ NrUeMac::SendBufferStatusReport(const SfnSf& dataSfn, uint8_t symStart)
     // against sr-TransMax: only requests that go unanswered do.
     m_srCounter = 0;
     m_lastSrSent = Time::Min();
+    // the report is out: no regular BSR is pending, periodicBSR-Timer and retxBSR-Timer start
+    // over (5.4.5), and the request for a grant that it answered is cancelled (5.4.4)
+    m_regularBsrPending = false;
+    m_lastBsrSent = Simulator::Now();
+    m_retxBsrStart = Simulator::Now();
+    if (m_bsrOnDemand)
+    {
+        m_srState = INACTIVE;
+    }
 
     m_macUeStateMachine(m_imsi,
                         m_currentSlot,
@@ -623,6 +718,46 @@ NrUeMac::SendBufferStatusReport(const SfnSf& dataSfn, uint8_t symStart)
                         m_ulBsrReceived,
                         m_ulDci->m_ndi,
                         "SendBufferStatusReport");
+}
+
+bool
+NrUeMac::BsrTriggered() const
+{
+    if (m_cgBsrWhenRoom && m_ulDci->m_sps != DciInfoElementTdma::DYNAMIC)
+    {
+        // A configured-grant block: the packet in it found the buffer empty, a Regular BSR
+        // (TS 38.321 5.4.5). It goes in when the block has room for it after the packet (and
+        // any confirmation), or when the packet does not fit (it cannot be cancelled then);
+        // it may be cancelled when the block holds the packet but not the report too.
+        const uint32_t grant = GrantBytes();
+        const uint32_t data = GetTotalBufSize();
+        const uint32_t need =
+            m_cgConfirmBytes + (data > 0 ? data + NrMacHeaderVs::SubheaderBytes(data) : 0);
+        const uint32_t bsr = NrMacShortBsrCe::OverheadBytes();
+        return need + bsr <= grant || need > grant;
+    }
+    if (!m_bsrOnDemand || m_ulDci->m_sps != DciInfoElementTdma::DYNAMIC)
+    {
+        return true;
+    }
+    if (m_regularBsrPending)
+    {
+        return true;
+    }
+    return m_periodicBsrTimer.IsStrictlyPositive() &&
+           (m_lastBsrSent == Time::Min() || Simulator::Now() - m_lastBsrSent >= m_periodicBsrTimer);
+}
+
+void
+NrUeMac::SetCompactBsr(bool compact)
+{
+    NrMacShortBsrCe::SetCompact(compact);
+}
+
+bool
+NrUeMac::GetCompactBsr() const
+{
+    return NrMacShortBsrCe::IsCompact();
 }
 
 void
@@ -682,6 +817,30 @@ NrUeMac::DoSlotIndication(const SfnSf& sfn)
         const auto due = *block;
         block = m_cgBlocks.erase(block);
         DoProcessUlGrant(due.first, due.second);
+    }
+
+    if (m_bsrOnDemand && m_rnti != 0)
+    {
+        // retxBSR-Timer ran out with data in the buffer: a regular BSR (TS 38.321 5.4.5)
+        if (m_retxBsrTimer.IsStrictlyPositive() && m_retxBsrStart != Time::Min() &&
+            GetTotalBufSize() > 0 && !m_regularBsrPending &&
+            Simulator::Now() - m_retxBsrStart >= m_retxBsrTimer)
+        {
+            m_regularBsrPending = true;
+            m_retxBsrStart = Simulator::Now();
+            if (m_srState == INACTIVE)
+            {
+                m_srCounter = 0;
+                m_srState = TO_SEND;
+            }
+        }
+        // the scheduling request is pending until a grant takes the BSR: again after
+        // sr-ProhibitTimer (5.4.4)
+        if (m_regularBsrPending && m_srState == ACTIVE && m_lastSrSent != Time::Min() &&
+            Simulator::Now() - m_lastSrSent >= m_srProhibitTimer)
+        {
+            m_srState = TO_SEND;
+        }
     }
 
     // A pending scheduling request is transmitted on the first occasion on which
@@ -878,10 +1037,22 @@ NrUeMac::ProcessUlDci(const Ptr<NrUlDciMessage>& dciMsg)
     // Configured grant Type 2 (TS 38.321 5.8.2): the UE confirms a DCI that activates or
     // releases a configuration with a MAC CE in its next new transport block
     const auto& grant = dciMsg->GetDciInfoElement();
+    if (grant->m_sps == DciInfoElementTdma::DYNAMIC && grant->m_cgConfirmAhead &&
+        grant->m_cgSerial > m_cgLastActivationSerial)
+    {
+        // The DCIs that activate (and release) a configuration came before this grant's PUSCH:
+        // it carries their confirmation, the configuration's first block does not. (If the
+        // activation came first, it triggered the confirmation itself.)
+        m_cgConfirmBytes = grant->m_cgConfirmBytes;
+        m_cgAheadSerial = grant->m_cgSerial;
+    }
     if (grant->m_sps == DciInfoElementTdma::SPS_RELEASE)
     {
         m_macRxedCtrlMsgsTrace(m_imsi, m_currentSlot, GetCellId(), m_rnti, GetBwpId(), dciMsg);
-        m_cgConfirmBytes = grant->m_cgConfirmBytes;
+        if (grant->m_cgSerial + 1 != m_cgAheadSerial || m_cgAheadSerial == 0)
+        {
+            m_cgConfirmBytes = grant->m_cgConfirmBytes;
+        }
         if (m_cgActiveConfig == grant->m_spsConfig)
         {
             // (the release of one configuration may come in the slot that activates another)
@@ -891,7 +1062,11 @@ NrUeMac::ProcessUlDci(const Ptr<NrUlDciMessage>& dciMsg)
     }
     if (grant->m_sps == DciInfoElementTdma::SPS_ACTIVATION)
     {
-        m_cgConfirmBytes = grant->m_cgConfirmBytes;
+        if (grant->m_cgSerial != m_cgAheadSerial || m_cgAheadSerial == 0)
+        {
+            m_cgConfirmBytes = grant->m_cgConfirmBytes;
+        }
+        m_cgLastActivationSerial = std::max(m_cgLastActivationSerial, grant->m_cgSerial);
         m_cgActive = true;
         m_cgActiveConfig = grant->m_spsConfig;
     }
@@ -901,7 +1076,13 @@ NrUeMac::ProcessUlDci(const Ptr<NrUlDciMessage>& dciMsg)
     SfnSf dataSfn = m_phySapProvider->GetDlArrivalSlot(m_currentSlot);
     dataSfn.Add(dciMsg->GetKDelay());
 
-    if (grant->m_sps != DciInfoElementTdma::DYNAMIC &&
+    // (a further transmission of such a block, too: it repeats what the block will carry)
+    const bool cgRepetition = grant->m_sps == DciInfoElementTdma::PUSCH_REPETITION &&
+                              grant->m_repFirst &&
+                              grant->m_repFirst->m_sps != DciInfoElementTdma::DYNAMIC;
+    if (((grant->m_sps != DciInfoElementTdma::DYNAMIC &&
+          grant->m_sps != DciInfoElementTdma::PUSCH_REPETITION) ||
+         cgRepetition) &&
         dataSfn.Normalize() > m_currentSlot.Normalize() + 1)
     {
         // A block of a configured grant: filled when its slot comes (DoSlotIndication())
@@ -925,6 +1106,13 @@ NrUeMac::DoProcessUlGrant(const Ptr<NrUlDciMessage>& dciMsg, const SfnSf& dataSf
         NS_LOG_LOGIC("UE " << m_rnti << " grant kind " << +grant->m_sps << ": nothing to send");
         return;
     }
+    if (grant->m_sps == DciInfoElementTdma::PUSCH_REPETITION && grant->m_repFirst &&
+        grant->m_repFirst->m_cgSkipped)
+    {
+        // A further transmission of a block of a configured grant the UE left unused: nothing
+        grant->m_cgSkipped = true;
+        return;
+    }
     const uint32_t bufferBefore = GetTotalBufSize();
 
     // Saving the data we need in DoTransmitPdu
@@ -938,7 +1126,22 @@ NrUeMac::DoProcessUlGrant(const Ptr<NrUlDciMessage>& dciMsg, const SfnSf& dataSf
                 << dataSfn << " Harq Process " << +m_ulDci->m_harqProcess << " TBS "
                 << m_ulDci->m_tbSize << " total queue " << GetTotalBufSize());
 
-    if (m_ulDci->m_ndi == 0)
+    if (m_ulDci->m_sps == DciInfoElementTdma::PUSCH_REPETITION)
+    {
+        // PUSCH repetition: the transport block of the grant again, exactly as it was, with the
+        // buffer status report it had (also when that was all it carried: unlike a HARQ
+        // retransmission, a repetition comes before the gNB has decoded anything of the block)
+        TransmitRetx();
+        const auto sentBsr = m_harqBsr.find(m_ulDci->m_harqProcess);
+        if (sentBsr != m_harqBsr.end())
+        {
+            m_phySapProvider->SendMacPdu(sentBsr->second->Copy(),
+                                         dataSfn,
+                                         m_ulDci->m_symStart,
+                                         m_ulDci->m_rnti);
+        }
+    }
+    else if (m_ulDci->m_ndi == 0)
     {
         // This method will retransmit the data saved in the harq buffer
         TransmitRetx();
@@ -957,7 +1160,7 @@ NrUeMac::DoProcessUlGrant(const Ptr<NrUlDciMessage>& dciMsg, const SfnSf& dataSf
         // The gNB reads the reports to see what a block of the configuration left behind, and
         // a report of this instant would count the packet the next block is about to carry.
         const auto sentBsr = m_harqBsr.find(m_ulDci->m_harqProcess);
-        if (!m_cgActive)
+        if (!m_cgActive && !m_bsrOnDemand)
         {
             SendBufferStatusReport(dataSfn, m_ulDci->m_symStart);
         }
@@ -971,6 +1174,12 @@ NrUeMac::DoProcessUlGrant(const Ptr<NrUlDciMessage>& dciMsg, const SfnSf& dataSf
     }
     else if (m_ulDci->m_ndi == 1)
     {
+        // A grant for new data restarts retxBSR-Timer (TS 38.321 5.4.5)
+        if (m_bsrOnDemand)
+        {
+            m_retxBsrStart = Simulator::Now();
+        }
+        m_bsrInTb = BsrTriggered();
         SendNewData();
         m_macUeStateMachine(m_imsi,
                             m_currentSlot,
@@ -986,7 +1195,15 @@ NrUeMac::DoProcessUlGrant(const Ptr<NrUlDciMessage>& dciMsg, const SfnSf& dataSf
 
         // Send a new BSR. SendNewData() already took into account the size of
         // the BSR.
-        SendBufferStatusReport(dataSfn, m_ulDci->m_symStart);
+        if (m_bsrInTb)
+        {
+            SendBufferStatusReport(dataSfn, m_ulDci->m_symStart);
+        }
+        else
+        {
+            // this block has no report: a retransmission of it has none either
+            m_harqBsr.erase(m_ulDci->m_harqProcess);
+        }
 
         NS_LOG_INFO("UL DCI processing done, sent to PHY a total of "
                     << m_ulDciTotalUsed << " B out of " << m_ulDci->m_tbSize
@@ -995,9 +1212,25 @@ NrUeMac::DoProcessUlGrant(const Ptr<NrUlDciMessage>& dciMsg, const SfnSf& dataSf
                            << GrantBytes() << " B for slot " << dataSfn.Normalize()
                            << ": buffer " << bufferBefore << " -> " << GetTotalBufSize()
                            << " B, sent " << m_ulDciTotalUsed << " B");
+        static const bool ulTrace = std::getenv("NTN_ULTRACE") != nullptr;
+        if (ulTrace)
+        {
+            std::cerr << "ULTRACE " << Simulator::Now().GetMicroSeconds() << " rnti " << m_rnti
+                      << " kind " << +m_ulDci->m_sps << " grant " << GrantBytes() << " tb "
+                      << m_ulDci->m_tbSize << " buf " << bufferBefore << "->" << GetTotalBufSize()
+                      << " used " << m_ulDciTotalUsed << " bsr " << m_bsrInTb << " ahead "
+                      << m_ulDci->m_cgConfirmAhead << " ce " << +m_ulDci->m_cgConfirmBytes
+                      << std::endl;
+        }
 
         if (GetTotalBufSize() == 0)
         {
+            if (!m_bsrInTb)
+            {
+                // the block took everything without a report: the regular BSR is cancelled
+                // (TS 38.321 5.4.5)
+                m_regularBsrPending = false;
+            }
             m_srState = INACTIVE;
             // The buffer was drained by a transport block that also carried the buffer status,
             // so the pending scheduling requests are cancelled and their sr-ProhibitTimer is
@@ -1263,13 +1496,22 @@ NrUeMac::SendNewData()
     // out. For the rest that we have left, we can use only a part of it because of
     // the overhead of the SHORT_BSR, which is 5 bytes.
     const uint32_t grantBytes = GrantBytes();
-    NS_ASSERT_MSG(m_ulDciTotalUsed + 5 <= grantBytes,
+    uint32_t bsrBytes = m_bsrInTb ? NrMacShortBsrCe::OverheadBytes() : 0;
+    if (m_cgBsrWhenRoom && m_cgConfirmBytes > 0 && bsrBytes > 0 &&
+        m_ulDciTotalUsed + bsrBytes + m_cgConfirmBytes > grantBytes &&
+        m_ulDciTotalUsed + m_cgConfirmBytes <= grantBytes)
+    {
+        // the confirmation comes before the report (TS 38.321 5.4.3.1.3)
+        m_bsrInTb = false;
+        bsrBytes = 0;
+    }
+    NS_ASSERT_MSG(m_ulDciTotalUsed + bsrBytes <= grantBytes,
                   "The StatusPDU used " << m_ulDciTotalUsed
                                         << " B, we don't have any for the SHORT_BSR.");
     // The MAC CE that confirms the activation or the release of a configured grant comes
     // before the data (TS 38.321 5.4.3.1.3): its bytes are not there for the logical channels
     uint32_t confirmBytes = 0;
-    if (m_cgConfirmBytes > 0 && m_ulDciTotalUsed + 5 + m_cgConfirmBytes <= grantBytes)
+    if (m_cgConfirmBytes > 0 && m_ulDciTotalUsed + bsrBytes + m_cgConfirmBytes <= grantBytes)
     {
         confirmBytes = m_cgConfirmBytes;
         m_cgConfirmBytes = 0;
@@ -1280,7 +1522,7 @@ NrUeMac::SendNewData()
         }
     }
     // reserve some data for the SHORT_BSR
-    uint32_t usefulTbs = grantBytes - m_ulDciTotalUsed - 5 - confirmBytes;
+    uint32_t usefulTbs = grantBytes - m_ulDciTotalUsed - bsrBytes - confirmBytes;
 
     // Now, we have 3 bytes of overhead for each subPDU. Let's try to serve all
     // the queues with some RETX data.
@@ -1304,7 +1546,7 @@ NrUeMac::SendNewData()
         }
         else
         {
-            usefulTbs -= activeLcsRetx * 3;
+            usefulTbs -= activeLcsRetx * NrMacHeaderVs::SubheaderBytes(usefulTbs);
             SendRetxData(usefulTbs, activeLcsRetx);
         }
     }
@@ -1313,9 +1555,9 @@ NrUeMac::SendNewData()
     // Remember that m_ulDciTotalUsed keep count of data and overhead that we
     // used till now.
     NS_ASSERT_MSG(
-        m_ulDciTotalUsed + 5 + confirmBytes <= grantBytes,
+        m_ulDciTotalUsed + bsrBytes + confirmBytes <= grantBytes,
         "The StatusPDU and RETX sending required all space, we don't have any for the SHORT_BSR.");
-    usefulTbs = grantBytes - m_ulDciTotalUsed - 5 - confirmBytes; // Update the usefulTbs.
+    usefulTbs = grantBytes - m_ulDciTotalUsed - bsrBytes - confirmBytes; // Update the usefulTbs.
 
     // The last part is for the queues with some non-RETX data. If there is no space left,
     // then nothing.
@@ -1332,7 +1574,7 @@ NrUeMac::SendNewData()
         }
         else
         {
-            usefulTbs -= activeLcsTx * 3;
+            usefulTbs -= activeLcsTx * NrMacHeaderVs::SubheaderBytes(usefulTbs);
             SendTxData(usefulTbs, activeLcsTx);
         }
     }
@@ -1659,9 +1901,14 @@ NrUeMac::DoReset()
     m_lastSrSent = Time::Min();
     m_srCounter = 0;
     m_cgConfirmBytes = 0;
+    m_cgAheadSerial = 0;
+    m_cgLastActivationSerial = 0;
     m_cgActive = false;
     m_cgBlocks.clear();
     m_harqBsr.clear();
+    m_regularBsrPending = false;
+    m_lastBsrSent = Time::Min();
+    m_retxBsrStart = Time::Min();
 }
 
 //////////////////////////////////////////////

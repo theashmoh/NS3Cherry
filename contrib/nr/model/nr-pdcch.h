@@ -39,15 +39,42 @@ namespace ns3
  *  - the CCEs of candidate m of level L: L x ((Y + floor(m N_CCE / (L M))) mod floor(N_CCE / L))
  *    and the L - 1 that follow, Y = 0 in a common search space and a pseudo-random number of the
  *    C-RNTI and the slot in a UE-specific one (TS 38.213 10.1)
- *  - common search space (SIB1, random access response): levels 4, 8, 16 with 4, 2, 1 candidates
- *    (TS 38.213 Table 10.1-1)
+ *  - common search space (SIB1, other system information, paging, random access response, group
+ *    power control): levels 4, 8, 16 with 4, 2, 1 candidates (TS 38.213 Table 10.1-1); the level
+ *    is one for each message (Sib1Al, OtherSiAl, PagingAl, RarAl, TpcAl; CommonAl if 0)
+ *  - the size of the DCIs of those messages and of the RRC ones: format 1_0 (28 bits and the
+ *    frequency domain resource assignment), to which formats 0_0 and 2_2 are padded; the
+ *    reserved bits of the system information, paging and random access DCIs make them as large
+ *    as the one for a UE (TS 38.212 7.3.1.0, 7.3.1.2.1, 7.3.1.3.3), GetDciBits(Purpose)
+ *  - the DCIs the cell sends besides those of the schedulers (each in the first slots it fits):
+ *    SIB1 every Sib1PeriodMs; an SI message, other system information, every period of
+ *    SiPeriodsMs (TS 38.331 5.2.2; SIB19 of an NTN cell is one of them); paging in the paging
+ *    occasion of a frame when it has a UE to page, which PagingRate pages a second make
+ *    happen at random (TS 38.304 7.1: a paging message for all the UEs of the occasion);
+ *    DCI 2_2 every TpcPeriodMs, one for TpcUesPerDci UEs that have an SPS or configured grant
+ *    configuration (their power control commands; dynamic DCIs carry their own, TS 38.213 7.1
+ *    and 7.2); and the DCIs of the RRC messages of a UE: RrcSetupDcis when it connects
+ *    (RRCSetup, security, capabilities, reconfiguration, with their answers), RrcCallDcis when a
+ *    call starts (the reconfiguration of its QoS flow, CallStarts()), a measurement report every
+ *    MeasReportPeriodMs, one message every RrcStepMs (the round trip of the answer)
  *
  * What is simplified:
  *  - one CORESET and one UE-specific search space set, monitored in every slot; DCI formats
- *    0_0/1_0 and 0_1/1_1 are not told apart: every DCI has DciBits bits
+ *    0_0/1_0 and 0_1/1_1 are not told apart: every DCI of data has DciBits bits
+ *  - the DCIs of system information, paging and RRC messages take CCEs only: the PDSCH or PUSCH
+ *    of their messages takes no resource blocks from the schedulers
  *  - the block error rate of a PDCCH comes from one table (BlerTable: aggregation level 1, DCI of
  *    TableDciBits bits) moved by 10 log10(L) dB for level L and by the ratio of the coded payloads
  *    for another DCI size
+ *  - PDCCH power boost (BoostMaxDb > 0): the resource elements of the CCEs the slot does not use
+ *    (the CORESET has N_CCE of them, the DCIs take the rest) lend their energy to the CCEs in use.
+ *    The network may set the power of a PDCCH as it likes: the UE assumes the same energy per
+ *    resource element for the DM-RS and the data of a PDCCH (TS 38.213 does not signal any
+ *    offset), so a boost needs no signalling and the channel estimate gains with it. In the
+ *    symbols of the CORESET the total power is fixed, so the boost of every DCI of the slot is
+ *    10 log10(N_CCE / used CCEs), at most BoostMaxDb (the PFD limit of the downlink bounds it
+ *    in the script). It lowers the block error rate of the DCI only; the aggregation level is
+ *    chosen without it (SinrMarginDb below 0 claims part of it in advance)
  *  - Symbols = 0 (dynamic): NR has no indicator of the size of the control region (the CORESET
  *    is configured by RRC); the model takes, slot by slot, the smallest of 1, 2, 3 symbols that
  *    holds all DCIs and starts the PDSCH right after it (the PDSCH start symbol is in the DCI:
@@ -82,7 +109,12 @@ class NR_EXPORT NrPdcch : public Object
     enum Purpose : uint8_t
     {
         SIB1 = 0,          //!< system information, common search space
+        OTHER_SI,          //!< an SI message (other system information), common search space
+        PAGING,            //!< a paging message, common search space
         RAR,               //!< random access response, common search space
+        TPC_GROUP,         //!< DCI 2_2: power control commands of a group of UEs, common
+        RRC_DL,            //!< downlink assignment of an RRC message
+        RRC_UL,            //!< uplink grant of an RRC message
         DL_NEW,            //!< downlink assignment, new data
         DL_RETX,           //!< downlink assignment, HARQ retransmission
         DL_SPS_ACTIVATION, //!< activation of a downlink SPS configuration
@@ -158,6 +190,13 @@ class NR_EXPORT NrPdcch : public Object
         uint64_t unusedReservations{0}; //!< candidates reserved for a UE that got no DCI
         uint64_t ulCapped{0};     //!< of the blocked uplink grants: a candidate was free, but
                                   //!< UlMaxShare held them back
+        double boostSumDb{0.0};   //!< sum of the PDCCH power boost (dB) of the DCIs sent, see BoostMaxDb
+        uint64_t boosted{0};      //!< DCIs sent with a boost above 0.05 dB
+        std::array<uint64_t, N_PURPOSES> repeated{}; //!< of the DCIs sent, those sent twice
+                                                     //!< (Repetitions), by purpose
+        std::array<uint64_t, 5> repeatedByAl{};      //!< ... by aggregation level
+        uint64_t repetitionDropped{0}; //!< DCIs that wanted a copy and found no second candidate
+        uint64_t repetitionByPower{0}; //!< Repetitions 0: copies dropped, the boost made one enough
         std::array<uint64_t, N_EVENTS> events{}; //!< see Event
     };
 
@@ -166,6 +205,7 @@ class NR_EXPORT NrPdcch : public Object
     {
         uint32_t id{0}; //!< handle, 0 = none
         uint8_t al{0};  //!< aggregation level, 0 = no candidate was free
+        uint32_t copy{0}; //!< the second, linked candidate of the same DCI, 0 = none (Repetitions)
         explicit operator bool() const
         {
             return al != 0;
@@ -191,9 +231,24 @@ class NR_EXPORT NrPdcch : public Object
      */
     uint8_t GetMaxSymbols() const;
     /**
-     * @return the size of a DCI in bits, without the CRC
+     * @return the size of a DCI of new data, retransmissions and semi-persistent scheduling in
+     * bits, without the CRC (the attribute DciBits)
      */
     uint32_t GetDciBits() const;
+    /**
+     * @brief The size of a DCI, without the CRC
+     *
+     * The DCIs of the cell's own messages follow TS 38.212 7.3.1 unless CellDciBits is set:
+     * DCI format 1_0 has 28 bits and the frequency domain resource assignment of
+     * ceil(log2(N (N + 1) / 2)) bits, with N the RBs of CORESET 0 (SI-RNTI, P-RNTI, RA-RNTI,
+     * TC-RNTI: 15, 6 and 16 reserved bits make them the same size, 7.3.1.2.1) or of the
+     * carrier (C-RNTI). Format 0_0 (29 bits on 25 RB) and format 2_2 (2 bits for each UE, 3 with
+     * a closed loop indicator) are padded with zeros to the size of format 1_0 (7.3.1.0,
+     * 7.3.1.3.3).
+     * @param purpose what the DCI is for
+     * @return the size in bits
+     */
+    uint32_t GetDciBits(Purpose purpose) const;
     /**
      * @brief Tell the PDCCH the carrier it is on. The scheduler of the downlink carrier does so.
      * @param dlRbs resource blocks of the downlink bandwidth part
@@ -228,9 +283,15 @@ class NR_EXPORT NrPdcch : public Object
      */
     static uint32_t GetMaxMonitoredCandidates(uint8_t numerology);
     /**
-     * @return the aggregation level of the DCIs of the common search space
+     * @return the aggregation level of the DCIs of the common search space (CommonAl)
      */
     uint8_t GetCommonAl() const;
+    /**
+     * @param purpose a DCI of the common search space: SIB1, OTHER_SI, PAGING, RAR or TPC_GROUP
+     * @return its aggregation level: the attribute of the message, or CommonAl if that is 0; the
+     * highest of 4, 8, 16 up to it that the CORESET holds
+     */
+    uint8_t GetCommonAl(Purpose purpose) const;
 
     // --- the link ------------------------------------------------------------------------
 
@@ -240,25 +301,33 @@ class NR_EXPORT NrPdcch : public Object
      * @param sinrDb SINR of the control symbols at the UE
      * @param boostDb power of the PDCCH above the reference signal (the hypothetical PDCCH of
      * the radio link monitoring has 4 dB, TS 38.133 Table 8.1.2.1-1)
+     * @param dciBits size of the DCI without its CRC, 0 = DciBits
+     * @param copies copies of the PDCCH the UE combines (Repetitions): 2 adds RepetitionGainDb
      * @return the probability that the UE does not decode the DCI
      */
-    double GetBler(uint8_t al, double sinrDb, double boostDb = 0.0) const;
+    double GetBler(uint8_t al,
+                   double sinrDb,
+                   double boostDb = 0.0,
+                   uint32_t dciBits = 0,
+                   uint8_t copies = 1) const;
     /**
      * @brief The lowest SINR at which a level meets a block error rate
      * @param al aggregation level
      * @param bler the block error rate
+     * @param dciBits size of the DCI without its CRC, 0 = DciBits
      * @return the SINR in dB (SinrMarginDb not included)
      */
-    double GetSinrForBler(uint8_t al, double bler) const;
+    double GetSinrForBler(uint8_t al, double bler, uint32_t dciBits = 0) const;
     /**
      * @brief The aggregation level for a UE: the lowest that meets TargetBler at the reported
      * SINR less SinrMarginDb, of those the search space has candidates for and the CORESET
      * can hold; the highest of them if none does
      * @param sinrDb the SINR the UE reported, NaN if it has not reported any
      * @param meetsTarget if not null: whether the level meets the target
+     * @param dciBits size of the DCI without its CRC, 0 = DciBits
      * @return the aggregation level, 0 if the CORESET holds none
      */
-    uint8_t ChooseAl(double sinrDb, bool* meetsTarget = nullptr) const;
+    uint8_t ChooseAl(double sinrDb, bool* meetsTarget = nullptr, uint32_t dciBits = 0) const;
 
     /**
      * @brief Note the SINR a UE reported
@@ -276,6 +345,25 @@ class NR_EXPORT NrPdcch : public Object
      * @param rnti the UE
      */
     void RemoveUe(uint16_t rnti);
+    /**
+     * @brief A UE has connected: the DCIs of its RRC messages are to come (RrcSetupDcis), and
+     * its measurement reports. Once per RNTI: the schedulers of both carriers call it.
+     * @param rnti the UE
+     */
+    void AddUe(uint16_t rnti);
+    /**
+     * @brief A call of a UE starts: the DCIs of the RRC messages that set its QoS flow up
+     * (RrcCallDcis)
+     * @param rnti the UE
+     */
+    void CallStarts(uint16_t rnti);
+    /**
+     * @brief The UEs with an SPS (downlink) or configured grant (uplink) configuration, whose
+     * power control commands come in DCI 2_2. Each scheduler tells its own.
+     * @param isDl downlink SPS or uplink configured grants
+     * @param n the UEs
+     */
+    void SetConfiguredUes(bool isDl, uint32_t n);
 
     // --- the PDCCH of the slot being scheduled -------------------------------------------
     //
@@ -369,16 +457,35 @@ class NR_EXPORT NrPdcch : public Object
         bool raised{false};
         bool noReport{false};
         uint8_t charged{0}; //!< CCEs taken from the credit of the uplink
+        uint32_t copyOf{0}; //!< the second candidate of the DCI of entry copyOf (Repetitions)
+        uint32_t copy{0};   //!< the id of this DCI's second candidate, 0 = none
         std::shared_ptr<DciInfoElementTdma> dci;
     };
+    /// Whether a DCI of this purpose may be sent twice (RepetitionFor)
+    bool MayRepeat(Purpose purpose) const;
 
     void SetBlerTable(const std::string& table);
     std::string GetBlerTable() const;
     void SetCandidates(const std::string& candidates);
     std::string GetCandidatesString() const;
+    void SetSiPeriods(const std::string& periods);
+    std::string GetSiPeriods() const;
+    void SetRrcSetupDcis(const std::string& dcis);
+    std::string GetRrcSetupDcis() const;
+    void SetRrcCallDcis(const std::string& dcis);
+    std::string GetRrcCallDcis() const;
+    /// queue the DCIs of RRC messages of a UE: dl downlink and ul uplink, alternating
+    void QueueRrc(uint16_t rnti, uint32_t dl, uint32_t ul);
+    /// the DCIs the cell sends of its own in this slot (system information, paging, DCI 2_2,
+    /// RRC messages), after those due earlier that found no room
+    void PlaceCellDcis();
+    /// a number in [0, 1) that depends on the slot only (paging): the same in every run
+    double SlotRandom(uint64_t salt) const;
     void NewSlotIfNeeded();
     void FinishSlot();
     void DoFixSymbols();
+    /// the power boost of the DCIs of the slot in the making (BoostMaxDb), from the CCEs it uses
+    double ApplyBoost();
     bool IsUplink(Purpose purpose) const;
     bool IsCommon(Purpose purpose) const;
     /// first CCE of candidate m at level L in a CORESET of d symbols, -1 if there is none
@@ -401,13 +508,47 @@ class NR_EXPORT NrPdcch : public Object
     double m_sinrMarginDb{0.0};
     double m_sinrOffsetDb{0.0};
     uint8_t m_commonAlAttr{8};
+    uint8_t m_sib1AlAttr{0};
+    uint8_t m_otherSiAlAttr{0};
+    uint8_t m_pagingAlAttr{0};
+    uint8_t m_rarAlAttr{0};
+    uint8_t m_tpcAlAttr{0};
+    uint32_t m_cellDciBits{0};
     uint8_t m_initialAl{0};
     bool m_raiseAl{true};
+    uint8_t m_repetitions{1};       //!< Repetitions: 1, 2, 0 = when a single one misses the target
+    double m_repetitionGainDb{3.0103}; //!< RepetitionGainDb
+    std::string m_repetitionFor{"all"}; //!< RepetitionFor: all, sps
     uint32_t m_sib1PeriodMs{20};
     double m_ulMaxShare{0.5};
+    double m_boostMaxDb{0.0};
+    std::vector<uint32_t> m_siPeriodsMs{160, 160, 320};
+    uint32_t m_pagingCycleMs{1280};
+    uint32_t m_pagingFrames{0};
+    double m_pagingRate{5.0};
+    uint32_t m_tpcPeriodMs{40};
+    uint32_t m_tpcUesPerDci{13};
+    std::array<uint32_t, 2> m_rrcSetupDcis{{4, 5}}; //!< downlink, uplink
+    std::array<uint32_t, 2> m_rrcCallDcis{{1, 1}};
+    uint32_t m_rrcStepMs{20};
+    uint32_t m_measReportPeriodMs{0};
+
+    // the DCIs the cell sends of its own: due in a slot, or waiting for room since then
+    struct CellDci
+    {
+        uint16_t rnti{0};
+        Purpose purpose{SIB1};
+        uint64_t due{0}; //!< absolute slot
+    };
+
+    std::vector<CellDci> m_cellDcis;
+    uint64_t m_lastCellDciSlot{UINT64_MAX};    //!< the slot whose cell DCIs have been made
+    std::map<uint16_t, uint64_t> m_connected;  //!< UEs and the slot they connected in
+    std::array<uint32_t, 2> m_configuredUes{}; //!< with SPS (downlink), configured grant (uplink)
 
     // the carrier
     uint32_t m_coresetRbs{0};
+    uint32_t m_carrierRbs{0};
     uint8_t m_numerology{0};
     bool m_hasCarrier{false};
 

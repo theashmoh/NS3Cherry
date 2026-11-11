@@ -202,6 +202,16 @@ class NR_EXPORT NrPdcp : public Object // SimpleRefCount<NrPdcp>
      * bearer. Called by NrRlcUm.
      */
     static void NotePduDiscarded();
+    /**
+     * The RLC of a UE dropped an SDU that had waited too long in its transmit buffer
+     * (`NrRlcUm::UeTxStaleMs`). It is counted as discarded on the uplink bearer of that cell,
+     * RNTI and LCID, as if the RLC had refused it. (Two cells may give the same RNTI: with
+     * several gNBs a count by RNTI alone went to the bearer of the first cell.)
+     * @param cellId the cell the UE is in
+     * @param rnti the RNTI of the UE
+     * @param lcid the logical channel
+     */
+    static void NoteUeStaleDiscard(uint16_t cellId, uint16_t rnti, uint8_t lcid);
 
     /**
      * For the RLC: the PDCP PDU it hands up next came in this many RLC PDUs (1 if it was not
@@ -241,6 +251,9 @@ class NR_EXPORT NrPdcp : public Object // SimpleRefCount<NrPdcp>
         uint64_t toVoice{0};       //!< and voice frames that followed a silence descriptor
         uint64_t toSilencePdus{0}; //!< uplink: the RLC PDUs the packets of toSilence came in
         uint64_t toVoicePdus{0};   //!< uplink: the RLC PDUs the packets of toVoice came in
+        uint32_t lastPduBytes{0};  //!< the PDCP PDU of the last packet (header + compressed SDU)
+        bool lastIr{false};        //!< the last packet was a ROHC IR packet
+        uint64_t run{0};           //!< packets in a row of the kind of the last one
     };
 
     /**
@@ -389,20 +402,33 @@ class NR_EXPORT NrPdcp : public Object // SimpleRefCount<NrPdcp>
     RohcModel m_rohcModel{ROHC_MODEL_LIBRARY};        ///< the `RohcModel` attribute
     uint32_t m_rohcTableUo0Size{3};                   ///< the `RohcTableUo0Size` attribute
     uint32_t m_rohcTableUpdateSize{13};               ///< the `RohcTableUpdateSize` attribute
-    uint32_t m_rohcTableIrPackets{1};                 ///< the `RohcTableIrPackets` attribute
+    uint32_t m_rohcTableIrPackets{4};                 ///< the `RohcTableIrPackets` attribute
+    uint32_t m_rohcTableRepairIrPackets{1};           ///< the `RohcTableRepairIrPackets` attribute
+    uint32_t m_rohcTableUpdatePackets{4};             ///< the `RohcTableUpdatePackets` attribute
+    uint32_t m_rohcTableSpurtStartSize{5};            ///< the `RohcTableSpurtStartSize` attribute
+    uint32_t m_rohcTableSpurtStartPackets{0};         ///< the `RohcTableSpurtStartPackets` attribute
     uint32_t m_rohcTableDynamicWindow{13};            ///< the `RohcTableDynamicWindow` attribute
     uint32_t m_rohcTableStaticWindow{61};             ///< the `RohcTableStaticWindow` attribute
     // Size table, compressor
     std::string m_tableFlow;        ///< the flow that has a context
     uint32_t m_tableLastSize{0};    ///< bytes of its last packet
+    bool m_rohcTableSizeChangeUpdate{true}; ///< the `RohcTableSizeChangeUpdate` attribute
+    uint32_t m_rohcTableSidUpdateSize{0};   ///< the `RohcTableSidUpdateSize` attribute
+    uint32_t m_tableLastTs{0};              ///< RTP timestamp of its last packet
+    bool m_tableTsValid{false};             ///< m_tableLastTs is set
+    uint32_t m_tableTsStride{0};            ///< smallest timestamp step seen (one frame)
+    uint32_t m_tableJumps{0};               ///< timestamp jumps since the last talk-spurt start
     uint32_t m_tableNumber{1};      ///< the number of its next packet
     uint32_t m_tableIrLeft{0};      ///< IR packets still to send
-    bool m_tableUpdateDue{false};   ///< a NACK or a periodic refresh asked for a context update
+    uint32_t m_tableUpdateLeft{0};  ///< context updates still to send
+    bool m_tableUpdateFo{false};    ///< those were asked for by a NACK or a periodic refresh
+    bool m_tableUpdateSpurt{false}; ///< those are for the start of a talk spurt (RTP marker)
     bool m_tableOMode{false};       ///< feedback asked for O-mode: no periodic refreshes
     uint32_t m_tableSinceIr{0};     ///< packets since the last IR
     uint32_t m_tableSinceUpdate{0}; ///< packets since the last IR or context update
     Time m_tableLastIr{0};          ///< when the last IR left
     Time m_tableLastUpdate{0};      ///< when the last IR or context update left
+    int64_t m_tableUModeSentNs{-1}; ///< when the newest request for U-mode was sent (ns), -1: none
     // Size table, decompressor
     bool m_tableRxStatic{false};  ///< the static context is valid
     bool m_tableRxDynamic{false}; ///< the dynamic context is valid
@@ -410,6 +436,8 @@ class NR_EXPORT NrPdcp : public Object // SimpleRefCount<NrPdcp>
     uint32_t m_tableRxFailed{0};  ///< packets in a row that could not be restored
     uint8_t m_tableRxLastFeedback{0};    ///< the feedback sent last: 0 none, 1 NACK, 2 STATIC-NACK
     uint32_t m_tableRxSinceFeedback{0};  ///< failed packets since it was sent
+    bool m_tableRxAskedU{false}; ///< it asked the compressor for U-mode; no packet said yet it is
+    bool m_tableRxUMode{false};  ///< the compressor is in U-mode, so no feedback is sent
     bool m_enableRohc{false};                         ///< the `EnableRohc` attribute
     RohcMode m_rohcMode{ROHC_UNIDIRECTIONAL};         ///< the `RohcMode` attribute
     uint32_t m_rohcMaxCid{15};                        ///< the `RohcMaxCid` attribute
@@ -422,6 +450,7 @@ class NR_EXPORT NrPdcp : public Object // SimpleRefCount<NrPdcp>
     bool m_rohcCrcRepair{false};                      ///< the `RohcCrcRepair` attribute
     uint32_t m_rohcNackFailures{10};                  ///< the `RohcNackFailures` attribute
     uint32_t m_rohcFeedbackSpacing{32};               ///< the `RohcFeedbackSpacing` attribute
+    uint32_t m_rohcFallbackFailures{0};               ///< the `RohcFallbackFailures` attribute
     uint32_t m_silenceSduMaxBytes{0};                 ///< the `SilenceSduMaxBytes` attribute
     struct rohc_comp* m_rohcCompressor{nullptr};      ///< for the SDUs this entity sends
     struct rohc_decomp* m_rohcDecompressor{nullptr};  ///< for the PDUs this entity receives

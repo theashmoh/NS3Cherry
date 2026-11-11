@@ -58,6 +58,9 @@ namespace ns3
 class NR_EXPORT NrMacHeaderVs : public Header
 {
   public:
+    /// \return the bytes of the subheader of a MAC SDU of this size (2, or 3 with the 16-bit L)
+    static uint32_t SubheaderBytes(uint32_t sduSize);
+
     /**
      * @brief GetTypeId
      * @return the type id of the object

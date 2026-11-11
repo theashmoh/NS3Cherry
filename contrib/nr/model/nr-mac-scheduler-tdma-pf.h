@@ -184,6 +184,7 @@ class NR_EXPORT NrMacSchedulerTdmaPF : public NrMacSchedulerTdmaRR
     double m_timeWindow{
         99.0}; //!< Time window to calculate the throughput. Better to make it an attribute.
     double m_alpha{0.0}; //!< PF Fairness index
+    bool m_repAware{false}; //!< count the K slots of a PUSCH repetition (RepetitionAware)
 };
 
 } // namespace ns3

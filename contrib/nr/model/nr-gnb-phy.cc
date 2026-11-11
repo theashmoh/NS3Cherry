@@ -8,11 +8,10 @@
         std::clog << " [ CellId " << GetCellId() << ", bwpId " << GetBwpId() << "] ";              \
     } while (false);
 
-#include "nr-gnb-phy.h"
-
 #include "beam-manager.h"
 #include "nr-ch-access-manager.h"
 #include "nr-gnb-net-device.h"
+#include "nr-gnb-phy.h"
 #include "nr-net-device.h"
 #include "nr-ue-net-device.h"
 #include "nr-ue-phy.h"
@@ -30,10 +29,11 @@
 
 #include <algorithm>
 #include <cmath>
-#include <tuple>
 #include <functional>
+#include <limits>
 #include <random>
 #include <string>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 
@@ -58,10 +58,45 @@ NrGnbPhy::~NrGnbPhy()
 {
 }
 
+std::map<uint16_t, const NrGnbPhy*> NrGnbPhy::s_byCell;
+
+const NrGnbPhy*
+NrGnbPhy::FindByCell(uint16_t cellId)
+{
+    const auto it = s_byCell.find(cellId);
+    return it == s_byCell.end() ? nullptr : it->second;
+}
+
+double
+NrGnbPhy::GetDataBoostDb(uint16_t rnti, uint32_t rbs) const
+{
+    if (GetPowerAllocationType() != NrSpectrumValueHelper::UNIFORM_POWER_ALLOCATION_USED ||
+        rbs == 0)
+    {
+        return 0.0;
+    }
+    double db = std::min(m_maxRbBoostDb,
+                         10.0 * std::log10(static_cast<double>(GetRbNum()) / static_cast<double>(rbs)));
+    const double ueCap = GetUeMaxRbBoostDb(rnti);
+    if (!std::isnan(ueCap))
+    {
+        db = std::min(db, ueCap);
+    }
+    return std::max(0.0, db);
+}
+
 void
 NrGnbPhy::DoDispose()
 {
     NS_LOG_FUNCTION(this);
+    if (m_registered)
+    {
+        const auto it = s_byCell.find(GetCellId());
+        if (it != s_byCell.end() && it->second == this)
+        {
+            s_byCell.erase(it);
+        }
+    }
     delete m_gnbCphySapProvider;
     delete m_nrFhPhySapUser;
     m_nrFhPhySapUser = nullptr;
@@ -114,15 +149,16 @@ NrGnbPhy::GetTypeId()
                                 "UniformPowerAllocBw",
                                 NrSpectrumValueHelper::UNIFORM_POWER_ALLOCATION_USED,
                                 "UniformPowerAllocUsed"))
+            // With UniformPowerAllocUsed: the most power an RB in use may get, in dB above TxPower divided
+            // by the RBs of the band (the power each RB has with UniformPowerAllocBw). The power of the
+            // idle RBs of a symbol goes to its RBs in use up to this. 0 = as UniformPowerAllocBw; 100 (the
+            // default) = no cap: TxPower is split among the RBs in use. Below 0: less than that share, a
+            // limit on the power of an RB.
             .AddAttribute("MaxRbBoostDb",
-                          "With UniformPowerAllocUsed: the most power an RB in use may get, in dB "
-                          "above TxPower divided by the RBs of the band (the power each RB has "
-                          "with UniformPowerAllocBw). The power of the idle RBs of a symbol goes "
-                          "to its RBs in use up to this. 0 = as UniformPowerAllocBw; 100 (the "
-                          "default) = no cap: TxPower is split among the RBs in use.",
+                          "With UniformPowerAllocUsed: the most an RB in use may get above TxPower / RBs of the band, dB (100 = no cap, < 0 = a limit).",
                           DoubleValue(100.0),
                           MakeDoubleAccessor(&NrGnbPhy::m_maxRbBoostDb),
-                          MakeDoubleChecker<double>(0.0, 100.0))
+                          MakeDoubleChecker<double>(-100.0, 100.0))
             .AddAttribute("SpectrumPhy",
                           "The downlink NrSpectrumPhy associated to this NrPhy",
                           TypeId::ATTR_GET,
@@ -221,6 +257,16 @@ NrGnbPhy::GetTypeId()
                 "Resource Block used for data: SfnSf, symbol, RB PHY map, bwp ID, cell ID",
                 MakeTraceSourceAccessor(&NrGnbPhy::m_rbStatistics),
                 "ns3::NrGnbPhy::RBStatsTracedCallback")
+            .AddTraceSource("DlDataPower",
+                            "Power of the RBs of a downlink data allocation: RNTI, RBs, dBm per RB",
+                            MakeTraceSourceAccessor(&NrGnbPhy::m_dlDataPowerTrace),
+                            "ns3::NrGnbPhy::DlDataPowerTracedCallback")
+            .AddTraceSource("DlDataPowerFree",
+                            "What the power of the RBs of a downlink data allocation would be "
+                            "without the cap of the UE (SetUeMaxRbBoostDb): RNTI, RBs, dBm per RB. "
+                            "Fired next to DlDataPower while some UE has a cap",
+                            MakeTraceSourceAccessor(&NrGnbPhy::m_dlDataPowerFreeTrace),
+                            "ns3::NrGnbPhy::DlDataPowerFreeTracedCallback")
             .AddAttribute("TestDropRachPreambles",
                           "Attribute is meant to emulate control channel loss of RACH preambles",
                           BooleanValue(false),
@@ -741,24 +787,43 @@ NrGnbPhy::GetTxPower() const
     return m_txPower;
 }
 
-void
-NrGnbPhy::SetSubChannels(const std::vector<int>& rbIndexVector, size_t nTotalAllocRbs)
+double
+NrGnbPhy::SetSubChannels(const std::vector<int>& rbIndexVector,
+                         size_t nTotalAllocRbs,
+                         uint16_t rnti)
 {
     Ptr<SpectrumValue> txPsd = GetTxPowerSpectralDensity(rbIndexVector);
     NS_ASSERT(txPsd);
+
+    // The factor between the power the RBs get and the power they would get without the cap of
+    // the UE (1: the UE has none, or its cap is not the limit)
+    double freeOverCapped = 1.0;
 
     // In case of UNIFORM_POWER_ALLOCATION_USED, the txPsd created by GetTxPowerSpectralDensity
     // assumed that the transmit power would be split only among RBs allocated to this signal/UE.
     // This assumption is false when there are concurrent transmissions on other RBs to other UEs
     // (OFDMA DL). To correct this, use the combined number of used RBs to scale down txPsd.
     // Each RB in use then has TxPower / nTotalAllocRbs, which MaxRbBoostDb caps at that many dB
-    // above TxPower / (RBs of the band).
+    // above TxPower / (RBs of the band). A cap of the UE (SetUeMaxRbBoostDb) is a second one.
     if (GetPowerAllocationType() == NrSpectrumValueHelper::UNIFORM_POWER_ALLOCATION_USED)
     {
         auto scaling = double(rbIndexVector.size()) / double(nTotalAllocRbs);
         const double cap =
             std::pow(10.0, m_maxRbBoostDb / 10.0) * double(nTotalAllocRbs) / double(GetRbNum());
         scaling *= std::min(1.0, cap);
+        if (rnti != 0 && !m_ueMaxRbBoostDb.empty())
+        {
+            const auto ueCap = m_ueMaxRbBoostDb.find(rnti);
+            if (ueCap != m_ueMaxRbBoostDb.end())
+            {
+                const double freeScaling = scaling;
+                const double capUe = std::pow(10.0, ueCap->second / 10.0) *
+                                     double(nTotalAllocRbs) / double(GetRbNum());
+                scaling = double(rbIndexVector.size()) / double(nTotalAllocRbs) *
+                          std::min(1.0, std::min(cap, capUe));
+                freeOverCapped = freeScaling / scaling;
+            }
+        }
         for (auto it = txPsd->ValuesBegin(); it != txPsd->ValuesEnd(); it++)
         {
             *it *= scaling;
@@ -770,6 +835,37 @@ NrGnbPhy::SetSubChannels(const std::vector<int>& rbIndexVector, size_t nTotalAll
     }
 
     m_spectrumPhy->SetTxPowerSpectralDensity(txPsd);
+
+    // the power of an RB in use: its density over its width
+    m_lastRbPowerFreeDbm = std::numeric_limits<double>::quiet_NaN();
+    if (rbIndexVector.empty())
+    {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const auto rb = static_cast<size_t>(rbIndexVector.front());
+    const auto band = txPsd->GetSpectrumModel()->Begin() + rb;
+    const double rbPowerDbm = 10.0 * std::log10(1000.0 * (*txPsd)[rb] * (band->fh - band->fl));
+    m_lastRbPowerFreeDbm = rbPowerDbm + 10.0 * std::log10(freeOverCapped);
+    return rbPowerDbm;
+}
+
+void
+NrGnbPhy::SetUeMaxRbBoostDb(uint16_t rnti, double db)
+{
+    m_ueMaxRbBoostDb[rnti] = db;
+}
+
+void
+NrGnbPhy::RemoveUeMaxRbBoostDb(uint16_t rnti)
+{
+    m_ueMaxRbBoostDb.erase(rnti);
+}
+
+double
+NrGnbPhy::GetUeMaxRbBoostDb(uint16_t rnti) const
+{
+    const auto it = m_ueMaxRbBoostDb.find(rnti);
+    return it == m_ueMaxRbBoostDb.end() ? std::numeric_limits<double>::quiet_NaN() : it->second;
 }
 
 void
@@ -850,6 +946,11 @@ NrGnbPhy::StartSlot(const SfnSf& startSlot)
 
     m_currentSlot = startSlot;
     m_lastSlotStart = Simulator::Now();
+    if (!m_registered)
+    {
+        s_byCell[GetCellId()] = this;
+        m_registered = true;
+    }
 
     Simulator::Schedule(GetSlotPeriod(), &NrGnbPhy::EndSlot, this);
 
@@ -1701,10 +1802,11 @@ NrGnbPhy::UlData(const std::shared_ptr<DciInfoElementTdma>& dci)
 
     Time varTtiPeriod = GetSymbolPeriod() * dci->m_numSym;
 
-    if (dci->m_cgSkipped)
+    if (dci->m_cgSkipped || (dci->m_repFirst && dci->m_repFirst->m_cgSkipped))
     {
         // A block of a configured grant the UE leaves unused (it has nothing to send, or does
-        // not know of the block): nothing comes, and nothing is asked for again
+        // not know of the block), or a further transmission of one: nothing comes, and nothing
+        // is asked for again
         return varTtiPeriod;
     }
 
@@ -1722,6 +1824,10 @@ NrGnbPhy::UlData(const std::shared_ptr<DciInfoElementTdma>& dci)
                           m_currentSlot};
     // The UE did not decode this grant (NrUePhy::PdcchErrorModel): it sends nothing
     expectedTb.m_pdcchMissed = dci->m_pdcchMissed;
+    // PUSCH repetition: the block decodes after its last transmission
+    expectedTb.m_repLeft = dci->m_repetitions > dci->m_repIndex + 1
+                               ? static_cast<uint8_t>(dci->m_repetitions - dci->m_repIndex - 1)
+                               : 0;
     m_spectrumPhy->AddExpectedTb(expectedTb);
 
     bool found = false;
@@ -1955,7 +2061,15 @@ NrGnbPhy::SendDataChannels(const Ptr<PacketBurst>& pb,
     NS_ASSERT(m_rbgAllocationPerSym.find(dci->m_symStart) != m_rbgAllocationPerSym.end());
     auto nTotalAllocRbs =
         FromRBGBitmaskToRBAssignment(m_rbgAllocationPerSym.at(dci->m_symStart)).size();
-    SetSubChannels(FromRBGBitmaskToRBAssignment(dci->m_rbgBitmask), nTotalAllocRbs);
+    const auto dciRbs = FromRBGBitmaskToRBAssignment(dci->m_rbgBitmask);
+    const double rbPowerDbm = SetSubChannels(dciRbs, nTotalAllocRbs, dci->m_rnti);
+    m_dlDataPowerTrace(dci->m_rnti, static_cast<uint32_t>(dciRbs.size()), rbPowerDbm);
+    if (!m_ueMaxRbBoostDb.empty())
+    {
+        m_dlDataPowerFreeTrace(dci->m_rnti,
+                               static_cast<uint32_t>(dciRbs.size()),
+                               m_lastRbPowerFreeDbm);
+    }
 
     std::list<Ptr<NrControlMessage>> ctrlMsgs;
     m_spectrumPhy->StartTxDataFrames(pb, ctrlMsgs, dci, varTtiPeriod);

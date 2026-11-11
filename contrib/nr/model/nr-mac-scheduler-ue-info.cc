@@ -4,6 +4,8 @@
 
 #include "nr-mac-scheduler-ue-info.h"
 
+#include "nr-mac-short-bsr-ce.h"
+
 #include "ns3/log.h"
 
 #include <algorithm>
@@ -96,40 +98,178 @@ NrMacSchedulerUeInfo::GetDlMcs() const
     return static_cast<uint8_t>(std::clamp(corrected, 0, maxMcs));
 }
 
-std::pair<uint8_t, uint8_t>
+bool
+NrMacSchedulerUeInfo::IsPuschRepetitionValue(uint32_t k)
+{
+    return std::find(std::begin(kPuschRepetitionValues), std::end(kPuschRepetitionValues), k) !=
+           std::end(kPuschRepetitionValues);
+}
+
+uint8_t
+NrMacSchedulerUeInfo::PuschRepetitionsAtLeast(uint32_t k)
+{
+    for (const uint8_t value : kPuschRepetitionValues)
+    {
+        if (value >= k)
+        {
+            return value;
+        }
+    }
+    return kPuschRepetitionValues[11];
+}
+
+NrMacSchedulerUeInfo::UlLink
 NrMacSchedulerUeInfo::UlLinkFor(uint32_t rbs) const
 {
     const auto measured = static_cast<uint32_t>(m_ulSinrMeas.size());
-    if (!m_ulMcsPerRbs || measured == 0 || rbs == 0 || rbs == measured || !m_ulModel)
+    if (!m_ulMcsPerRbs || measured == 0 || rbs == 0 || !m_ulModel ||
+        (rbs == measured && m_puschRepetitions == 1))
     {
-        return {m_ulMcs, m_ulCqi.m_wbCqi};
+        // (a fixed number of repetitions makes the block more robust, at this MCS)
+        return {m_ulMcs, m_ulCqi.m_wbCqi, std::max<uint8_t>(m_puschRepetitions, 1)};
     }
     auto it = m_ulMcsByRbs.find(rbs);
     if (it == m_ulMcsByRbs.end())
     {
-        // The measured SINR of the RBs (in turn, for more RBs than were measured), times the
-        // share of the UE's power each RB gets now against then
-        SpectrumValue sinr(m_ulModel);
-        const double scale = static_cast<double>(measured) / rbs;
-        const auto bands = std::min<uint32_t>(rbs, m_ulModel->GetNumBands());
-        for (uint32_t i = 0; i < bands; ++i)
+        double mean = 0.0;
+        const SpectrumValue sinr = UlSinrFor(rbs, &mean);
+        // PUSCH repetition: the gNB combines the K transmissions of the block; K is the fewest
+        // that bring K times the mean SINR to the target, the MCS the error model decodes then
+        uint8_t reps = m_puschRepetitions;
+        if (reps > 1 && m_ulWideRbs > 0 && rbs > m_ulNarrowRbs)
         {
-            sinr[i] = m_ulSinrMeas.at(i % measured) * scale;
+            // a wide grant (UlWideGrantRbs): as many resource block slots as a narrow one, so
+            // the repetitions are divided by how many times wider it is
+            // (to a number TS 38.331 has: 9 / 2 = 4.5 is 7, not 5, the next above it)
+            reps = PuschRepetitionsAtLeast((reps * m_ulNarrowRbs + rbs - 1) / rbs);
+        }
+        if (reps == 0)
+        {
+            reps = 32;
+            for (const uint8_t k : kPuschRepetitionValues)
+            {
+                if (mean * k >= m_puschRepSinr)
+                {
+                    reps = k;
+                    break;
+                }
+            }
         }
         uint8_t mcs = 0;
-        const uint8_t cqi = m_ulAmc->CreateCqiFeedbackSiso(sinr, mcs);
-        it = m_ulMcsByRbs.emplace(rbs, std::make_pair(mcs, cqi)).first;
+        uint8_t cqi = m_ulAmc->CreateCqiFeedbackSiso(sinr, mcs, reps);
+        if (m_puschRepetitions == 0)
+        {
+            // ... or more, if the block of a slot at that MCS is under the 15 B a grant needs
+            // (12 with the compact BSR; NrMacSchedulerOfdma::CreateUlDci() makes none for less,
+            // and the UE sends no data in less): with fewer the UE would get no grant at all
+            const uint32_t nprb = rbs * NrAmc::NR_AMC_NUM_SYMBOLS_DEFAULT;
+            const uint32_t minBlock =
+                std::max<uint32_t>(m_puschMinBlock, NrMacShortBsrCe::MinUlGrantBytes());
+            for (const uint8_t k : kPuschRepetitionValues)
+            {
+                if (k <= reps || m_ulAmc->CalculateTbSize(mcs, 1, nprb) >= minBlock)
+                {
+                    continue;
+                }
+                reps = k;
+                cqi = m_ulAmc->CreateCqiFeedbackSiso(sinr, mcs, reps);
+            }
+        }
+        it = m_ulMcsByRbs.emplace(rbs, UlLink{mcs, cqi, reps}).first;
     }
     return it->second;
+}
+
+SpectrumValue
+NrMacSchedulerUeInfo::UlSinrFor(uint32_t rbs, double* mean) const
+{
+    // The measured SINR of the RBs (in turn, for more RBs than were measured), times the share
+    // of the UE's power each RB gets now against then
+    const auto measured = static_cast<uint32_t>(m_ulSinrMeas.size());
+    SpectrumValue sinr(m_ulModel);
+    const double scale = static_cast<double>(measured) / rbs;
+    const auto bands = std::min<uint32_t>(rbs, m_ulModel->GetNumBands());
+    *mean = 0.0;
+    for (uint32_t i = 0; i < bands; ++i)
+    {
+        sinr[i] = m_ulSinrMeas.at(i % measured) * scale;
+        *mean += sinr[i] / bands;
+    }
+    return sinr;
+}
+
+uint8_t
+NrMacSchedulerUeInfo::GetUlMcsForReps(uint32_t rbs, uint8_t reps, double scale) const
+{
+    if (!m_ulMcsPerRbs || m_ulSinrMeas.empty() || rbs == 0 || !m_ulModel)
+    {
+        return m_ulMcs;
+    }
+    if (scale != 1.0)
+    {
+        // with a margin: the MCS the error model decodes at that much less SINR (not cached)
+        double mean = 0.0;
+        SpectrumValue sinr = UlSinrFor(rbs, &mean);
+        sinr *= scale;
+        uint8_t mcs = 0;
+        m_ulAmc->CreateCqiFeedbackSiso(sinr, mcs, std::max<uint8_t>(reps, 1));
+        return mcs;
+    }
+    const uint32_t key = (rbs << 8) + reps;
+    auto it = m_ulMcsByRbsReps.find(key);
+    if (it == m_ulMcsByRbsReps.end())
+    {
+        double mean = 0.0;
+        const SpectrumValue sinr = UlSinrFor(rbs, &mean);
+        uint8_t mcs = 0;
+        m_ulAmc->CreateCqiFeedbackSiso(sinr, mcs, std::max<uint8_t>(reps, 1));
+        it = m_ulMcsByRbsReps.emplace(key, mcs).first;
+    }
+    return it->second;
+}
+
+double
+NrMacSchedulerUeInfo::GetUlMeanSinrFor(uint32_t rbs) const
+{
+    if (m_ulSinrMeas.empty() || rbs == 0 || !m_ulModel)
+    {
+        return 0.0;
+    }
+    double mean = 0.0;
+    UlSinrFor(rbs, &mean);
+    return mean;
+}
+
+uint8_t
+NrMacSchedulerUeInfo::GetUlRepetitionsFor(uint32_t rbs) const
+{
+    return UlLinkFor(rbs).reps;
 }
 
 uint8_t
 NrMacSchedulerUeInfo::GetUlMcsFor(uint32_t rbs) const
 {
-    int mcs = UlLinkFor(rbs).first;
+    const int planned = UlLinkFor(rbs).mcs;
+    int mcs = planned;
     if (m_ulOllaMax != 0.0)
     {
-        mcs = static_cast<int>(std::lround(mcs + m_ulOlla));
+        mcs = std::clamp(static_cast<int>(std::lround(mcs + m_ulOlla)),
+                         0,
+                         static_cast<int>(m_ulAmc->GetMaxMcs()));
+        if (mcs < planned && rbs > 0)
+        {
+            // The outer loop makes the block safer by a lower MCS, which also makes it smaller.
+            // Not smaller than the least block of the plan (the 15 B a UE sends data in, or
+            // PuschMinBlockBytes: a voice frame that does not fit one block takes two, and the
+            // uplink has twice the load, with repetitions that is K more slots per frame).
+            const uint32_t nprb = rbs * NrAmc::NR_AMC_NUM_SYMBOLS_DEFAULT;
+            const uint32_t minBlock =
+                std::max<uint32_t>(m_puschMinBlock, NrMacShortBsrCe::MinUlGrantBytes());
+            while (mcs < planned && m_ulAmc->CalculateTbSize(static_cast<uint8_t>(mcs), 1, nprb) < minBlock)
+            {
+                ++mcs;
+            }
+        }
     }
     return static_cast<uint8_t>(std::clamp(mcs, 0, static_cast<int>(m_ulAmc->GetMaxMcs())));
 }
@@ -148,7 +288,7 @@ NrMacSchedulerUeInfo::GetUlMaxRbs() const
         uint32_t most = 1;
         for (uint32_t rbs = 1; rbs <= bands; ++rbs)
         {
-            if (UlLinkFor(rbs).second == 0)
+            if (UlLinkFor(rbs).cqi == 0)
             {
                 break;
             }
@@ -157,6 +297,41 @@ NrMacSchedulerUeInfo::GetUlMaxRbs() const
         m_ulMaxRbs = most;
     }
     return m_ulMaxRbs;
+}
+
+bool
+NrMacSchedulerUeInfo::UlWideHalvesReps() const
+{
+    return m_ulWideRbs > m_ulNarrowRbs && m_puschRepetitions > 1;
+}
+
+bool
+NrMacSchedulerUeInfo::UlWideOk() const
+{
+    if (!(m_ulWideRbs > 0 && m_ulMcsPerRbs && !m_ulSinrMeas.empty() && m_ulModel &&
+          GetUlMeanSinrFor(1) >= m_ulWideSinr && GetUlMaxRbs() >= m_ulWideRbs))
+    {
+        return false;
+    }
+    if (m_puschRepetitions == 0)
+    {
+        // The repetitions follow the SINR of the grant the UE gets, and the wide grant has
+        // 10 log10(W) dB less of it per RB. If that puts the wide grant under the repetition
+        // target (UlWideSinrDb under PuschRepetitionSinrDb + 10 log10(W), or exactly at it:
+        // 5 dB on one RB is 1.99 dB on two, under a 2 dB target), the wide grant takes more
+        // slots than it saves. Give it only while its resource block slots, repetitions
+        // included, are no more than the narrow grant's; otherwise the narrow grant and its
+        // K carry the same bits for less. The decision is per grant, from the measurement
+        // scaled to one RB, so it does not feed back on itself.
+        const uint32_t narrow = std::max<uint32_t>(m_ulNarrowRbs, 1);
+        const uint32_t wideSlots = UlLinkFor(m_ulWideRbs).reps * m_ulWideRbs;
+        const uint32_t narrowSlots = UlLinkFor(narrow).reps * narrow;
+        if (wideSlots > narrowSlots)
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 uint32_t

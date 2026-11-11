@@ -8,6 +8,7 @@
 
 #include "ns3/nr-export.h"
 
+#include <string>
 #include <unordered_map>
 
 namespace ns3
@@ -31,6 +32,8 @@ namespace ns3
 class NR_EXPORT NrMacHarqVector : private std::unordered_map<uint8_t, HarqProcess>
 {
   public:
+    /// DIAG: keep the string of the last Erase() (the scheduler sets it from its DiagUlHarq)
+    static bool s_diagnostics;
     friend std::ostream& operator<<(std::ostream& os, const NrMacHarqVector& item);
     /**
      * @brief iterator of the map
@@ -67,7 +70,15 @@ class NR_EXPORT NrMacHarqVector : private std::unordered_map<uint8_t, HarqProces
      * @param id ID of the process to erase
      * @return true if the process was erased successfully
      */
-    bool Erase(uint8_t id);
+    bool Erase(uint8_t id, const char* site = "?");
+
+    /**
+     * @brief DIAG: who erased a process last, and when
+     */
+    std::string LastErase() const
+    {
+        return m_lastErase;
+    }
 
     /**
      * @brief Insert a process
@@ -194,6 +205,7 @@ class NR_EXPORT NrMacHarqVector : private std::unordered_map<uint8_t, HarqProces
   private:
     uint8_t m_maxSize{0};  //!< Maximum size (or the number of processes stored)
     uint8_t m_usedSize{0}; //!< Number of ACTIVE processes
+    std::string m_lastErase{"none"}; //!< DIAG: the last Erase() call
 };
 
 /**

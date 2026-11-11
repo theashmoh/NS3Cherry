@@ -110,6 +110,17 @@ class NR_EXPORT NrMacSchedulerOfdma : public NrMacSchedulerTdma
     uint32_t GetMaxUesPerSlot(uint32_t symAvail) const override;
 
     /**
+     * @brief Whether the UL loop may give a UE one more resource block group
+     * @param ue the UE, which has the groups assigned to it in this slot so far
+     * @return true. A scheduler whose metric knows that a UE's block stops growing with its
+     * grant (NrMacSchedulerOfdmaPF with UlMarginalRate) returns false for such a UE.
+     */
+    virtual bool UlGrantCanGrow([[maybe_unused]] const UePtrAndBufferReq& ue) const
+    {
+        return true;
+    }
+
+    /**
      * @brief HARQ retransmissions take resource block groups over the data symbols of the slot,
      * which new data shares (attribute HarqRetxInFrequency)
      */

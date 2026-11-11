@@ -45,6 +45,8 @@ struct NR_EXPORT NrEesmErrorModelOutput : public NrErrorModelOutput
     std::vector<int> m_map; //!< map of the active RBs
     uint32_t m_infoBits{0}; //!< number of info bits
     uint32_t m_codeBits{0}; //!< number of code bits
+    uint8_t m_rvCounter{255}; //!< transmission counter of the MAC (m_rv), 255 = not known
+    uint8_t m_rvId{0};        //!< redundancy version of the transmission (TS 38.214 5.1.2.1)
 };
 
 /**
@@ -79,6 +81,18 @@ struct NR_EXPORT NrEesmErrorModelOutput : public NrErrorModelOutput
 class NR_EXPORT NrEesmErrorModel : public NrErrorModel
 {
   public:
+    /// \return the target code rate R of the MCS (for TS 38.214 transport block sizes)
+    double McsCodeRate(uint8_t mcs) const
+    {
+        return GetMcsEcrTable()->at(mcs);
+    }
+
+    /// \return the modulation order Qm of the MCS
+    uint8_t McsQm(uint8_t mcs) const
+    {
+        return GetMcsMTable()->at(mcs);
+    }
+
     friend NrL2smEesmTestCase;
     /**
      * @brief GetTypeId
@@ -224,6 +238,42 @@ class NR_EXPORT NrEesmErrorModel : public NrErrorModel
                                const NrErrorModel::NrErrorModelHistory& sinrHistory) const = 0;
 
     /**
+     * @brief The effective SINR of the transmissions of a block combined as chase combining:
+     * the linear SINRs summed RB by RB over the history and this transmission, then EESM at
+     * the MCS (the same coded bits received again)
+     * @param sinr SINR of the new transmission
+     * @param map RB map of the new transmission
+     * @param mcs MCS of the transmission
+     * @param sinrHistory history of the previous transmissions of the block
+     * @return the effective SINR (linear)
+     */
+    double ChaseCombinedSinr(const SpectrumValue& sinr,
+                             const std::vector<int>& map,
+                             uint8_t mcs,
+                             const NrErrorModel::NrErrorModelHistory& sinrHistory) const;
+
+    /**
+     * @brief Whether a combined block's error rate may not exceed that of chase combining
+     * @return true to bound it by the chase-combining error rate (NrEesmIr: attribute
+     * ChaseFloor); false here
+     */
+    /**
+     * The redundancy version of the transmission being decoded: the MAC's transmission counter
+     * (SetNextRvCounter()) indicates rv_id = {0, 2, 3, 1}[counter mod 4] in the DCI, and the
+     * j-th repetition of that transmission (PDSCH aggregation, PUSCH repetition type A) takes
+     * the j-th next of that sequence (TS 38.214 Table 5.1.2.1-2 and Table 6.1.2.1-2). Without a
+     * counter: position n of the transmission in the history, rv_id = {0, 2, 3, 1}[n mod 4].
+     * Set by GetTbBitDecodificationStats() before ComputeSINR().
+     */
+    uint8_t m_currentRvId{0};
+    uint8_t m_currentRvCounter{255}; //!< the counter of the transmission being decoded
+
+    virtual bool ChaseFloor() const
+    {
+        return false;
+    }
+
+    /**
      * @brief Get the "Equivalent MCS" after retransmission combining
      * @param mcsTx MCS of the transmission
      * @return the equivalent MCS
@@ -259,6 +309,37 @@ class NR_EXPORT NrEesmErrorModel : public NrErrorModel
      */
     virtual const std::vector<double>* GetSpectralEfficiencyForCqi() const = 0;
 
+    /**
+     * @brief Type of base graph for LDPC coding
+     */
+    enum GraphType
+    {
+        FIRST = 0, //!< LDPC base graph 1
+        SECOND = 1 //!< LDPC base graph 2
+    };
+
+    /**
+     * @brief Get Base Graph type of LDPC coding (1 or 2) for the given TBS and MCS
+     * of a specific NR table, as per TS 38.212 Section 6.2.2 (UL) and 7.2.2 (DL)
+     *
+     * @param tbSize the size of the TB (in bits) (A, payload, in TS 38.212)
+     * @param mcs the MCS of the TB
+     * @return the GraphType used for the TB
+     */
+    GraphType GetBaseGraphType(uint32_t tbSize, uint8_t mcs) const;
+
+    /**
+     * @brief Code Block Segmentation for the given TBS and BG type, as per TS
+     * 38.212 Section 5.2.2 (LDPC coding)
+     *
+     * @param B the size of the TB including transport block CRC attachment
+     * (in bits) (B, in TS 38.212)
+     * @param the GraphType used for the TB
+     * @return std::pair (K,C) being K the number of bits in each code block, C
+     * the number of code blocks
+     */
+    std::pair<uint32_t, uint32_t> CodeBlockSegmentation(uint32_t B, GraphType bg_type) const;
+
   private:
     static std::vector<std::string> m_bgTypeName; //!< Base graph name
 
@@ -292,36 +373,6 @@ class NR_EXPORT NrEesmErrorModel : public NrErrorModel
                                                         uint8_t mcs,
                                                         const NrErrorModelHistory& sinrHistory);
 
-    /**
-     * @brief Type of base graph for LDPC coding
-     */
-    enum GraphType
-    {
-        FIRST = 0, //!< LDPC base graph 1
-        SECOND = 1 //!< LDPC base graph 2
-    };
-
-    /**
-     * @brief Get Base Graph type of LDPC coding (1 or 2) for the given TBS and MCS
-     * of a specific NR table, as per TS 38.212 Section 6.2.2 (UL) and 7.2.2 (DL)
-     *
-     * @param tbSize the size of the TB (in bits) (A, payload, in TS 38.212)
-     * @param mcs the MCS of the TB
-     * @return the GraphType used for the TB
-     */
-    GraphType GetBaseGraphType(uint32_t tbSize, uint8_t mcs) const;
-
-    /**
-     * @brief Code Block Segmentation for the given TBS and BG type, as per TS
-     * 38.212 Section 5.2.2 (LDPC coding)
-     *
-     * @param B the size of the TB including transport block CRC attachment
-     * (in bits) (B, in TS 38.212)
-     * @param the GraphType used for the TB
-     * @return std::pair (K,C) being K the number of bits in each code block, C
-     * the number of code blocks
-     */
-    std::pair<uint32_t, uint32_t> CodeBlockSegmentation(uint32_t B, GraphType bg_type) const;
 
     /**
      * @brief Get SinrDb Vector From Simulated Values

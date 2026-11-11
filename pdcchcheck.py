@@ -8,9 +8,21 @@ import sys
 TABLE = [(-4.0, 0.9303), (-2.0, 0.4356), (-1.0, 0.1453), (0.0, 0.0246), (0.5, 0.00797), (1.0, 0.00221)]
 LEVELS = [1, 2, 4, 8, 16]
 COMMON_CANDIDATES = {4: 4, 8: 2, 16: 1}  # TS 38.213 Table 10.1-1
-SIB1, RAR, DL_NEW, DL_RETX, DL_ACT, DL_REL, UL_NEW, UL_RETX, UL_ACT, UL_REL = range(10)
-UPLINK = {UL_NEW, UL_RETX, UL_ACT, UL_REL}
-COMMON = {SIB1, RAR}
+(SIB1, OTHER_SI, PAGING, RAR, TPC, RRC_DL, RRC_UL, DL_NEW, DL_RETX, DL_ACT, DL_REL, UL_NEW, UL_RETX,
+ UL_ACT, UL_REL) = range(15)
+N_PURPOSES = 15
+UPLINK = {UL_NEW, UL_RETX, UL_ACT, UL_REL, RRC_UL}
+COMMON = {SIB1, OTHER_SI, PAGING, RAR, TPC}
+MASK = (1 << 64) - 1
+
+
+def slot_random(slot, salt):
+    """splitmix64 of the slot and the salt, in [0, 1): the rule of NrPdcch::SlotRandom"""
+    z = (slot * 0x9e3779b97f4a7c15 + salt * 0xbf58476d1ce4e5b9 + 1) & MASK
+    z = ((z ^ (z >> 30)) * 0xbf58476d1ce4e5b9) & MASK
+    z = ((z ^ (z >> 27)) * 0x94d049bb133111eb) & MASK
+    z = z ^ (z >> 31)
+    return (z >> 11) / float(1 << 53)
 A_P = {0: 39827, 1: 39829, 2: 39839}  # TS 38.213 10.1
 D = 65537
 
@@ -49,8 +61,72 @@ class Model:
         self.prev_dl_demand = 0
         self.sinr = {}
         self.stats = dict(slots=0, by_symbols=[0, 0, 0, 0], avail=0, used=0, above=0, raised=0,
-                          noreport=0, unused=0, capped=0, dci=[0] * 10, cce=[0] * 10,
-                          blocked=[0] * 10, dci_al=[0] * 5, cce_al=[0] * 5)
+                          noreport=0, unused=0, capped=0, dci=[0] * N_PURPOSES,
+                          cce=[0] * N_PURPOSES, blocked=[0] * N_PURPOSES, dci_al=[0] * 5,
+                          cce_al=[0] * 5)
+        # the cell's own DCIs: waiting (rnti, purpose, due slot), UEs and when they connected
+        self.pending = []
+        self.connected = {}
+        self.configured = (0, 0)
+        self.cell = None
+
+    # --- the cell's own DCIs, from the rules in nr-pdcch.h
+    def queue_rrc(self, rnti, base, dl, ul):
+        step = self.cell['step']
+        due = base
+        for i in range(max(dl, ul)):
+            for purpose, n in ((RRC_DL, dl), (RRC_UL, ul)):
+                if i < n:
+                    due += step
+                    self.pending.append((rnti, purpose, due))
+
+    def add_ue(self, rnti, slot):
+        if rnti in self.connected:
+            return
+        self.connected[rnti] = slot
+        self.queue_rrc(rnti, slot, *self.cell['setup'])
+
+    def call_starts(self, rnti, slot):
+        if rnti in self.connected:
+            self.queue_rrc(rnti, slot, *self.cell['call'])
+
+    def cell_dcis(self, slot):
+        c = self.cell
+        frame, in_frame = divmod(slot, 10)
+        for k, period in enumerate(c['si']):  # SI message k: frame k + 1 of its period
+            pf = period // 10
+            s = (1 + 2 * k) % 10
+            if s == 5:
+                s = 6
+            if frame % pf == (k + 1) % pf and in_frame == s:
+                self.pending.append((0, OTHER_SI, slot))
+        if c['paging_rate'] > 0 and in_frame == 9:  # paging occasion: last slot of a paging frame
+            frames = c['cycle'] // 10
+            n = c['paging_frames'] or frames
+            if frame % (frames // n) == 0:
+                per_occasion = c['paging_rate'] * c['cycle'] / 1000.0 / n
+                if slot_random(slot, 1) < 1.0 - math.exp(-per_occasion):
+                    self.pending.append((0, PAGING, slot))
+        if c['tpc'] > 0 and slot % c['tpc'] == 0:  # DCI 2_2
+            per = c['tpc_ues']
+            n = (self.configured[0] + per - 1) // per + (self.configured[1] + per - 1) // per
+            self.pending += [(0, TPC, slot)] * n
+        if c['meas'] > 0:
+            for rnti in sorted(self.connected):
+                since = self.connected[rnti]
+                if slot > since and (slot - since) % c['meas'] == 0:
+                    self.pending.append((rnti, RRC_UL, slot))
+        keep = []
+        for rnti, purpose, due in self.pending:
+            if due > slot:
+                keep.append((rnti, purpose, due))
+                continue
+            e = self.request(rnti, purpose)
+            if e is None:
+                keep.append((rnti, purpose, due))
+            else:
+                e['committed'] = True
+        self.pending = keep
 
     # --- static rules
     def n_cce(self, symbols):
@@ -124,6 +200,7 @@ class Model:
             e = self.request(0, SIB1)
             if e is not None:
                 e['committed'] = True
+        self.cell_dcis(slot)
 
     def request(self, rnti, purpose):
         common = purpose in COMMON
@@ -222,6 +299,8 @@ def main(path):
     models, errors, checked = {}, [], 0
     asks = {}
     order = []
+    configured = {}
+    calls = {}
     for line in open(path):
         f = line.split()
         if not f:
@@ -247,6 +326,19 @@ def main(path):
                 errors.append(f'LEVEL {f[1]} {l}: {got} != {want}')
         elif f[0] == 'UE':
             models[f[1]].sinr[int(f[2])] = None if f[3] == 'nan' else float(f[3])
+        elif f[0] == 'CELL':
+            m = models[f[1]]
+            m.cell = dict(si=[] if f[2] == '-' else [int(x) for x in f[2].split(',')],
+                          cycle=int(f[3]), paging_frames=int(f[4]), paging_rate=float(f[5]),
+                          tpc=int(f[6]), tpc_ues=int(f[7]),
+                          setup=[int(x) for x in f[8].split(':')],
+                          call=[int(x) for x in f[9].split(':')], step=int(f[10]),
+                          meas=int(f[11]))
+            m.ues_to_add = True
+        elif f[0] == 'CONFIGURED':
+            configured[(f[1], int(f[2]))] = (int(f[3]), int(f[4]))
+        elif f[0] == 'CALL':
+            calls.setdefault((f[1], int(f[2])), []).append(int(f[3]))
         elif f[0] == 'SLOT':
             key = (f[1], int(f[2]))
             order.append((key, int(f[3])))
@@ -260,8 +352,15 @@ def main(path):
         if name in first_slot:
             m.finish()
         twice = name not in first_slot
+        if twice:
+            # the UEs connected before the first slot, when NrPdcch's slot was still 0
+            for rnti in sorted(m.sinr):
+                m.add_ue(rnti, 0)
         first_slot.setdefault(name, slot)
+        m.configured = configured.get((name, slot), (0, 0))
         m.start_slot(slot, twice)
+        for rnti in calls.get((name, slot), []):
+            m.call_starts(rnti, slot)
         made = []
         for rnti, purpose, al, released, cce, sym, dci_al in asks[(name, slot)]:
             e = m.request(rnti, purpose)
@@ -312,7 +411,7 @@ def run(path):
         st = m.stats
         want = [st['slots']] + st['by_symbols'] + [st['avail'], st['used'], st['above'], st['raised'],
                                                    st['noreport'], st['unused'], st['capped']]
-        for i in range(10):
+        for i in range(N_PURPOSES):
             want += [st['dci'][i], st['cce'][i], st['blocked'][i]]
         for i in range(5):
             want += [st['dci_al'][i], st['cce_al'][i]]

@@ -19,6 +19,7 @@
 #include "ns3/node.h"
 #include "ns3/trace-source-accessor.h"
 
+#include <algorithm>
 #include <numeric>
 
 namespace ns3
@@ -662,6 +663,16 @@ NrSpectrumPhy::StartRx(Ptr<SpectrumSignalParameters> params)
                 ntnDelay->GetOneWayDelayRate(txMobility, GetMobility()));
         }
     }
+    // A data signal that joins the gNB's data reception in progress within a small part of the
+    // cyclic prefix is taken over the window of that reception: the gNB samples its own symbol
+    // grid, and decodes simultaneous signals over one window. (An NTN UE whose timing advance has
+    // just grown starts its block a few ns late and shortens it to end on time, NrUePhy::UlData.)
+    if (m_isGnb && m_state == RX_DATA && !m_rxPacketBurstList.empty() &&
+        DynamicCast<NrSpectrumSignalParametersDataFrame>(params) &&
+        AlignedWithFirstRx(params->duration))
+    {
+        params->duration = m_firstRxDuration;
+    }
     Ptr<const SpectrumValue> rxPsd = params->psd;
     Time duration = params->duration;
     NS_LOG_INFO("Start receiving signal: " << params->psd << " duration= " << duration);
@@ -1243,6 +1254,16 @@ NrSpectrumPhy::AddSrsSnrReportCallback(SrsSnrReportCallback callback)
 
 // private
 
+bool
+NrSpectrumPhy::AlignedWithFirstRx(Time duration) const
+{
+    // A 40th of a symbol, about a third of the normal cyclic prefix (1.7 us at 15 kHz); an NTN
+    // timing advance grows by up to about 0.1 us per slot
+    const Time tolerance = m_phy->GetSymbolPeriod() / 40;
+    return Abs(Simulator::Now() - m_firstRxStart) <= tolerance &&
+           Abs(duration - m_firstRxDuration) <= tolerance;
+}
+
 void
 NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& params)
 {
@@ -1313,9 +1334,9 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
         // generally starts on a different symbol and spans a different number of symbols,
         // reaches this point while a reception is still open. Decline to decode it rather than
         // corrupting the interference window; its power is still accounted for, because
-        // AddSignalMimo() has already registered it as interference in StartRx().
-        if (!m_rxPacketBurstList.empty() &&
-            ((m_firstRxStart != Simulator::Now()) || (m_firstRxDuration != params->duration)))
+        // AddSignalMimo() has already registered it as interference in StartRx() (which has
+        // given a signal within a small part of the cyclic prefix of the first the same window).
+        if (!m_rxPacketBurstList.empty() && !AlignedWithFirstRx(params->duration))
         {
             NS_LOG_WARN("NrSpectrumPhy::StartRxData: discarding misaligned signal from cellId:"
                         << params->cellId << " rnti:" << params->rnti << " (firstRxStart:"
@@ -1329,7 +1350,8 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
 
         if (m_rxPacketBurstList.empty())
         {
-            NS_ASSERT(m_state == IDLE || m_state == CCA_BUSY);
+            NS_ABORT_MSG_UNLESS(m_state == IDLE || m_state == CCA_BUSY,
+                                "first data reception in state " << m_state);
             // first transmission, i.e., we're IDLE and we start RX
             m_firstRxStart = Simulator::Now();
             m_firstRxDuration = params->duration;
@@ -1340,13 +1362,13 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
         }
         else
         {
-            NS_ASSERT(m_state == RX_DATA);
+            NS_ABORT_MSG_UNLESS(m_state == RX_DATA, "a further data reception in state " << m_state);
             // sanity check: if there are multiple RX events, they
             // should occur at the same time and have the same
             // duration, otherwise the interference calculation
             // won't be correct
-            NS_ASSERT((m_firstRxStart == Simulator::Now()) &&
-                      (m_firstRxDuration == params->duration));
+            NS_ABORT_MSG_UNLESS(AlignedWithFirstRx(params->duration),
+                                "a data reception not aligned with the first one of the slot");
         }
 
         ChangeState(RX_DATA, params->duration);
@@ -1575,9 +1597,9 @@ NrSpectrumPhy::EndTx()
 
     // In case of OFDMA DL, this function will be called multiple times, after each transmission
     // to a different UE. In the first call to this function, m_state is changed to IDLE.
-    NS_ASSERT_MSG(m_state == TX, "In EndTx() but state is not TX; state: " << m_state);
+    NS_ABORT_MSG_UNLESS(m_state == TX, "In EndTx() but state is not TX; state: " << m_state);
     NS_LOG_DEBUG("Number of active transmissions (before decrement): " << m_activeTransmissions);
-    NS_ASSERT_MSG(m_activeTransmissions, "Ending Tx but no active transmissions");
+    NS_ABORT_MSG_UNLESS(m_activeTransmissions, "Ending Tx but no active transmissions");
     m_activeTransmissions--;
 
     // change to BUSY or IDLE mode when this is the end of the last transmission
@@ -1655,11 +1677,36 @@ NrSpectrumPhy::CheckTransportBlockCorruptionStatus()
         auto rnti = tbIt.first;
         auto& tbInfo = tbIt.second;
 
+        // A block on resource blocks the receiver no longer has: a UE whose RRC connection was
+        // released while the gNB still had a transmission (or HARQ retransmission) of a block
+        // for it on its way is back on its initial bandwidth of a few RBs. It cannot receive the
+        // block, and the SINR it has does not cover the block's RBs: not received, nothing to
+        // combine (as a missed DCI).
+        const auto& rbs = tbInfo.m_expected.m_rbBitmap;
+        const auto maxRb = rbs.empty() ? 0 : *std::max_element(rbs.begin(), rbs.end());
+        if (!rbs.empty() && (static_cast<std::size_t>(maxRb) >= m_sinrPerceived.GetValuesN() ||
+                             (m_rxSpectrumModel &&
+                              static_cast<std::size_t>(maxRb) >= m_rxSpectrumModel->GetNumBands())))
+        {
+            NS_LOG_INFO("RNTI " << rnti << ": block on RB " << maxRb << " beyond the "
+                                << m_sinrPerceived.GetValuesN() << " RBs received: not received");
+            tbInfo.m_expected.m_pdcchMissed = true;
+            tbInfo.m_isCorrupted = true;
+            tbInfo.m_outputOfEM = Create<NrErrorModelOutput>(1.0);
+            continue;
+        }
+
         tbInfo.UpdatePerceivedSinr(m_sinrPerceived);
+
+        // PUSCH or PDSCH repetition: more transmissions of this block are coming, and the
+        // receiver decodes it once it has combined them all (ProcessReceivedPacketBurst() keeps
+        // this one in the HARQ history and sends no feedback for it)
+        const bool repeatedLater = tbInfo.m_expected.m_repLeft > 0;
 
         if ((!m_dataErrorModelEnabled) || (m_rxPacketBurstList.empty()))
         {
-            tbInfo.m_isCorrupted = tbInfo.m_isCorrupted || tbInfo.m_expected.m_pdcchMissed;
+            tbInfo.m_isCorrupted =
+                tbInfo.m_isCorrupted || tbInfo.m_expected.m_pdcchMissed || repeatedLater;
             continue;
         }
 
@@ -1699,6 +1746,9 @@ NrSpectrumPhy::CheckTransportBlockCorruptionStatus()
 
         // Output is the output of the error model. From the TBLER we decide
         // if the entire TB is corrupted or not
+        // (the MAC's transmission counter of the block: its redundancy version, see
+        // NrErrorModel::SetNextRvCounter())
+        m_errorModel->SetNextRvCounter(tbInfo.m_expected.m_rv);
 
         if (!m_mimoSinrPerceived.empty())
         {
@@ -1727,7 +1777,9 @@ NrSpectrumPhy::CheckTransportBlockCorruptionStatus()
                                                        harqInfoList);
         }
 
-        tbInfo.m_isCorrupted = m_random->GetValue() <= tbInfo.m_outputOfEM->m_tbler;
+        m_errorModel->SetNextRvCounter(255);
+        tbInfo.m_isCorrupted =
+            repeatedLater || m_random->GetValue() <= tbInfo.m_outputOfEM->m_tbler;
         if (tbInfo.m_expected.m_pdcchMissed)
         {
             // NrUePhy::PdcchErrorModel: the UE did not decode the assignment (downlink) or the
@@ -1896,6 +1948,29 @@ NrSpectrumPhy::ProcessReceivedPacketBurst()
             }
 
             // send HARQ feedback (if not already done for this TB)
+            if (!tbInfo.m_harqFeedbackSent && tbInfo.m_expected.m_repLeft > 0)
+            {
+                // PUSCH or PDSCH repetition, not the last transmission of the block: no feedback
+                // yet, and the history keeps it for the decoding after the last (one that was
+                // never sent, or whose assignment the UE missed, leaves nothing to combine)
+                tbInfo.m_harqFeedbackSent = true;
+                if (m_dataErrorModelEnabled && tbInfo.m_outputOfEM &&
+                    !tbInfo.m_expected.m_pdcchMissed)
+                {
+                    if (tbInfo.m_expected.m_isDownlink)
+                    {
+                        m_harqPhyModule.UpdateDlHarqProcessStatus(rnti,
+                                                                  tbInfo.m_expected.m_harqProcessId,
+                                                                  tbInfo.m_outputOfEM);
+                    }
+                    else
+                    {
+                        m_harqPhyModule.UpdateUlHarqProcessStatus(rnti,
+                                                                  tbInfo.m_expected.m_harqProcessId,
+                                                                  tbInfo.m_outputOfEM);
+                    }
+                }
+            }
             if (!tbInfo.m_harqFeedbackSent)
             {
                 tbInfo.m_harqFeedbackSent = true;

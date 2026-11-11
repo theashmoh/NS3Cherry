@@ -59,7 +59,9 @@ struct NR_EXPORT HarqProcess
           m_status(other.m_status),
           m_timer(other.m_timer),
           m_dciElement(other.m_dciElement),
-          m_rlcPduInfo(other.m_rlcPduInfo)
+          m_rlcPduInfo(other.m_rlcPduInfo),
+          m_txSlot(other.m_txSlot),
+          m_ollaCounted(other.m_ollaCounted)
     {
     }
 
@@ -91,6 +93,8 @@ struct NR_EXPORT HarqProcess
         m_timer = 0;
         m_dciElement.reset();
         m_rlcPduInfo.clear();
+        m_txSlot = 0;
+        m_ollaCounted = false;
     }
 
     bool m_active{false};      //!< False indicate that the process is not active
@@ -98,6 +102,21 @@ struct NR_EXPORT HarqProcess
     uint32_t m_timer{0};       //!< Age in scheduling indications, including the NTN waiting window
     std::shared_ptr<DciInfoElementTdma> m_dciElement{}; //!< DCI element
     std::vector<RlcPduInfo> m_rlcPduInfo{};             //!< vector of RLC PDU
+    /**
+     * The slot (SfnSf::Normalize()) of the first transmission of the DCI the process holds now
+     * (a retransmission: its own slot); 0 when not known. The feedback of a block comes after
+     * its last repetition and a round trip: a process is reclaimed from there, not from when it
+     * was scheduled (a block of a configured grant is scheduled a period ahead), and a feedback
+     * for it that comes too soon, or for another redundancy version, is for an earlier
+     * transmission on the same process id and is stale.
+     */
+    uint64_t m_txSlot{0};
+    /**
+     * True once the outcome of the first transmission has been given to the outer-loop link
+     * adaptation. A NACK whose retransmission finds no room comes back through the feedback
+     * list in every slot until it is placed; it must count once (review of 1 Nov 2026).
+     */
+    bool m_ollaCounted{false};
 };
 
 /**
@@ -112,7 +131,10 @@ operator<<(std::ostream& os, const HarqProcess& item)
     if (item.m_active)
     {
         os << "is active, timer=" << static_cast<uint32_t>(item.m_timer)
-           << " Status: " << static_cast<uint32_t>(item.m_status);
+           << " Status: " << static_cast<uint32_t>(item.m_status) << " txSlot " << item.m_txSlot
+           << (item.m_dciElement ? " rv " + std::to_string(item.m_dciElement->m_rv) +
+                                       " reps " + std::to_string(item.m_dciElement->m_repetitions)
+                                 : std::string());
     }
     return os;
 }

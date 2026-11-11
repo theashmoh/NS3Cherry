@@ -1039,6 +1039,13 @@ class NR_EXPORT NrUeRrc : public Object
     bool m_rlcMaxRetxTriggersRlf; ///< if true, RLC-AM max-retx declares RLF (TS 38.331 5.3.10.3)
     bool m_rlcMaxRetxRlfDeclared{
         false}; ///< guard: RLC-max-retx RLF already declared this connection
+    /// The 'ReconnectAfterRelease' attribute: if true, a UE whose RRC connection the network
+    /// released connects again by itself once it camps on a cell again (the stock behaviour of
+    /// the nr module, which reuses the radio-link-failure recovery for the release). If false
+    /// (the default), it stays in RRC_IDLE until the NAS asks it to connect (TS 38.331 5.3.8).
+    bool m_reconnectAfterRelease{false};
+    /// True from an RrcConnectionRelease of the network until the NAS asks for a connection
+    bool m_releasedByNetwork{false};
     /// TR 36.839 (5.3.2) handover-failure model: fail the handover if the HO
     /// command arrives while the source link is below Qout (T310 running).
     bool m_tr36839HandoverFailure{false};

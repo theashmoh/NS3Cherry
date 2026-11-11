@@ -89,6 +89,85 @@ NrEesmErrorModel::SinrExp(const SpectrumValue& sinr, const std::vector<int>& map
     return SINRsum;
 }
 
+double
+NrEesmErrorModel::ChaseCombinedSinr(const SpectrumValue& sinr,
+                                    const std::vector<int>& map,
+                                    uint8_t mcs,
+                                    const NrErrorModel::NrErrorModelHistory& sinrHistory) const
+{
+    NS_LOG_FUNCTION(this);
+    // The SINRs of the transmissions summed RB by RB (chase combining: the same coded bits again)
+
+    // make a vector of history that contains the last tx (but without modifying
+    // sinrHistory, as it will be modified by the caller when it will be the time)
+    Ptr<NrEesmErrorModelOutput> last = Create<NrEesmErrorModelOutput>(0.0);
+    last->m_map = map;
+    last->m_sinr = sinr;
+
+    NrErrorModel::NrErrorModelHistory total = sinrHistory;
+    total.emplace_back(last);
+
+    // evaluate SINR_eff over "total", as per Chase Combining
+
+    NS_ASSERT(sinr.GetSpectrumModel()->GetNumBands() == sinr.GetValuesN());
+
+    SpectrumValue sinr_sum(sinr.GetSpectrumModel());
+    auto historySize = static_cast<uint32_t>(total.size());
+    uint32_t maxRBUsed = 0;
+    for (uint32_t i = 0; i < historySize; ++i)
+    {
+        Ptr<NrEesmErrorModelOutput> output = DynamicCast<NrEesmErrorModelOutput>(total.at(i));
+        maxRBUsed = std::max(maxRBUsed, static_cast<uint32_t>(output->m_map.size()));
+    }
+
+    std::vector<int> map_sum;
+    map_sum.reserve(maxRBUsed);
+
+    for (uint32_t i = 0; i < maxRBUsed; ++i)
+    {
+        sinr_sum[i] = 0;
+        map_sum.push_back(static_cast<int>(i));
+    }
+
+    /* combine at the bit level. Example:
+     * SINR{1}=[0 0 10 20 10 0 0];
+     * SINR{2}=[1 2 1 2 1 0 3];
+     * SINR{3}=[5 0 0 0 0 0 0];
+     *
+     * map{1}=[2 3 4];
+     * map{2}=[0 1 2 3 4 6];
+     * map{3}=[0];
+     *
+     * MAP_SUM = [0 1 2 3 4 5]
+     * SINR_SUM = [16 27 16 17 26 18]
+     *
+     * (the value at SINR_SUM[0] is SINR{1}[2] + SINR{2}[0] + SINR{3}[0])
+     */
+    for (uint32_t i = 0; i < historySize; ++i)
+    {
+        Ptr<NrEesmErrorModelOutput> output = DynamicCast<NrEesmErrorModelOutput>(total.at(i));
+        uint32_t size = output->m_map.size();
+        for (uint32_t j = 0; j < maxRBUsed; ++j)
+        {
+            sinr_sum[j] += output->m_sinr[output->m_map[j % size]];
+        }
+    }
+
+    NS_LOG_INFO("\tHISTORY:");
+    for (const auto& element : total)
+    {
+        Ptr<NrEesmErrorModelOutput> output = DynamicCast<NrEesmErrorModelOutput>(element);
+        NS_LOG_INFO("\tMAP:" << PrintMap(output->m_map));
+        NS_LOG_INFO("\tSINR: " << output->m_sinr);
+    }
+
+    NS_LOG_INFO("MAP_SUM: " << PrintMap(map_sum));
+    NS_LOG_INFO("SINR_SUM: " << sinr_sum);
+
+    // compute effective SINR with the sinr_sum vector and map_sum RB map
+    return SinrEff(sinr_sum, map_sum, mcs, 0.0, map_sum.size());
+}
+
 const std::vector<double>&
 NrEesmErrorModel::GetSinrDbVectorFromSimulatedValues(NrEesmErrorModel::GraphType graphType,
                                                      uint8_t mcs,
@@ -292,6 +371,28 @@ NrEesmErrorModel::GetTbBitDecodificationStats(const SpectrumValue& sinr,
                          << "MAP: " << PrintMap(map) << std::endl
                          << "SINR: " << sinr);
 
+    // the redundancy version of this transmission (see m_currentRvId)
+    {
+        static const uint8_t rvSequence[4] = {0, 2, 3, 1};
+        m_currentRvCounter = m_nextRvCounter;
+        uint32_t position = static_cast<uint32_t>(sinrHistory.size());
+        if (m_currentRvCounter != 255)
+        {
+            uint32_t sameTx = 0; // earlier repetitions of this transmission
+            for (auto it = sinrHistory.rbegin(); it != sinrHistory.rend(); ++it)
+            {
+                const auto out = DynamicCast<NrEesmErrorModelOutput>(*it);
+                if (out == nullptr || out->m_rvCounter != m_currentRvCounter)
+                {
+                    break;
+                }
+                ++sameTx;
+            }
+            position = m_currentRvCounter + sameTx;
+        }
+        m_currentRvId = rvSequence[position % 4];
+    }
+
     if (!sinrHistory.empty())
     {
         SINR = ComputeSINR(sinr, map, mcs, sizeBit, sinrHistory);
@@ -331,6 +432,24 @@ NrEesmErrorModel::GetTbBitDecodificationStats(const SpectrumValue& sinr,
         errorRate = MappingSinrBler(SINR, mcs_eq, K);
     }
 
+    // A receiver that keeps every coded bit of the earlier transmissions does at least as well
+    // as chase combining of the same energy: where the incremental-redundancy abstraction
+    // (an averaged SINR on the curve of a lower code rate) gives a higher error rate, the
+    // error rate of the energy combined at the transmitted MCS stands (ChaseFloor())
+    if (!sinrHistory.empty() && errorRate > 0.0 && ChaseFloor())
+    {
+        const double sinrCc = ChaseCombinedSinr(sinr, map, mcs, sinrHistory);
+        const double cblerCc = MappingSinrBler(sinrCc, mcs, K);
+        const double errorRateCc = C != 1 ? 1.0 - pow(1.0 - cblerCc, C) : cblerCc;
+        if (errorRateCc < errorRate)
+        {
+            NS_LOG_INFO(" chase combining " << errorRateCc << " below incremental redundancy "
+                                            << errorRate << ": SINR " << sinrCc);
+            errorRate = errorRateCc;
+            SINR = sinrCc;
+        }
+    }
+
     NS_LOG_DEBUG("Calculated Error rate " << errorRate);
     NS_ASSERT(GetMcsEcrTable() != nullptr);
 
@@ -350,6 +469,8 @@ NrEesmErrorModel::GetTbBitDecodificationStats(const SpectrumValue& sinr,
     }
     ret->m_infoBits = sizeBit;
     ret->m_codeBits = sizeBit / GetMcsEcrTable()->at(mcs);
+    ret->m_rvCounter = m_currentRvCounter;
+    ret->m_rvId = m_currentRvId;
 
     return ret;
 }

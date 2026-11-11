@@ -118,6 +118,36 @@ class NR_EXPORT NrMacShortBsrCe : public Header
      */
     static uint64_t FromLevelToBytes(uint8_t bufferLevel);
 
+    /**
+     * @brief Compact buffer status report (TS 38.321 6.1.3.1, short BSR)
+     * @param compact true: a BSR of 2 bytes on the air (the MAC subheader of 1 byte and 1 byte
+     * with the LCG ID and its buffer level), as the standard has it. false (default): the
+     * module's, 5 bytes (the subheader and the levels of the 4 LCGs).
+     *
+     * Static: it is a setting of the whole simulation (NrUeMac attribute CompactBsr).
+     */
+    static void SetCompact(bool compact);
+    /**
+     * @return true if the compact BSR is on
+     */
+    static bool IsCompact();
+    /**
+     * @return the bytes a BSR takes of an uplink transport block: 2 (compact) or 5
+     */
+    static uint32_t OverheadBytes();
+    /**
+     * @return the least uplink transport block that carries data: 10 bytes (the MAC subheader
+     * of 3 and the 7 an RLC entity needs) and the BSR that goes in every block. The UE sends no
+     * data in a smaller one, so the scheduler must not grant one.
+     */
+    static uint32_t MinUlGrantBytes();
+
+    /**
+     * @brief Put this BSR in its compact form, for the LCG whose level is not 0
+     * @param lcg the LCG (0 to 3)
+     */
+    void SetCompactLcg(uint8_t lcg);
+
     uint8_t m_bufferSizeLevel_0{0}; //!< Buffer size level for LCG 0 (maximum value: 31)
     uint8_t m_bufferSizeLevel_1{0}; //!< Buffer size level for LCG 1 (maximum value: 31)
     uint8_t m_bufferSizeLevel_2{0}; //!< Buffer size level for LCG 2 (maximum value: 31)
@@ -125,6 +155,7 @@ class NR_EXPORT NrMacShortBsrCe : public Header
 
   private:
     NrMacHeaderFsUl m_header; //!< Fixed-size header to prepend to the BSR
+    int m_compactLcg{-1};     //!< -1: the module's 5 bytes; 0 to 3: compact, this LCG alone
 };
 
 } // namespace ns3

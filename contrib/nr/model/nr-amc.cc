@@ -4,6 +4,12 @@
 
 #include "nr-amc.h"
 
+#include "nr-eesm-error-model.h"
+
+#include "ns3/boolean.h"
+
+#include <cmath>
+
 #include "lena-error-model.h"
 #include "nr-error-model.h"
 #include "nr-lte-mi-error-model.h"
@@ -56,6 +62,12 @@ NrAmc::GetTypeId()
                           UintegerValue(1),
                           MakeUintegerAccessor(&NrAmc::SetNumRefScPerRb, &NrAmc::GetNumRefScPerRb),
                           MakeUintegerChecker<uint8_t>(0, 12))
+            .AddAttribute("TbsTable",
+                          "TBS of TS 38.214 5.1.3.2 (quantised, Table 5.1.3.2-1, CRC on top; EESM error models); "
+                          "false: payload minus 3 B CRC",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&NrAmc::m_tbsTable),
+                          MakeBooleanChecker())
             .AddAttribute("AmcModel",
                           "AMC model used to assign CQI",
                           EnumValue(NrAmc::ErrorModel),
@@ -121,6 +133,18 @@ NrAmc::CalculateTbSize(uint8_t mcs, uint8_t rank, uint32_t nprb) const
                   "MCS=" << static_cast<uint32_t>(mcs) << " while maximum MCS is "
                          << static_cast<uint32_t>(m_errorModel->GetMaxMcs()));
 
+    if (m_tbsTable)
+    {
+        if (const auto eesm = DynamicCast<NrEesmErrorModel>(m_errorModel))
+        {
+            const double nInfo = static_cast<double>(NrSpectrumValueHelper::SUBCARRIERS_PER_RB -
+                                                     GetNumRefScPerRb()) *
+                                 nprb * eesm->McsQm(mcs) * eesm->McsCodeRate(mcs) * rank;
+            const uint32_t tbs = Tbs38214(nInfo, eesm->McsCodeRate(mcs));
+            NS_LOG_INFO(" mcs:" << (unsigned)mcs << " Ninfo:" << nInfo << " TBS:" << tbs);
+            return tbs;
+        }
+    }
     uint32_t payloadSize = GetPayloadSize(mcs, rank, nprb);
     uint32_t tbSize = payloadSize;
 
@@ -152,6 +176,57 @@ NrAmc::CalculateTbSize(uint8_t mcs, uint8_t rank, uint32_t nprb) const
 }
 
 uint32_t
+NrAmc::Tbs38214(double nInfo, double codeRate)
+{
+    // TS 38.214 5.1.3.2 steps 2-4 (also 6.1.4.2 for PUSCH); returns bytes, 0 if nothing fits
+    static const uint16_t table[] = {
+        24,   32,   40,   48,   56,   64,   72,   80,   88,   96,   104,  112,  120,  128,
+        136,  144,  152,  160,  168,  176,  184,  192,  208,  224,  240,  256,  272,  288,
+        304,  320,  336,  352,  368,  384,  408,  432,  456,  480,  504,  528,  552,  576,
+        608,  640,  672,  704,  736,  768,  808,  848,  888,  928,  984,  1032, 1064, 1128,
+        1160, 1192, 1224, 1256, 1288, 1320, 1352, 1416, 1480, 1544, 1608, 1672, 1736, 1800,
+        1864, 1928, 2024, 2088, 2152, 2216, 2280, 2408, 2472, 2536, 2600, 2664, 2728, 2792,
+        2856, 2976, 3104, 3240, 3368, 3496, 3624, 3752, 3824};
+    if (nInfo < 1.0)
+    {
+        return 0;
+    }
+    if (nInfo <= 3824.0)
+    {
+        const int n = std::max(3, static_cast<int>(std::floor(std::log2(nInfo))) - 6);
+        const double step = std::pow(2.0, n);
+        const double nInfoQ = std::max(24.0, step * std::floor(nInfo / step));
+        for (const uint16_t t : table)
+        {
+            if (t >= nInfoQ)
+            {
+                return t / 8;
+            }
+        }
+        return 3824 / 8;
+    }
+    const int n = static_cast<int>(std::floor(std::log2(nInfo - 24.0))) - 5;
+    const double step = std::pow(2.0, n);
+    const double nInfoQ = std::max(3840.0, step * std::round((nInfo - 24.0) / step));
+    double tbs;
+    if (codeRate <= 0.25)
+    {
+        const double c = std::ceil((nInfoQ + 24.0) / 3816.0);
+        tbs = 8.0 * c * std::ceil((nInfoQ + 24.0) / (8.0 * c)) - 24.0;
+    }
+    else if (nInfoQ > 8424.0)
+    {
+        const double c = std::ceil((nInfoQ + 24.0) / 8424.0);
+        tbs = 8.0 * c * std::ceil((nInfoQ + 24.0) / (8.0 * c)) - 24.0;
+    }
+    else
+    {
+        tbs = 8.0 * std::ceil((nInfoQ + 24.0) / 8.0) - 24.0;
+    }
+    return static_cast<uint32_t>(tbs) / 8;
+}
+
+uint32_t
 NrAmc::GetPayloadSize(uint8_t mcs, uint8_t rank, uint32_t nprb) const
 {
     return m_errorModel->GetPayloadSize(NrSpectrumValueHelper::SUBCARRIERS_PER_RB -
@@ -163,7 +238,7 @@ NrAmc::GetPayloadSize(uint8_t mcs, uint8_t rank, uint32_t nprb) const
 }
 
 uint8_t
-NrAmc::CreateCqiFeedbackSiso(const SpectrumValue& sinr, uint8_t& mcs) const
+NrAmc::CreateCqiFeedbackSiso(const SpectrumValue& sinr, uint8_t& mcs, uint8_t transmissions) const
 {
     NS_LOG_FUNCTION(this);
 
@@ -181,7 +256,7 @@ NrAmc::CreateCqiFeedbackSiso(const SpectrumValue& sinr, uint8_t& mcs) const
         uint32_t rbNum = 0;
         for (it = sinr.ConstValuesBegin(); it != sinr.ConstValuesEnd(); it++)
         {
-            double sinr_ = (*it);
+            double sinr_ = (*it) * std::max<uint8_t>(transmissions, 1);
             if (sinr_ == 0.0)
             {
                 // cqi.push_back (-1); // SINR == 0 (linear units) means no signal in this RB
@@ -234,11 +309,38 @@ NrAmc::CreateCqiFeedbackSiso(const SpectrumValue& sinr, uint8_t& mcs) const
         {
             uint8_t rank = 1; // This function is SISO only
             auto tbSize = CalculateTbSize(mcs, rank, rbMap.size());
+            if (transmissions > 1)
+            {
+                // The block of a slot, as the MIMO CQI takes: one symbol holds a few bytes,
+                // too few code bits for the error model to combine transmissions
+                tbSize = CalculateTbSize(mcs, rank, rbMap.size() * NR_AMC_NUM_SYMBOLS_DEFAULT);
+                if (tbSize == 0 && mcs < m_errorModel->GetMaxMcs())
+                {
+                    // the lowest MCSs on a few RBs: no block at all, nothing to decode; the
+                    // next MCS decides (the error rate of an empty block says nothing)
+                    ++mcs;
+                    continue;
+                }
+            }
             output = m_errorModel->GetTbDecodificationStats(sinr,
                                                             rbMap,
                                                             tbSize,
                                                             mcs,
                                                             NrErrorModel::NrErrorModelHistory());
+            if (transmissions > 1)
+            {
+                // The receiver combines the earlier transmissions of the block, all at this
+                // SINR, as it combines HARQ transmissions: the history as the PHY builds it,
+                // each transmission's output computed with the ones before it (the EESM-IR
+                // output carries the sum over them)
+                NrErrorModel::NrErrorModelHistory history{output};
+                for (uint8_t k = 2; k < transmissions; ++k)
+                {
+                    history.push_back(
+                        m_errorModel->GetTbDecodificationStats(sinr, rbMap, tbSize, mcs, history));
+                }
+                output = m_errorModel->GetTbDecodificationStats(sinr, rbMap, tbSize, mcs, history);
+            }
             if (output->m_tbler > 0.1)
             {
                 break;
@@ -251,7 +353,7 @@ NrAmc::CreateCqiFeedbackSiso(const SpectrumValue& sinr, uint8_t& mcs) const
             mcs--;
         }
 
-        if ((output->m_tbler > 0.1) && (mcs == 0))
+        if (!output || ((output->m_tbler > 0.1) && (mcs == 0)))
         {
             cqi = 0;
         }

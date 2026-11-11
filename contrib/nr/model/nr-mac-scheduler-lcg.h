@@ -20,6 +20,16 @@ namespace ns3
  */
 inline constexpr uint32_t MAC_SUBHEADER_SIZE{3};
 
+/// The MAC subheader of an SDU of this size (2 B, or 3 with the 16-bit L field; NrMacHeaderVs)
+uint32_t MacSubheaderFor(uint32_t sduBytes);
+
+/// The SDU that fits in these bytes with its subheader
+inline uint32_t
+MacSduIn(uint32_t bytes)
+{
+    return bytes >= 2 && MacSubheaderFor(bytes - 2) == 2 ? bytes - 2 : (bytes >= 3 ? bytes - 3 : 0);
+}
+
 /**
  * @ingroup scheduler
  * @brief Represent a DL Logical Channel of an UE

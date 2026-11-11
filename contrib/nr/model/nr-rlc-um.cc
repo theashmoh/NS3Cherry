@@ -61,6 +61,12 @@ NrRlcUm::GetTypeId()
                           MakeUintegerChecker<uint32_t>())
             // sn-FieldLength of TS 36.331; header and window as in TS 36.322 6.2.1.3 and 7.2.
             // Both ends of a bearer need the same value.
+            .AddAttribute("SegmentOffsetBytes",
+                          "Bytes added to a PDU whose data starts inside an SDU: 2 = NR's 16-bit "
+                          "SO (TS 38.322 6.2.2.3); 0 = E-UTRA framing (v9)",
+                          UintegerValue(0),
+                          MakeUintegerAccessor(&NrRlcUm::m_segmentOffsetBytes),
+                          MakeUintegerChecker<uint32_t>(0, 4))
             .AddAttribute("SnFieldLength",
                           "UM sequence number bits: 10 (2-octet header, window 512) or 5 (1 "
                           "octet, window 16)",
@@ -87,15 +93,31 @@ NrRlcUm::GetTypeId()
                           UintegerValue(0),
                           MakeUintegerAccessor(&NrRlcUm::m_discardTimerMs),
                           MakeUintegerChecker<uint32_t>())
+            // The part of the packet delay budget a packet has used up when it reaches this RLC, in ms:
+            // the delay between UPF and gNB. Where the delay budget is the discard timer (DiscardTimerMs =
+            // 0, and the budget is known: at the gNB), the timer is the budget less this, in whole ms.
             .AddAttribute("DelayBudgetSpentMs",
-                          "The part of the packet delay budget a packet has used up when it "
-                          "reaches this RLC, in ms: the delay between UPF and gNB. Where the "
-                          "delay budget is the discard timer (DiscardTimerMs = 0, and the "
-                          "budget is known: at the gNB), the timer is the budget less this, "
-                          "in whole ms.",
+                          "Part of the packet delay budget already used when a packet reaches this RLC (UPF to gNB), ms; the discard timer is the budget less this.",
                           DoubleValue(0.0),
                           MakeDoubleAccessor(&NrRlcUm::m_delayBudgetSpentMs),
                           MakeDoubleChecker<double>(0.0))
+            .AddAttribute("UeTxStaleMs",
+                          "UE side: an SDU that has waited this long in the transmit buffer is "
+                          "dropped, the oldest first; 0 = never",
+                          UintegerValue(0),
+                          MakeUintegerAccessor(&NrRlcUm::m_ueTxStaleMs),
+                          MakeUintegerChecker<uint32_t>())
+            .AddAttribute("UeSide",
+                          "Set by the UE's RRC on the entities it creates",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&NrRlcUm::m_ueSide),
+                          MakeBooleanChecker())
+            .AddAttribute("UeCellId",
+                          "Set by the UE's RRC on the entities it creates: the cell of the UE, "
+                          "for the counts of packets by bearer (two cells may give the same RNTI)",
+                          UintegerValue(0),
+                          MakeUintegerAccessor(&NrRlcUm::m_ueCellId),
+                          MakeUintegerChecker<uint16_t>())
             .AddAttribute("BufferStatusReportTimer",
                           "How much to wait to issue a new Buffer Status Report while the "
                           "transmission buffer is not empty",
@@ -126,9 +148,28 @@ NrRlcUm::DoDispose()
  */
 
 void
+NrRlcUm::DiscardStale()
+{
+    if (!m_ueSide || m_ueTxStaleMs == 0)
+    {
+        return;
+    }
+    const Time limit = MilliSeconds(m_ueTxStaleMs);
+    while (!m_txBuffer.empty() && Simulator::Now() - m_txBuffer.front().m_waitingSince > limit)
+    {
+        NS_LOG_INFO("Tx SDU waited over " << m_ueTxStaleMs << " ms in the UE. RLC SDU discarded");
+        m_txBufferSize -= m_txBuffer.front().m_pdu->GetSize();
+        m_txDropTrace(m_txBuffer.front().m_pdu);
+        NrPdcp::NoteUeStaleDiscard(m_ueCellId, m_rnti, m_lcid); // for NrPdcp::GetPacketCounts()
+        m_txBuffer.pop_front();
+    }
+}
+
+void
 NrRlcUm::DoTransmitPdcpPdu(Ptr<Packet> p)
 {
     NS_LOG_FUNCTION(this << m_rnti << (uint32_t)m_lcid << p->GetSize());
+    DiscardStale();
     if ((m_txBufferSize + p->GetSize() <= m_maxTxBufferSize) || (m_maxTxBufferSize == 0))
     {
         if (m_enablePdcpDiscarding)
@@ -264,6 +305,7 @@ NrRlcUm::DoNotifyTxOpportunity(NrMacSapUser::TxOpportunityParameters txOpParams)
 
     // Remove the first packet from the transmission buffer.
     // If only a segment of the packet is taken, then the remaining is given back later
+    DiscardStale();
     if (m_txBuffer.empty())
     {
         NS_LOG_LOGIC("No data pending");
@@ -272,6 +314,24 @@ NrRlcUm::DoNotifyTxOpportunity(NrMacSapUser::TxOpportunityParameters txOpParams)
 
     Ptr<Packet> firstSegment = m_txBuffer.begin()->m_pdu->Copy();
     Time firstSegmentTime = m_txBuffer.begin()->m_waitingSince;
+    // NR (SegmentOffsetBytes): a PDU that starts inside an SDU carries the segment offset
+    bool continues = false;
+    if (m_segmentOffsetBytes > 0)
+    {
+        NrRlcSduStatusTag headTag;
+        if (firstSegment->PeekPacketTag(headTag) &&
+            (headTag.GetStatus() == NrRlcSduStatusTag::MIDDLE_SEGMENT ||
+             headTag.GetStatus() == NrRlcSduStatusTag::LAST_SEGMENT))
+        {
+            continues = true;
+            if (nextSegmentSize <= m_segmentOffsetBytes)
+            {
+                NS_LOG_INFO("TX opportunity too small for the segment offset");
+                return;
+            }
+            nextSegmentSize -= m_segmentOffsetBytes;
+        }
+    }
 
     NS_LOG_LOGIC("SDUs in TxBuffer  = " << m_txBuffer.size());
     NS_LOG_LOGIC("First SDU buffer  = " << firstSegment);
@@ -494,6 +554,13 @@ NrRlcUm::DoNotifyTxOpportunity(NrMacSapUser::TxOpportunityParameters txOpParams)
     rlcHeader.SetFramingInfo(framingInfo);
 
     NS_LOG_LOGIC("RLC header: " << rlcHeader);
+    if (continues)
+    {
+        NS_ASSERT((framingInfo & NrRlcHeader::NO_FIRST_BYTE) != 0);
+        Ptr<Packet> so = Create<Packet>(m_segmentOffsetBytes);
+        so->AddAtEnd(packet);
+        packet = so;
+    }
     packet->AddHeader(rlcHeader);
 
     // Sender timestamp and transmitting entity identity, on the header bytes. Not from byte 1:
@@ -771,6 +838,10 @@ NrRlcUm::ReassembleAndDeliver(Ptr<Packet> packet)
     packet->RemoveHeader(rlcHeader);
     uint8_t framingInfo = rlcHeader.GetFramingInfo();
     nr::SequenceNumber10 currSeqNumber = rlcHeader.GetSequenceNumber();
+    if (m_segmentOffsetBytes > 0 && (framingInfo & NrRlcHeader::NO_FIRST_BYTE) != 0)
+    {
+        packet->RemoveAtStart(m_segmentOffsetBytes); // the segment offset
+    }
     bool expectedSnLost;
 
     if (currSeqNumber != m_expectedSeqNumber)
@@ -945,6 +1016,7 @@ NrRlcUm::ReassembleSnInterval(nr::SequenceNumber10 lowSeqNumber, nr::SequenceNum
 void
 NrRlcUm::DoTransmitBufferStatusReport()
 {
+    DiscardStale();
     Time holDelay(0);
     uint32_t queueSize = 0;
 
@@ -959,6 +1031,14 @@ NrRlcUm::DoTransmitBufferStatusReport()
         // leaves the last bytes of the last SDU behind, and takes the buffer for empty.
         const auto extensions = static_cast<uint32_t>(m_txBuffer.size() - 1);
         queueSize = m_txBufferSize + FixedHeaderSize() + (extensions * 12 + 7) / 8;
+        // (NR: a head that continues an SDU also carries the segment offset)
+        NrRlcSduStatusTag headTag;
+        if (m_segmentOffsetBytes > 0 && m_txBuffer.front().m_pdu->PeekPacketTag(headTag) &&
+            (headTag.GetStatus() == NrRlcSduStatusTag::MIDDLE_SEGMENT ||
+             headTag.GetStatus() == NrRlcSduStatusTag::LAST_SEGMENT))
+        {
+            queueSize += m_segmentOffsetBytes;
+        }
     }
 
     NrMacSapProvider::BufferStatusReportParameters r;

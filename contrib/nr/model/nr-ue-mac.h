@@ -506,6 +506,25 @@ class NR_EXPORT NrUeMac : public Object
 
     SrBsrMachine m_srState{INACTIVE}; //!< Current state for the SR/BSR machine.
 
+    // BSR triggers (BsrOnDemand, TS 38.321 clause 5.4.5)
+    bool m_bsrOnDemand{false};   //!< report the buffer when a trigger fires, not in every block
+    bool m_cgBsrWhenRoom{false}; //!< CgBsrWhenRoom attribute
+    uint32_t m_cgAheadSerial{0}; //!< the activation a dynamic grant has confirmed ahead
+    uint32_t m_cgLastActivationSerial{0}; //!< the last activation DCI received
+    Time m_periodicBsrTimer{MilliSeconds(20)}; //!< periodicBSR-Timer (TS 38.331), 0 = infinity
+    Time m_retxBsrTimer{MilliSeconds(80)};     //!< retxBSR-Timer (TS 38.331), 0 = infinity
+    bool m_regularBsrPending{false}; //!< a regular BSR was triggered and is not sent yet
+    Time m_lastBsrSent{Time::Min()};   //!< when periodicBSR-Timer was (re)started
+    Time m_retxBsrStart{Time::Min()};  //!< when retxBSR-Timer was (re)started
+    bool m_bsrInTb{true};      //!< the block being built carries a BSR
+    /**
+     * @brief Does a BSR go in the block being built? Always without BsrOnDemand, and in every
+     * block of a configured grant (the gNB reads them); in a dynamic grant with a trigger
+     * pending: a regular BSR (data arrived in an empty buffer, or retxBSR-Timer ran out with
+     * data) or the expiry of periodicBSR-Timer.
+     */
+    bool BsrTriggered() const;
+
     Time m_srProhibitTimer{MilliSeconds(10)}; //!< sr-ProhibitTimer (TS 38.331), 0 disables it
     Time m_lastSrSent{Time::Min()};           //!< When the last scheduling request was transmitted
     uint32_t m_srTransMax{64}; //!< sr-TransMax (TS 38.331): transmissions before giving up
@@ -586,6 +605,9 @@ class NR_EXPORT NrUeMac : public Object
     NrUeCmacSapProvider::RachConfig m_rachConfig{}; ///< RACH configuration
     uint8_t m_preambleTransmissionCounter{0};       ///< preamble transmission counter
     EventId m_noRaResponseReceivedEvent;            ///< no RA response received event ID
+    void SetCompactBsr(bool compact);
+    bool GetCompactBsr() const;
+
     bool m_idealRandomAccess{false}; ///< Attribute IdealRandomAccess: never arm the RA response
                                      ///< timeout, so that random access cannot time out
 };

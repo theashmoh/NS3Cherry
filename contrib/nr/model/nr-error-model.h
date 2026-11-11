@@ -202,6 +202,21 @@ class NR_EXPORT NrErrorModel : public Object
     /// @return A 2D matrix of the average SINR for this TB reception, dimensions nMimoLayers x nRbs
     virtual NrSinrMatrix ComputeAvgSinrMimo(const std::vector<MimoSinrChunk>& sinrChunks);
 
+    /// @brief The transmission counter (m_rv of the MAC) of the block the next
+    /// GetTbDecodificationStats() decodes; 255 = not known (the AMC's hypothetical blocks).
+    /// The receiver sets it before each decoding and clears it after; an error model that maps
+    /// transmissions to redundancy versions (NrEesmIr::RedundancyVersions) reads it.
+    /// @param rvCounter the counter, or 255
+    void SetNextRvCounter(uint8_t rvCounter)
+    {
+        m_nextRvCounter = rvCounter;
+    }
+
+  protected:
+    uint8_t m_nextRvCounter{255}; //!< see SetNextRvCounter()
+
+  public:
+
     /// @brief Create an equivalent RB index map for vectorized SINR values
     /// Matches layer-to-codeword mapping in TR 38.211, Table 7.3.1.3-1
     /// If map contains index "j", the output vectorized map contains

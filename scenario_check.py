@@ -82,8 +82,9 @@ def pdcch(calls, a):
     path = os.path.join(a.sweep, 'pdcch.csv')
     if os.path.exists(path):
         p = pd.read_csv(path)
-        parts = ['sib1', 'rar', 'dlNew', 'dlRetx', 'dlSpsActivation', 'dlSpsRelease', 'ulNew',
-                 'ulRetx', 'ulCgActivation', 'ulCgRelease']
+        parts = ['sib1', 'otherSi', 'paging', 'rar', 'tpcGroup', 'rrcDl', 'rrcUl', 'dlNew',
+                 'dlRetx', 'dlSpsActivation', 'dlSpsRelease', 'ulNew', 'ulRetx', 'ulCgActivation',
+                 'ulCgRelease']
         parts = [x for x in parts if x + 'Dcis' in p]
         s = p.groupby(KEYS)[[x + y for x in parts for y in ('Dcis', 'Cces')] +
                             ['ccePossible', 'cceUsed', 'dcis', 'blocked']].sum()
@@ -91,6 +92,11 @@ def pdcch(calls, a):
         r = pd.DataFrame(index=s.index)
         r['util%'] = 100 * s.cceUsed / s.ccePossible
         r['sib1%'] = 100 * s.sib1Cces / s.ccePossible
+        # the cell's own DCIs besides SIB1: other SI, paging, DCI 2_2, RRC (a newer version)
+        own = [x + 'Cces' for x in ('otherSi', 'paging', 'tpcGroup', 'rrcDl', 'rrcUl')
+               if x + 'Cces' in s]
+        if own:
+            r['cell%'] = 100 * s[own].sum(axis=1) / s.ccePossible
         for x, short in (('dlNew', 'new'), ('dlRetx', 'retx'), ('dlSpsActivation', 'act')):
             if x + 'Dcis' in s:
                 r[short + '/1k'] = 1000 * s[x + 'Dcis'] / s.onBearer

@@ -401,8 +401,10 @@ NrInterference::DoSubtractSignalMimo(Ptr<const SpectrumSignalParameters> params,
                            [params](Ptr<const SpectrumSignalParameters> p) { return p == params; }),
             m_allSignalsMimo.end());
     }
-    NS_ASSERT_MSG(m_allSignalsMimo.size() == (numSignals - 1),
-                  "MIMO signal was not found for removal");
+    // (an abort, not an assert: a signal left behind would stay in the interference of every
+    // later reception, silently, in an optimized build)
+    NS_ABORT_MSG_UNLESS(m_allSignalsMimo.size() == (numSignals - 1),
+                        "MIMO signal was not found for removal");
 }
 
 void
@@ -422,9 +424,9 @@ NrCovMat
 NrInterference::CalcOutOfCellInterfCov() const
 {
     // Extract dimensions from first receive signal. Interference signals have equal dimensions
-    NS_ASSERT_MSG(!(m_rxSignalsMimo.empty()), "At least one receive signal is required");
+    NS_ABORT_MSG_IF(m_rxSignalsMimo.empty(), "At least one receive signal is required");
     const auto& firstSignal = m_rxSignalsMimo[0];
-    NS_ASSERT_MSG(firstSignal->spectrumChannelMatrix, "signal must have a channel matrix");
+    NS_ABORT_MSG_UNLESS(firstSignal->spectrumChannelMatrix, "signal must have a channel matrix");
     auto nRbs = firstSignal->spectrumChannelMatrix->GetNumPages();
     auto nRxPorts = firstSignal->spectrumChannelMatrix->GetNumRows();
 

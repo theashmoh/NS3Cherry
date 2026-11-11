@@ -10,6 +10,8 @@
 
 #include "nr-mac-scheduler-ns3.h"
 
+#include "nr-gnb-phy.h"
+
 #include "nr-fh-control.h"
 #include "nr-mac-scheduler-harq-rr.h"
 #include "nr-mac-scheduler-lc-rr.h"
@@ -28,6 +30,7 @@
 #include "ns3/uinteger.h"
 
 #include <algorithm>
+#include <sstream>
 #include <cmath>
 #include <memory>
 #include <numeric>
@@ -39,6 +42,19 @@ namespace ns3
 {
 
 NS_LOG_COMPONENT_DEFINE("NrMacSchedulerNs3");
+
+// NTN_SPSTRACE=1 in the environment: the logic lines of the SPS/CG scheduling on stderr, also in
+// an optimised build (where NS_LOG is compiled out); nothing else changes
+static const bool g_ntnSpsTrace = std::getenv("NTN_SPSTRACE") != nullptr;
+#undef NS_LOG_LOGIC
+#define NS_LOG_LOGIC(msg)                                                                          \
+    do                                                                                             \
+    {                                                                                              \
+        if (g_ntnSpsTrace)                                                                         \
+        {                                                                                          \
+            std::cerr << "SPST " << Simulator::Now().GetMicroSeconds() << " " << msg << "\n";     \
+        }                                                                                          \
+    } while (false)
 NS_OBJECT_ENSURE_REGISTERED(NrMacSchedulerNs3);
 
 NrMacSchedulerNs3::NrMacSchedulerNs3()
@@ -127,19 +143,17 @@ NrMacSchedulerNs3::GetTypeId()
                           MakeTimeAccessor(&NrMacSchedulerNs3::SetCqiTimerThreshold,
                                            &NrMacSchedulerNs3::GetCqiTimerThreshold),
                           MakeTimeChecker())
+            // Slots a HARQ process is held, after its last repetition and the K_offset round trip,
+            // before it is reclaimed without feedback (ResetExpiredHARQ(), counted from
+            // HarqProcess::m_txSlot since 30 Oct 2026). 0: NumHarqProcess slots, the module's
+            // behaviour, which has no 3GPP equivalent: NR holds the soft buffer until feedback
+            // arrives or the process is reused by a grant with a toggled NDI. Set it beyond the
+            // worst-case loop delay so that the process count only limits the outstanding blocks.
             .AddAttribute("HarqProcessTimeout",
-                          "Slots a HARQ process is held before being reclaimed without feedback. "
-                          "0 keeps the legacy behaviour of reclaiming after NumHarqProcess slots, "
-                          "which ties the wait for feedback to the pipeline depth and has no 3GPP "
-                          "equivalent: NR holds the soft buffer until feedback arrives or the "
-                          "process is reused by a grant with a toggled NDI. Set this beyond the "
-                          "worst-case loop delay so the process count controls only how many "
-                          "transport blocks may be outstanding, and a short window stalls the UE "
-                          "rather than silently discarding its feedback. Capped at 255, the range "
-                          "of HarqProcess::m_timer.",
+                          "Slots a HARQ process is held after its last repetition and the round trip before it is reclaimed without feedback; 0 = NumHarqProcess.",
                           UintegerValue(0),
                           MakeUintegerAccessor(&NrMacSchedulerNs3::m_harqProcessTimeout),
-                          MakeUintegerChecker<uint32_t>(0, 255))
+                          MakeUintegerChecker<uint32_t>(0, 1023))
             .AddAttribute("FixedMcsDl",
                           "Fix MCS to value set in StartingMcsDl",
                           BooleanValue(false),
@@ -226,6 +240,16 @@ NrMacSchedulerNs3::GetTypeId()
                 UintegerValue(0),
                 MakeUintegerAccessor(&NrMacSchedulerNs3::m_spsScenario),
                 MakeUintegerChecker<uint8_t>(0, 2))
+            .AddAttribute("SpsDl",
+                          "SpsScenario on the downlink (SPS); false: the downlink is dynamic.",
+                          BooleanValue(true),
+                          MakeBooleanAccessor(&NrMacSchedulerNs3::m_spsDlOn),
+                          MakeBooleanChecker())
+            .AddAttribute("SpsUl",
+                          "SpsScenario on the uplink (configured grant); false: the uplink is dynamic.",
+                          BooleanValue(true),
+                          MakeBooleanAccessor(&NrMacSchedulerNs3::m_spsUlOn),
+                          MakeBooleanChecker())
             .AddAttribute("SpsFiveQi",
                           "5QI of the bearers served by semi-persistent scheduling.",
                           UintegerValue(1),
@@ -257,12 +281,107 @@ NrMacSchedulerNs3::GetTypeId()
                 UintegerValue(0),
                 MakeUintegerAccessor(&NrMacSchedulerNs3::m_spsFitExtraBytes),
                 MakeUintegerChecker<uint32_t>())
+            .AddAttribute("CgBlockPacketOnly",
+                          "Uplink: a configured block holds the packet only (BSR when there is room, confirmation ahead); false: packet + BSR + CE in every block (v9)",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&NrMacSchedulerNs3::m_cgBlockPacketOnly),
+                          MakeBooleanChecker())
+            .AddAttribute("CgStartAfterIr",
+                          "Uplink: no configured grant starts while the last packet received is a ROHC IR packet (the downlink waits for a packet that fits)",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&NrMacSchedulerNs3::m_cgStartAfterIr),
+                          MakeBooleanChecker())
+            .AddAttribute("CgStartRetry",
+                          "Uplink: an activation whose block is not placed two slots in a row waits a talk period, the UE answered with DCIs meanwhile (false: v9/v10, tried every slot)",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&NrMacSchedulerNs3::m_cgStartRetry),
+                          MakeBooleanChecker())
+            .AddAttribute("SrGrantLearned",
+                          "Grant for a scheduling request: the last packet received + BSR (SrGrantBytes the first time); false: SrGrantBytes",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&NrMacSchedulerNs3::m_srGrantLearned),
+                          MakeBooleanChecker())
+            .AddAttribute("SrGrantL2Bytes",
+                          "SrGrantLearned: bytes below PDCP added to the last PDCP PDU (RLC + MAC subheader)",
+                          UintegerValue(3),
+                          MakeUintegerAccessor(&NrMacSchedulerNs3::m_srGrantL2Bytes),
+                          MakeUintegerChecker<uint32_t>(0, 16))
+            .AddAttribute("SpsSidGapMs",
+                          "Time from the first silence descriptor to the next (TS 26.093: 60 ms); 0 = SpsSilencePeriodMs (v9)",
+                          UintegerValue(0),
+                          MakeUintegerAccessor(&NrMacSchedulerNs3::m_spsSidGapMs),
+                          MakeUintegerChecker<uint32_t>())
+            .AddAttribute("SpsDlSilenceAtSecondSid",
+                          "SpsScenario 2, downlink: the silence configuration starts with the second SID (first SID_UPDATE); false: the first (v9)",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&NrMacSchedulerNs3::m_spsDlSilenceAtSecondSid),
+                          MakeBooleanChecker())
+            .AddAttribute("DlSpsHysteresis",
+                          "Downlink SPS reactivation with the time filters below; false: at once when the MCS is SpsMcsTolerance off (v9)",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&NrMacSchedulerNs3::m_dlSpsHysteresis),
+                          MakeBooleanChecker())
+            .AddAttribute("DlSpsRaiseTime",
+                          "DlSpsHysteresis: the MCS must be SpsMcsTolerance worse this long before a reactivation",
+                          TimeValue(MilliSeconds(100)),
+                          MakeTimeAccessor(&NrMacSchedulerNs3::m_dlSpsRaiseTime),
+                          MakeTimeChecker())
+            .AddAttribute("DlSpsLowerTime",
+                          "DlSpsHysteresis: the MCS must be SpsMcsTolerance better this long before a reactivation",
+                          TimeValue(MilliSeconds(400)),
+                          MakeTimeAccessor(&NrMacSchedulerNs3::m_dlSpsLowerTime),
+                          MakeTimeChecker())
+            .AddAttribute("DlSpsMinInterval",
+                          "DlSpsHysteresis: least time between two activations of a UE's SPS, unless urgent",
+                          TimeValue(MilliSeconds(200)),
+                          MakeTimeAccessor(&NrMacSchedulerNs3::m_dlSpsMinInterval),
+                          MakeTimeChecker())
+            .AddAttribute("DlSpsUrgentSteps",
+                          "DlSpsHysteresis: MCS steps worse than the configuration's that reactivate at once (0: never)",
+                          UintegerValue(6),
+                          MakeUintegerAccessor(&NrMacSchedulerNs3::m_dlSpsUrgentSteps),
+                          MakeUintegerChecker<uint32_t>())
+            .AddAttribute("DlSpsFailures",
+                          "DlSpsHysteresis: failed first transmissions of SPS blocks in a row that reactivate at once (0: never)",
+                          UintegerValue(2),
+                          MakeUintegerAccessor(&NrMacSchedulerNs3::m_dlSpsFailures),
+                          MakeUintegerChecker<uint32_t>())
             .AddAttribute(
                 "SpsMcsTolerance",
                 "A configuration is activated anew when the MCS of the UE is this far off.",
                 UintegerValue(3),
                 MakeUintegerAccessor(&NrMacSchedulerNs3::m_spsMcsTolerance),
                 MakeUintegerChecker<uint8_t>())
+            // Keep a log of the uplink HARQ bookkeeping (feedback in, decisions, blocks, retransmissions,
+            // erasures) and print the UE's history if an inconsistency is found. Costs time: for debugging
+            // only.
+            .AddAttribute("DiagUlHarq",
+                          "Log the uplink HARQ bookkeeping and print a UE's history on an inconsistency (debugging only, costs time).",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&NrMacSchedulerNs3::m_diagUlHarq),
+                          MakeBooleanChecker())
+            // SpsScenario 2, uplink: bytes of the Multiple Entry Configured Grant Confirmation MAC CE (TS
+            // 38.321 6.1.3.31: 4 octets and a 1-octet subheader) that confirms an activation or release
+            // when the UE has several configurations. With one configuration the CE is its subheader
+            // alone, 1 byte (6.1.3.7).
+            .AddAttribute("CgMultiEntryCeBytes",
+                          "SpsScenario 2, uplink: bytes of the Multiple Entry CG Confirmation MAC CE (TS 38.321 6.1.3.31: 4 + 2 eLCID subheader).",
+                          UintegerValue(6),
+                          MakeUintegerAccessor(&NrMacSchedulerNs3::m_cgMultiEntryCeBytes),
+                          MakeUintegerChecker<uint32_t>(1, 16))
+            // SpsScenario 2, uplink, the speaker falls silent: false = the talk configuration stays, its
+            // occasions unused, until the next silence descriptor is due, one period after the first; then
+            // one DCI releases it and one activates the silence configuration, whose occasions fall where
+            // the descriptors are. true = the talk configuration is released as soon as the gNB has the
+            // first descriptor (no occasion kept), and the silence configuration is activated when the
+            // next descriptor is due, as before (an activation starts its occasions K2 + K_offset after
+            // the DCI: one sent at once would put them a period out of step, and the descriptors would
+            // come with scheduling requests).
+            .AddAttribute("CgSilenceSwitch",
+                          "SpsScenario 2, uplink: true = release the talk configuration at the first silence descriptor, false = at the next one.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&NrMacSchedulerNs3::m_cgSilenceSwitchNow),
+                          MakeBooleanChecker())
             .AddAttribute("DlHarqFeedbackDisabled",
                           "Rel-17 NTN downlinkHARQ-FeedbackDisabled. Releases the DL HARQ process "
                           "at transmission rather than on feedback, removing the throttle of one "
@@ -271,12 +390,12 @@ NrMacSchedulerNs3::GetTypeId()
                           BooleanValue(false),
                           MakeBooleanAccessor(&NrMacSchedulerNs3::m_dlHarqFeedbackDisabled),
                           MakeBooleanChecker())
+            // DL outer-loop link adaptation (OLLA) step applied to the MCS offset on each ACKed first
+            // transmission, in MCS units. The step applied on NACK is scaled by
+            // (1-OllaTargetBler)/OllaTargetBler, so the offset settles where the measured initial BLER
+            // equals the target. 0 disables OLLA, which reproduces the open-loop behaviour.
             .AddAttribute("OllaStepUp",
-                          "DL outer-loop link adaptation (OLLA) step applied to the MCS offset on "
-                          "each ACKed first transmission, in MCS units. The step applied on NACK "
-                          "is scaled by (1-OllaTargetBler)/OllaTargetBler, so the offset settles "
-                          "where the measured initial BLER equals the target. 0 disables OLLA, "
-                          "which reproduces the open-loop behaviour.",
+                          "DL outer-loop link adaptation: MCS offset step per ACKed first transmission (NACK step scaled by (1-target)/target); 0 = off.",
                           DoubleValue(0.0),
                           MakeDoubleAccessor(&NrMacSchedulerNs3::m_ollaStepUp),
                           MakeDoubleChecker<double>(0.0, 1.0))
@@ -290,39 +409,205 @@ NrMacSchedulerNs3::GetTypeId()
                           DoubleValue(4.0),
                           MakeDoubleAccessor(&NrMacSchedulerNs3::m_ollaMaxOffset),
                           MakeDoubleChecker<double>(0.0, 30.0))
+            // A dynamic downlink block gets whole resource blocks at the MCS of link adaptation and
+            // often holds much less than they carry (a voice frame on 2 RBs at MCS 11: 22 of 49 B).
+            // With DlMcsFill the scheduler then lowers the MCS to the lowest whose block on the
+            // same resource blocks still holds what the UE's queues need: the same resources, a
+            // lower code rate. Such a block is left out of the outer loop (its outcome says nothing
+            // of the MCS the loop steers). OFDMA scheduler; HARQ retransmissions keep their MCS.
+            .AddAttribute("DlMcsFill",
+                          "OFDMA: lower a new downlink block's MCS to the lowest that still holds the UE's queued bytes on its RBs.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&NrMacSchedulerNs3::m_dlMcsFill),
+                          MakeBooleanChecker())
+            // Uplink configured grant: when it is activated anew for a link that changed. Its MCS
+            // and repetitions come with the activation DCI, so every change costs a DCI (and the
+            // UE's confirmation MAC CE). With CgHysteresis the gNB raises K when the SINR has
+            // been CgRaiseDb short of the target for CgRaiseTime (at once if CgUrgentDb short or
+            // after CgFailures failed first transmissions in a row), lowers it when CgLowerDb
+            // were to spare for CgLowerTime, chooses K and MCS for the CgSinrPercentile of the
+            // SINR over CgSinrWindow, and activates no sooner than CgMinInterval after the last
+            // activation unless urgent. A gNB policy: 3GPP leaves when to reactivate open.
+            .AddAttribute("CgHysteresis",
+                          "UL configured grant: activate anew per the Cg* attributes (false: at every change of K or MCS, as before).",
+                          BooleanValue(true),
+                          MakeBooleanAccessor(&NrMacSchedulerNs3::m_cgHysteresis),
+                          MakeBooleanChecker())
+            .AddAttribute("CgRaiseDb",
+                          "CgHysteresis: more repetitions when the SINR is this far (dB) under the target for CgRaiseTime.",
+                          DoubleValue(1.0),
+                          MakeDoubleAccessor(&NrMacSchedulerNs3::m_cgRaiseDb),
+                          MakeDoubleChecker<double>(0.0, 30.0))
+            .AddAttribute("CgRaiseTime",
+                          "CgHysteresis: how long the SINR must be CgRaiseDb short before K goes up.",
+                          TimeValue(MilliSeconds(100)),
+                          MakeTimeAccessor(&NrMacSchedulerNs3::m_cgRaiseTime),
+                          MakeTimeChecker())
+            .AddAttribute("CgUrgentDb",
+                          "CgHysteresis: this far (dB) under the target, K goes up at once, whatever CgMinInterval.",
+                          DoubleValue(3.0),
+                          MakeDoubleAccessor(&NrMacSchedulerNs3::m_cgUrgentDb),
+                          MakeDoubleChecker<double>(0.0, 30.0))
+            .AddAttribute("CgLowerDb",
+                          "CgHysteresis: fewer repetitions when they would leave this much (dB) to spare for CgLowerTime.",
+                          DoubleValue(2.0),
+                          MakeDoubleAccessor(&NrMacSchedulerNs3::m_cgLowerDb),
+                          MakeDoubleChecker<double>(0.0, 30.0))
+            .AddAttribute("CgLowerTime",
+                          "CgHysteresis: how long the spare margin must last before K goes down.",
+                          TimeValue(MilliSeconds(400)),
+                          MakeTimeAccessor(&NrMacSchedulerNs3::m_cgLowerTime),
+                          MakeTimeChecker())
+            .AddAttribute("CgSinrPercentile",
+                          "CgHysteresis: K and MCS of an activation for this percentile of the SINR over CgSinrWindow (0: the last measurement).",
+                          DoubleValue(0.0),
+                          MakeDoubleAccessor(&NrMacSchedulerNs3::m_cgSinrPercentile),
+                          MakeDoubleChecker<double>(0.0, 50.0))
+            .AddAttribute("CgSinrWindow",
+                          "CgHysteresis: the window of SINR samples (one per talk period) for CgSinrPercentile.",
+                          TimeValue(MilliSeconds(500)),
+                          MakeTimeAccessor(&NrMacSchedulerNs3::m_cgSinrWindow),
+                          MakeTimeChecker())
+            .AddAttribute("CgMinInterval",
+                          "CgHysteresis: least time between two activations of a UE's configured grant, unless urgent.",
+                          TimeValue(MilliSeconds(200)),
+                          MakeTimeAccessor(&NrMacSchedulerNs3::m_cgMinInterval),
+                          MakeTimeChecker())
+            .AddAttribute("CgFailures",
+                          "CgHysteresis: this many failed first transmissions of its blocks in a row make it urgent (0: never).",
+                          UintegerValue(2),
+                          MakeUintegerAccessor(&NrMacSchedulerNs3::m_cgFailures),
+                          MakeUintegerChecker<uint32_t>(0, 100))
+            // Uplink outer-loop link adaptation: an MCS offset per UE moved on the outcome of each first
+            // transmission the UE sent (not on grants it missed), with OllaStepUp, OllaTargetBler and
+            // OllaMaxOffset.
             .AddAttribute("UlOlla",
-                          "Uplink outer-loop link adaptation: an MCS offset per UE moved on the "
-                          "outcome of each first transmission the UE sent (not on grants it "
-                          "missed), with OllaStepUp, OllaTargetBler and OllaMaxOffset.",
+                          "Uplink outer-loop link adaptation on the outcome of each first transmission the UE sent (OllaStepUp, OllaTargetBler, OllaMaxOffset).",
                           BooleanValue(false),
                           MakeBooleanAccessor(&NrMacSchedulerNs3::m_ulOlla),
                           MakeBooleanChecker())
+            // Uplink link adaptation: time constant of the average of the SINR reports of a UE. 0 (the
+            // module's behaviour): the MCS and the repetitions follow the SINR of the last reception
+            // alone, fading included. Above 0: each report enters an exponentially weighted mean (weight 1
+            // - exp(-dt / UlSinrAvgTime), in linear units, as the SINR of one resource block), as a CQI
+            // filter would; a few times the coherence time of the channel (70 ms for a pedestrian)
+            // averages the fading out and leaves the margin to the outer loop.
+            .AddAttribute("UlSinrAvgTime",
+                          "Uplink link adaptation: time constant of the exponential average of a UE's SINR reports; 0 = the last report alone.",
+                          TimeValue(Seconds(0)),
+                          MakeTimeAccessor(&NrMacSchedulerNs3::m_ulSinrAvgTime),
+                          MakeTimeChecker())
+            // true: the uplink MCS of a grant is for its resource blocks. The UE spreads its power over
+            // the resource blocks it gets, so the SINR measured on its last transmission is scaled by the
+            // ratio of the resource blocks then and now. false: the MCS of that SINR as it was.
             .AddAttribute("UlMcsPerRbs",
-                          "true: the uplink MCS of a grant is for its resource blocks. The UE "
-                          "spreads its power over the resource blocks it gets, so the SINR "
-                          "measured on its last transmission is scaled by the ratio of the "
-                          "resource blocks then and now. false: the MCS of that SINR as it was.",
+                          "true: the uplink MCS of a grant is for its resource blocks (the measured SINR scaled by the RB ratio); false: as measured.",
                           BooleanValue(false),
                           MakeBooleanAccessor(&NrMacSchedulerNs3::m_ulMcsPerRbs),
                           MakeBooleanChecker())
+            // Transport block size the gNB aims at with the grant it sends for a scheduling request. The
+            // default, 12 bytes and an RLC and a MAC header, holds a buffer status report and little else.
             .AddAttribute("SrGrantBytes",
-                          "Transport block size the gNB aims at with the grant it sends for a "
-                          "scheduling request. The default, 12 bytes and an RLC and a MAC "
-                          "header, holds a buffer status report and little else.",
+                          "Transport block size (bytes) aimed at by the grant that answers a scheduling request.",
                           UintegerValue(12 + 2 + MAC_SUBHEADER_SIZE),
                           MakeUintegerAccessor(&NrMacSchedulerNs3::m_srGrantBytes),
                           MakeUintegerChecker<uint32_t>(12, 10000))
+            // OFDMA: the most resource blocks of an uplink grant (whole RBGs: rounded up to a multiple of
+            // the RBs of an RBG), so that a UE puts its power into that much bandwidth, and the uplink
+            // blocks of a configured grant are that wide. A UE whose uplink has not been measured (no
+            // PUSCH within CqiTimerThreshold) gets one grant without the limit, from which the gNB learns
+            // its SINR (a real gNB has its Msg3 or SRS for that). 0 = no limit. A TDMA scheduler ignores
+            // it.
             .AddAttribute("UlGrantRbs",
-                          "OFDMA: the most resource blocks of an uplink grant (whole RBGs: "
-                          "rounded up to a multiple of the RBs of an RBG), so that a UE puts its "
-                          "power into that much bandwidth, and the uplink blocks of a configured "
-                          "grant are that wide. A UE whose uplink has not been measured (no PUSCH "
-                          "within CqiTimerThreshold) gets one grant without the limit, from which "
-                          "the gNB learns its SINR (a real gNB has its Msg3 or SRS for that). "
-                          "0 = no limit. A TDMA scheduler ignores it.",
+                          "OFDMA: the most resource blocks of an uplink grant (whole RBGs), also the width of configured-grant blocks; 0 = no limit.",
                           UintegerValue(0),
                           MakeUintegerAccessor(&NrMacSchedulerNs3::m_ulGrantRbs),
                           MakeUintegerChecker<uint32_t>())
+            // OFDMA, with UlGrantRbs and UlMcsPerRbs: the resource blocks of a wide uplink grant, which a
+            // UE gets instead of UlGrantRbs when UlWideSinrDb and UlWideLoadPct allow it: a block twice as
+            // wide with half the repetitions (a fixed PuschRepetitions is divided by the widening; with 0
+            // the repetitions follow from the SINR of the wide grant), which sends the bytes in fewer
+            // slots. 0 = off.
+            .AddAttribute("UlWideGrantRbs",
+                          "OFDMA: resource blocks of a wide uplink grant given instead of UlGrantRbs when UlWideSinrDb and UlWideLoadPct allow; 0 = off.",
+                          UintegerValue(0),
+                          MakeUintegerAccessor(&NrMacSchedulerNs3::m_ulWideRbs),
+                          MakeUintegerChecker<uint32_t>())
+            // UlWideGrantRbs: the SINR (dB) the UE must have on ONE resource block, one transmission,
+            // before repetitions, from its last measurement. A wide grant has 10 log10(UlWideGrantRbs /
+            // UlGrantRbs) dB less per RB. Lower: the UE needs repetitions in the wide grant too, and wide
+            // grants cost more resource block slots than they save.
+            .AddAttribute("UlWideSinrDb",
+                          "UlWideGrantRbs: the SINR (dB) a UE needs on one resource block, one transmission, from its last measurement, for a wide grant.",
+                          DoubleValue(5.0),
+                          MakeDoubleAccessor(&NrMacSchedulerNs3::m_ulWideSinrDb),
+                          MakeDoubleChecker<double>(-30.0, 40.0))
+            // UlWideGrantRbs: a UE gets a wide grant only if all the UEs waiting in the slot have a first
+            // resource block and the uplink resource blocks in use in the slot (repetitions and
+            // retransmissions of earlier blocks, grants so far, and this one) are at most this % of the
+            // band.
+            .AddAttribute("UlWideLoadPct",
+                          "UlWideGrantRbs: a wide grant only if every waiting UE has a first RB and the uplink RBs in use in the slot are at most this %.",
+                          DoubleValue(50.0),
+                          MakeDoubleAccessor(&NrMacSchedulerNs3::m_ulWideLoadPct),
+                          MakeDoubleChecker<double>(0.0, 100.0))
+            // PUSCH repetition type A (TS 38.214 6.1.2.1, Rel-17: up to 32): the uplink slots in a row
+            // that carry each uplink block, which the gNB combines before it decodes; a retransmission is
+            // repeated as often. 1 = none. 0 = per UE and grant, from its last measurement: the fewest of
+            // 1, 2, 3, 4, 7, 8, 12, 16, 20, 24, 28, 32 that bring the SINR of the grant's resource blocks,
+            // times them, to PuschRepetitionSinrDb, or more if the block of a slot would be under the
+            // least block the UE sends data in: 15 B, 12 B with NrUeMac::CompactBsr (1 without a
+            // measurement). The MCS is the one the error model decodes after the repetitions. With
+            // UlGrantRbs, the blocks of a configured grant repeat too, as often as TS 38.214 6.1.2.3 has
+            // (the numbers above, not more than the slots of the period; SpsUlLink()). Only these values
+            // are accepted: 0, 1, 2, 3, 4, 7, 8, 12, 16, 20, 24, 28, 32 (TS 38.331
+            // numberOfRepetitionsExt-r17). OFDMA only, with all UEs in one beam.
+            .AddAttribute("PuschRepetitions",
+                          "PUSCH repetition type A (TS 38.214 6.1.2.1): slots in a row per uplink block, 1 = none, 0 = per grant from the SINR (1..32, TS 38.331 numberOfRepetitionsExt-r17).",
+                          UintegerValue(1),
+                          MakeUintegerAccessor(&NrMacSchedulerNs3::SetPuschRepetitions,
+                                               &NrMacSchedulerNs3::GetPuschRepetitions),
+                          MakeUintegerChecker<uint32_t>(0, 32))
+            .AddAttribute("PuschRepetitionSinrDb",
+                          "PuschRepetitions = 0: the SINR (dB) that the repetitions of a block "
+                          "bring the SINR of its resource blocks to",
+                          DoubleValue(2.0),
+                          MakeDoubleAccessor(&NrMacSchedulerNs3::m_puschRepSinrDb),
+                          MakeDoubleChecker<double>(-30.0, 40.0))
+            // PuschRepetitions = 0: the least transport block of one slot (bytes) that the repetitions
+            // have to give the MCS the error model decodes: if the block is smaller, the repetitions go up
+            // (as far as 32) until it is not. 0 = the least block the UE sends data in (15 bytes, 12 with
+            // NrUeMac::CompactBsr). A voice frame needs about 26 (23 with the compact BSR): the PDCP,
+            // ROHC, RTP payload, RLC and MAC headers and the BSR. With smaller blocks a frame goes in two
+            // or three and takes a round of repetitions each.
+            .AddAttribute("PuschMinBlockBytes",
+                          "PuschRepetitions = 0: the least one-slot transport block (bytes) the repetitions must give the MCS; 0 = the least block carrying data.",
+                          UintegerValue(0),
+                          MakeUintegerAccessor(&NrMacSchedulerNs3::m_puschMinBlockBytes),
+                          MakeUintegerChecker<uint32_t>(0, 10000))
+            // PDSCH aggregation (TS 38.214 5.1.2.1): a downlink block goes in K downlink slots in a
+            // row, on the same symbols, with one DCI; the UE combines them and sends its HARQ-ACK
+            // after the last (K1 counts from the last). A fixed K is pdsch-AggregationFactor of
+            // PDSCH-Config (n2, n4, n8, TS 38.331; unchanged up to Rel-19 for unicast); for SPS the
+            // same K is pdsch-AggregationFactor-r16 of SPS-Config. 0 = per grant: K is the
+            // repetitionNumber-r16 of the TDRA row the DCI points at (2..8, 16; TS 38.214 5.1.2.1
+            // with one TCI state), the fewest that bring K times the UE's SINR (the one its
+            // PDCCH is sized with) to PdschAggregationSinrDb; an SPS configuration takes it from
+            // n1..n8 at its activation and keeps it. The MCS stays the one of the CQI: the
+            // repetitions buy reliability, not rate. A retransmission is repeated as often.
+            // Every transmission keeps the redundancy version of the first (TS 38.214 Table
+            // 5.1.2.1-2 cycles 0, 2, 3, 1: not modelled; the error model combines as chase).
+            // OFDMA, all UEs in one beam, HarqRetxInFrequency.
+            .AddAttribute("PdschAggregation",
+                          "PDSCH aggregation (TS 38.214 5.1.2.1): slots per downlink block, 1 = none, 2/4/8 fixed, 0 = per grant from the SINR (Rel-16 repetitionNumber).",
+                          UintegerValue(1),
+                          MakeUintegerAccessor(&NrMacSchedulerNs3::m_pdschAggregation),
+                          MakeUintegerChecker<uint32_t>(0, 8))
+            .AddAttribute("PdschAggregationSinrDb",
+                          "PdschAggregation = 0: K brings K x the UE's downlink SINR to this (dB).",
+                          DoubleValue(2.0),
+                          MakeDoubleAccessor(&NrMacSchedulerNs3::m_pdschAggSinrDb),
+                          MakeDoubleChecker<double>(-30.0, 40.0))
             .AddAttribute(
                 "SchedLcAlgorithmType",
                 "Type of the scheduling algorithm that assigns bytes to the different LCs.",
@@ -476,6 +761,24 @@ void
 NrMacSchedulerNs3::SetRachUlGrantMcs(uint8_t v)
 {
     m_rachUlGrantMcs = v;
+}
+
+void
+NrMacSchedulerNs3::SetPuschRepetitions(uint32_t k)
+{
+    NS_ABORT_MSG_UNLESS(k == 0 || NrMacSchedulerUeInfo::IsPuschRepetitionValue(k),
+                        "PuschRepetitions " << k
+                                            << " is not a number of repetitions of TS 38.331 "
+                                               "(numberOfRepetitionsExt-r17): use 0 (as many as "
+                                               "needed), 1, 2, 3, 4, 7, 8, 12, 16, 20, 24, 28 "
+                                               "or 32");
+    m_puschRepetitions = k;
+}
+
+uint32_t
+NrMacSchedulerNs3::GetPuschRepetitions() const
+{
+    return m_puschRepetitions;
 }
 
 void
@@ -740,6 +1043,16 @@ NrMacSchedulerNs3::DoCschedUeConfigReq(
         UeInfoOf(*itUe)->m_ulAmc = m_ulAmc;
         UeInfoOf(*itUe)->m_mcsCsiSource = m_mcsCsiSource;
         UeInfoOf(*itUe)->m_ulMcsPerRbs = m_ulMcsPerRbs;
+        UeInfoOf(*itUe)->m_puschRepetitions = static_cast<uint8_t>(m_puschRepetitions);
+        UeInfoOf(*itUe)->m_puschRepSinr = std::pow(10.0, m_puschRepSinrDb / 10.0);
+        UeInfoOf(*itUe)->m_puschMinBlock = m_puschMinBlockBytes;
+        UeInfoOf(*itUe)->m_ulWideRbs = GetUlWideRbs();
+        UeInfoOf(*itUe)->m_ulNarrowRbs = std::max(GetUlGrantRbs(), 1U);
+        UeInfoOf(*itUe)->m_ulWideSinr = std::pow(10.0, m_ulWideSinrDb / 10.0);
+        if (PdcchOn())
+        {
+            m_pdcch->AddUe(params.m_rnti); // the DCIs of its RRC messages
+        }
 
         NrMacSchedulerSrs::SrsPeriodicityAndOffset srs = m_schedulerSrs->AddUe();
 
@@ -796,6 +1109,10 @@ NrMacSchedulerNs3::DoCschedUeReleaseReq(
 
     m_dlPdcchLast.erase(params.m_rnti);
     m_ulPdcchLast.erase(params.m_rnti);
+    for (auto it = m_ulMeasuredHarq.begin(); it != m_ulMeasuredHarq.end();)
+    {
+        it = it->first == params.m_rnti ? m_ulMeasuredHarq.erase(it) : std::next(it);
+    }
     m_spsDl.erase(params.m_rnti);
     m_spsUl.erase(params.m_rnti);
     m_spsUlWholeBandMcs.erase(params.m_rnti);
@@ -1231,6 +1548,10 @@ NrMacSchedulerNs3::DoSchedUlCqiInfoReq(
                                                 allocation.m_rbgMask,
                                                 m_macSchedSapUser->GetNumRbPerRbg(),
                                                 m_macSchedSapUser->GetSpectrumModel());
+                if (m_ulSinrAvgTime.IsStrictlyPositive())
+                {
+                    SmoothUlSinr(UeInfoOf(*itUe));
+                }
                 if (m_spsScenario != 0)
                 {
                     // For the blocks of a configured grant (SpsUlMcs()): the MCS the UE would
@@ -1393,18 +1714,384 @@ NrMacSchedulerNs3::UpdateDlOlla(uint16_t rnti, bool ack) const
 }
 
 void
-NrMacSchedulerNs3::UpdateUlOlla(uint16_t rnti, bool ack) const
+NrMacSchedulerNs3::SmoothUlSinr(const std::shared_ptr<NrMacSchedulerUeInfo>& ue) const
+{
+    // The report has just replaced ue->m_ulSinrMeas (UlSBCQIReported()). Its level, as the SINR
+    // of one resource block (the UE's power is spread over the RBs it was given), goes into the
+    // mean; the mean takes the place of the report's level and the report keeps its shape over
+    // the RBs. The MCS and the repetitions are computed from m_ulSinrMeas later, per grant.
+    const auto n = ue->m_ulSinrMeas.size();
+    if (n == 0)
+    {
+        return;
+    }
+    double sum = 0.0;
+    for (const double v : ue->m_ulSinrMeas)
+    {
+        sum += v;
+    }
+    const double oneRb = sum; // mean per RB times the RBs = the sum
+    if (oneRb <= 0.0)
+    {
+        return;
+    }
+    const int64_t now = Simulator::Now().GetNanoSeconds();
+    if (ue->m_ulSinrFilt > 0.0 && ue->m_ulSinrFiltAtNs >= 0)
+    {
+        const double dt = static_cast<double>(now - ue->m_ulSinrFiltAtNs);
+        const double w = 1.0 - std::exp(-dt / static_cast<double>(m_ulSinrAvgTime.GetNanoSeconds()));
+        ue->m_ulSinrFilt = (1.0 - w) * ue->m_ulSinrFilt + w * oneRb;
+    }
+    else
+    {
+        ue->m_ulSinrFilt = oneRb;
+    }
+    ue->m_ulSinrFiltAtNs = now;
+    const double scale = ue->m_ulSinrFilt / oneRb;
+    for (double& v : ue->m_ulSinrMeas)
+    {
+        v *= scale;
+    }
+}
+
+void
+NrMacSchedulerNs3::UpdateUlOlla(uint16_t rnti, bool ack, uint8_t mcs, bool measured) const
 {
     if (!m_ulOlla || m_ollaStepUp <= 0.0)
     {
         return;
     }
     const auto& ue = m_ueMap.find(rnti)->second;
+    if (!measured || (!ack && mcs == 0) || (ack && mcs >= ue->m_ulAmc->GetMaxMcs()))
+    {
+        return;
+    }
     ue->m_ulOllaMax = m_ollaMaxOffset;
     const double stepDown = m_ollaStepUp * (1.0 - m_ollaTargetBler) / m_ollaTargetBler;
     ue->m_ulOlla = std::clamp(ue->m_ulOlla + (ack ? m_ollaStepUp : -stepDown),
                               -m_ollaMaxOffset,
                               m_ollaMaxOffset);
+}
+
+std::set<uint16_t>
+NrMacSchedulerNs3::PlaceUlRepetitions(const PointInFTPlane& start,
+                                      uint8_t numSym,
+                                      SlotAllocInfo* allocInfo)
+{
+    NS_LOG_FUNCTION(this);
+    std::set<uint16_t> ues;
+    // The UEs with a block of a configured grant in this slot have their PUSCH already
+    std::set<uint16_t> busy;
+    for (const auto& alloc : allocInfo->m_varTtiAllocInfo)
+    {
+        const auto& dci = alloc.m_dci;
+        if (dci->m_format == DciInfoElementTdma::UL && dci->m_type == DciInfoElementTdma::DATA &&
+            (dci->m_sps == DciInfoElementTdma::SPS_ACTIVATION ||
+             dci->m_sps == DciInfoElementTdma::SPS_OCCASION))
+        {
+            busy.insert(dci->m_rnti);
+        }
+    }
+    auto& free = m_ulRbgFreeForData;
+    for (auto it = m_ulRepetitions.begin(); it != m_ulRepetitions.end();)
+    {
+        const auto first = it->dci;
+        if (m_ueMap.find(first->m_rnti) == m_ueMap.end())
+        {
+            it = m_ulRepetitions.erase(it); // the UE has gone (a radio link failure)
+            continue;
+        }
+        if (ues.contains(first->m_rnti) || busy.contains(first->m_rnti))
+        {
+            ++it; // one PUSCH per UE and slot: its next block waits
+            continue;
+        }
+        const auto need = static_cast<std::size_t>(
+            std::count(first->m_rbgBitmask.begin(), first->m_rbgBitmask.end(), true));
+        bool same = first->m_rbgBitmask.size() == free.size();
+        for (std::size_t i = 0; same && i < free.size(); ++i)
+        {
+            same = !first->m_rbgBitmask[i] || free[i];
+        }
+        std::vector<bool> mask(free.size(), false);
+        std::size_t got = 0;
+        if (same)
+        {
+            mask = first->m_rbgBitmask;
+            got = need;
+        }
+        else
+        {
+            for (std::size_t i = 0; i < free.size() && got < need; ++i)
+            {
+                if (free[i])
+                {
+                    mask[i] = true;
+                    ++got;
+                }
+            }
+        }
+        if (got < need)
+        {
+            NS_LOG_INFO("No room for repetition " << +it->next << " of UE " << first->m_rnti);
+            ++it;
+            continue;
+        }
+        for (std::size_t i = 0; i < free.size(); ++i)
+        {
+            free[i] = free[i] && !mask[i];
+        }
+        auto dci = std::make_shared<DciInfoElementTdma>(start.m_sym - numSym,
+                                                        numSym,
+                                                        0,
+                                                        first->m_rv,
+                                                        *first);
+        dci->m_rbgBitmask = std::move(mask);
+        dci->m_repIndex = it->next;
+        dci->m_sps = DciInfoElementTdma::PUSCH_REPETITION;
+        dci->m_repFirst = first;
+        if (first->m_sps != DciInfoElementTdma::DYNAMIC)
+        {
+            // A block of a configured grant: if the UE leaves it unused, these go too
+            // (SpsPlanUl())
+            auto sps = m_spsUl.find(first->m_rnti);
+            if (sps != m_spsUl.end())
+            {
+                for (auto& sent : sps->second.blocks)
+                {
+                    if (sent.dci == first)
+                    {
+                        sent.repSfns.push_back(allocInfo->m_sfnSf.GetEncoding());
+                    }
+                }
+            }
+        }
+        NS_LOG_INFO("UE " << first->m_rnti << " repetition " << +it->next << " of "
+                          << +first->m_repetitions << ", HARQ process " << +first->m_harqProcess);
+        allocInfo->m_varTtiAllocInfo.emplace_back(dci);
+        ues.insert(first->m_rnti);
+        if (++it->next >= first->m_repetitions)
+        {
+            it = m_ulRepetitions.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    return ues;
+}
+
+void
+NrMacSchedulerNs3::QueueUlRepetitions(const SlotAllocInfo& allocInfo)
+{
+    for (const auto& alloc : allocInfo.m_varTtiAllocInfo)
+    {
+        const auto& dci = alloc.m_dci;
+        // (a grant with a DCI, or a block of a configured grant)
+        if (dci->m_format == DciInfoElementTdma::UL && dci->m_type == DciInfoElementTdma::DATA &&
+            (dci->m_sps == DciInfoElementTdma::DYNAMIC ||
+             dci->m_sps == DciInfoElementTdma::SPS_ACTIVATION ||
+             dci->m_sps == DciInfoElementTdma::SPS_OCCASION) &&
+            dci->m_repetitions > 1 && dci->m_repIndex == 0)
+        {
+            m_ulRepetitions.push_back({dci, 1});
+        }
+    }
+}
+
+uint8_t
+NrMacSchedulerNs3::DlAggregationFor(const DciInfoElementTdma& dci, bool sps) const
+{
+    const uint16_t rnti = dci.m_rnti;
+    if (m_pdschAggregation != 0)
+    {
+        NS_ABORT_MSG_UNLESS(m_pdschAggregation == 1 || m_pdschAggregation == 2 ||
+                                m_pdschAggregation == 4 || m_pdschAggregation == 8,
+                            "PdschAggregation " << m_pdschAggregation
+                                                << " is not 0, 1, 2, 4 or 8 (pdsch-AggregationFactor)");
+        return static_cast<uint8_t>(m_pdschAggregation);
+    }
+    NS_ABORT_MSG_UNLESS(m_pdcch && m_pdcch->IsEnabled(), "PdschAggregation = 0 needs the PDCCH model (NrPdcch)");
+    // Power first, as for PUSCH (a UE repeats only at full power): the L1-SINR the UE reports
+    // (control symbols, at the RB share) plus what the gNB can give the block's RBs over their
+    // share (the idle RBs' power, MaxRbBoostDb, the PFD limit and the closed loop's cap of the UE:
+    // NrGnbPhy::GetDataBoostDb). K covers what is left.
+    double sinrDb = m_pdcch->GetSinr(rnti);
+    if (std::isnan(sinrDb))
+    {
+        return 1; // no report yet
+    }
+    if (const NrGnbPhy* phy = NrGnbPhy::FindByCell(GetCellId()))
+    {
+        const auto rbgs = static_cast<uint32_t>(
+            std::count(dci.m_rbgBitmask.begin(), dci.m_rbgBitmask.end(), true));
+        sinrDb += phy->GetDataBoostDb(rnti, rbgs * GetNumRbPerRbg());
+    }
+    // repetitionNumber-r16 (dynamic), pdsch-AggregationFactor-r16 (SPS)
+    static const std::vector<uint8_t> dynamicValues{1, 2, 3, 4, 5, 6, 7, 8, 16};
+    static const std::vector<uint8_t> spsValues{1, 2, 4, 8};
+    const auto& values = sps ? spsValues : dynamicValues;
+    for (const uint8_t k : values)
+    {
+        if (sinrDb + 10.0 * std::log10(k) >= m_pdschAggSinrDb)
+        {
+            return k;
+        }
+    }
+    return values.back();
+}
+
+std::set<uint16_t>
+NrMacSchedulerNs3::DlRepeatingUes() const
+{
+    std::set<uint16_t> ues;
+    for (const auto& rep : m_dlRepetitions)
+    {
+        ues.insert(rep.dci->m_rnti);
+    }
+    return ues;
+}
+
+std::set<uint16_t>
+NrMacSchedulerNs3::PlaceDlRepetitions(const PointInFTPlane& start,
+                                      uint8_t numSym,
+                                      SlotAllocInfo* allocInfo)
+{
+    NS_LOG_FUNCTION(this);
+    std::set<uint16_t> ues;
+    // The UEs with a block of an SPS configuration in this slot have their PDSCH already
+    std::set<uint16_t> busy;
+    for (const auto& alloc : allocInfo->m_varTtiAllocInfo)
+    {
+        const auto& dci = alloc.m_dci;
+        if (dci->m_format == DciInfoElementTdma::DL && dci->m_type == DciInfoElementTdma::DATA)
+        {
+            busy.insert(dci->m_rnti);
+        }
+    }
+    auto& free = m_dlRbgFreeForData;
+    for (auto it = m_dlRepetitions.begin(); it != m_dlRepetitions.end();)
+    {
+        const auto first = it->dci;
+        const auto ue = m_ueMap.find(first->m_rnti);
+        // The process must still hold the block: one reclaimed (ResetExpiredHARQ) and reused
+        // would have the gNB MAC send another block under this one's DCI
+        if (ue == m_ueMap.end() || !ue->second->m_dlHarq.Exist(first->m_harqProcess) ||
+            ue->second->m_dlHarq.Get(first->m_harqProcess).m_dciElement != first)
+        {
+            NS_LOG_INFO("PDSCH repetition of RNTI " << first->m_rnti << " process "
+                                                    << +first->m_harqProcess << " dropped");
+            it = m_dlRepetitions.erase(it);
+            continue;
+        }
+        if (ues.contains(first->m_rnti) || busy.contains(first->m_rnti))
+        {
+            ++it; // one PDSCH per UE and slot: its next block waits
+            continue;
+        }
+        // As many RBGs over numSym symbols as keep the resource elements of the first
+        const auto rbgsFirst = static_cast<uint32_t>(
+            std::count(first->m_rbgBitmask.begin(), first->m_rbgBitmask.end(), true));
+        const uint32_t units = rbgsFirst * first->m_numSym;
+        const uint32_t need = numSym > 0 ? (units + numSym - 1) / numSym : UINT32_MAX;
+        std::vector<bool> mask(free.size(), false);
+        uint32_t got = 0;
+        for (std::size_t i = 0; i < free.size() && got < need; ++i)
+        {
+            if (i < first->m_rbgBitmask.size() && first->m_rbgBitmask[i] && free[i])
+            {
+                mask[i] = true;
+                ++got;
+            }
+        }
+        for (std::size_t i = 0; i < free.size() && got < need; ++i)
+        {
+            if (!mask[i] && free[i])
+            {
+                mask[i] = true;
+                ++got;
+            }
+        }
+        if (got < need || units == 0)
+        {
+            NS_LOG_INFO("No room for PDSCH repetition " << +it->next << " of UE " << first->m_rnti);
+            ++it;
+            continue;
+        }
+        for (std::size_t i = 0; i < free.size(); ++i)
+        {
+            free[i] = free[i] && !mask[i];
+        }
+        auto dci =
+            std::make_shared<DciInfoElementTdma>(start.m_sym, numSym, 0, first->m_rv, *first);
+        dci->m_rbgBitmask = std::move(mask);
+        dci->m_repIndex = it->next;
+        dci->m_sps = DciInfoElementTdma::PDSCH_REPETITION;
+        dci->m_repFirst = first;
+        // The process waits for its feedback from the last transmission, wherever it lands: a
+        // repetition that waited for room moves that later (ResetExpiredHARQ counts from
+        // m_txSlot + K - 1)
+        {
+            auto& process = ue->second->m_dlHarq.Get(first->m_harqProcess);
+            const uint64_t now = allocInfo->m_sfnSf.Normalize();
+            if (now >= it->next && process.m_txSlot < now - it->next)
+            {
+                process.m_txSlot = now - it->next;
+            }
+        }
+        NS_LOG_INFO("UE " << first->m_rnti << " PDSCH repetition " << +it->next << " of "
+                          << +first->m_repetitions << ", HARQ process " << +first->m_harqProcess);
+        allocInfo->m_varTtiAllocInfo.emplace_back(dci);
+        ues.insert(first->m_rnti);
+        if (++it->next >= first->m_repetitions)
+        {
+            it = m_dlRepetitions.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    return ues;
+}
+
+void
+NrMacSchedulerNs3::QueueDlRepetitions(const SlotAllocInfo& allocInfo)
+{
+    for (const auto& alloc : allocInfo.m_varTtiAllocInfo)
+    {
+        const auto& dci = alloc.m_dci;
+        if (dci->m_format != DciInfoElementTdma::DL || dci->m_type != DciInfoElementTdma::DATA ||
+            dci->m_repIndex != 0 ||
+            (dci->m_sps != DciInfoElementTdma::DYNAMIC &&
+             dci->m_sps != DciInfoElementTdma::SPS_ACTIVATION &&
+             dci->m_sps != DciInfoElementTdma::SPS_OCCASION))
+        {
+            continue;
+        }
+        if (dci->m_ndi == 1)
+        {
+            // a new block: its K (a retransmission has the K of its block, NrMacSchedulerHarqRr)
+            if (dci->m_sps == DciInfoElementTdma::DYNAMIC)
+            {
+                dci->m_repetitions = DlAggregationFor(*dci, false);
+            }
+            else
+            {
+                if (dci->m_sps == DciInfoElementTdma::SPS_ACTIVATION)
+                {
+                    m_dlSpsAggregation[dci->m_rnti] = DlAggregationFor(*dci, true);
+                }
+                const auto k = m_dlSpsAggregation.find(dci->m_rnti);
+                dci->m_repetitions = k != m_dlSpsAggregation.end() ? k->second : 1;
+            }
+        }
+        if (dci->m_repetitions > 1)
+        {
+            m_dlRepetitions.push_back({dci, 1});
+        }
+    }
 }
 
 bool
@@ -1468,20 +2155,56 @@ NrMacSchedulerNs3::ProcessHARQFeedbacks(
         // vendors target is the *initial* BLER, before HARQ recovers anything. Sampled before
         // the ACK branch below erases the process.
         // A NACK whose retransmission found no room comes through here again in every slot
-        // until it is placed, its process then in RECEIVED_FEEDBACK: it counts once.
+        // until it is placed (the retransmission scheduler puts the process back in
+        // WAITING_FEEDBACK before it knows whether the block fits): m_ollaCounted makes it
+        // count once (before 1 Nov 2026 it counted in every slot it waited).
         // A block whose DCI the UE missed was not received (downlink) or never sent (uplink):
         // that is no outcome of the MCS, and a gNB tells it apart (no HARQ-ACK, no PUSCH).
+        // A downlink block sent K times (PdschAggregation) is decoded after K combined: its
+        // outcome says nothing of the MCS of one transmission, which the loop steers.
+        // A downlink block whose MCS was lowered to fill its RBs (DlMcsFill) neither: it was
+        // sent at a lower MCS than the loop's.
         if (ueProcess.m_dciElement->m_rv == 0 &&
             ueProcess.m_status == HarqProcess::WAITING_FEEDBACK &&
-            !ueProcess.m_dciElement->m_pdcchMissed)
+            !ueProcess.m_dciElement->m_pdcchMissed && !ueProcess.m_ollaCounted &&
+            (direction != "DL" || (ueProcess.m_dciElement->m_repetitions <= 1 &&
+                                   ueProcess.m_dciElement->m_mcsPlanned == 255)))
         {
+            ueProcess.m_ollaCounted = true;
+            if (direction == "UL" && ueProcess.m_dciElement->m_sps != DciInfoElementTdma::DYNAMIC)
+            {
+                // a configured-grant block: its first transmissions failed in a row (CgFailures)
+                const auto cg = m_spsUl.find(rnti);
+                if (cg != m_spsUl.end())
+                {
+                    cg->second.failRun = harqFeedbackIt->IsReceivedOk()
+                                             ? 0
+                                             : static_cast<uint8_t>(std::min<uint32_t>(
+                                                   cg->second.failRun + 1U, 255U));
+                }
+            }
+            if (direction == "DL" && ueProcess.m_dciElement->m_sps != DciInfoElementTdma::DYNAMIC)
+            {
+                // a block of a DL SPS configuration: first transmissions failed in a row
+                const auto sps = m_spsDl.find(rnti);
+                if (sps != m_spsDl.end())
+                {
+                    sps->second.failRun = harqFeedbackIt->IsReceivedOk()
+                                              ? 0
+                                              : static_cast<uint8_t>(std::min<uint32_t>(
+                                                    sps->second.failRun + 1U, 255U));
+                }
+            }
             if (direction == "DL")
             {
                 UpdateDlOlla(rnti, harqFeedbackIt->IsReceivedOk());
             }
             else
             {
-                UpdateUlOlla(rnti, harqFeedbackIt->IsReceivedOk());
+                UpdateUlOlla(rnti,
+                             harqFeedbackIt->IsReceivedOk(),
+                             ueProcess.m_dciElement->m_mcs,
+                             m_ulMeasuredHarq.count({rnti, harqId}) > 0);
             }
         }
         if (m_spsScenario != 0)
@@ -1494,9 +2217,23 @@ NrMacSchedulerNs3::ProcessHARQFeedbacks(
                             ueProcess.m_dciElement->m_rv == maxHarqReTx);
         }
 
+        if (direction == "UL")
+        if (m_diagUlHarq)
+        {
+            std::ostringstream o;
+            o << "phf rnti " << rnti << " p" << +harqId << " "
+              << (harqFeedbackIt->IsReceivedOk() ? "ACK" : "NACK") << " numRetx "
+              << +harqFeedbackIt->m_numRetx << " dci rv " << +ueProcess.m_dciElement->m_rv
+              << " reps " << +ueProcess.m_dciElement->m_repetitions << " status "
+              << +ueProcess.m_status << " timer " << ueProcess.m_timer << " -> "
+              << ((harqFeedbackIt->IsReceivedOk() || ueProcess.m_dciElement->m_rv == maxHarqReTx)
+                      ? "erase"
+                      : "retx pending");
+            DiagLog(o.str());
+        }
         if (harqFeedbackIt->IsReceivedOk() || ueProcess.m_dciElement->m_rv == maxHarqReTx)
         {
-            ueHarqVector.Erase(harqId);
+            ueHarqVector.Erase(harqId, direction == "DL" ? "ProcessHARQFeedbacks DL (ACK or last rv)" : "ProcessHARQFeedbacks UL (ACK or last rv)");
             harqFeedbackIt = harqInfo->erase(harqFeedbackIt);
             NS_LOG_INFO("Erased processID " << static_cast<uint32_t>(harqId) << " of UE " << rnti
                                             << " direction " << direction);
@@ -1534,6 +2271,8 @@ NrMacSchedulerNs3::ResetExpiredHARQ(uint16_t rnti, NrMacHarqVector* harq)
     // K_offset is the scheduled part of the NTN wait and is always known; the timeout attribute
     // (or the process count when it is 0) stays the wait beyond it.
     const uint32_t koffsetSlots = m_macSchedSapUser->GetCellSpecificKoffsetSlots();
+    const uint64_t nowSlot = static_cast<uint64_t>(
+        Simulator::Now().GetNanoSeconds() / m_macSchedSapUser->GetSlotPeriod().GetNanoSeconds());
     for (auto harqIt = harq->Begin(); harqIt != harq->End(); ++harqIt)
     {
         HarqProcess& process = harqIt->second;
@@ -1552,15 +2291,55 @@ NrMacSchedulerNs3::ResetExpiredHARQ(uint16_t rnti, NrMacHarqVector* harq)
         {
             continue;
         }
+        // PDSCH aggregation: a block whose transmissions are not all sent yet (they wait for
+        // room) has no feedback to wait for; the clock starts at its last (PlaceDlRepetitions())
+        if (!m_dlRepetitions.empty() && process.m_dciElement &&
+            std::any_of(m_dlRepetitions.begin(),
+                        m_dlRepetitions.end(),
+                        [&process](const UlRepetition& r) { return r.dci == process.m_dciElement; }))
+        {
+            continue;
+        }
 
         // A process is normally released by feedback. This timer only reclaims one whose
         // feedback never came back; tying it to the process count instead conflates "how many
         // blocks may be outstanding" with "how long to wait", so a window shorter than the loop
         // delay discards every outcome instead of stalling the UE. See HarqProcessTimeout.
-        const uint32_t harqLifetime = (m_harqProcessTimeout > 0
-                                           ? m_harqProcessTimeout
-                                           : m_macSchedSapUser->GetNumHarqProcess()) +
-                                      koffsetSlots;
+        // (PUSCH repetition: the feedback comes after the last transmission of the block)
+        const uint32_t harqLifetime =
+            (m_harqProcessTimeout > 0 ? m_harqProcessTimeout
+                                      : m_macSchedSapUser->GetNumHarqProcess()) +
+            koffsetSlots +
+            (process.m_dciElement ? 2U * (process.m_dciElement->m_repetitions - 1U) : 0U);
+
+        // The block is received in its slot (a configured grant's is scheduled a period ahead,
+        // every uplink one K_offset ahead) and its repetitions, and the feedback follows: the
+        // wait counts from the last repetition, not from the scheduling, or the process is
+        // reclaimed while its feedback is in flight and the next block on the same id gets it
+        if (process.m_txSlot > 0)
+        {
+            const uint64_t reps = process.m_dciElement ? process.m_dciElement->m_repetitions : 1U;
+            const uint64_t lastSlot = process.m_txSlot + (reps > 0 ? reps - 1 : 0);
+            const uint64_t wait = (m_harqProcessTimeout > 0 ? m_harqProcessTimeout
+                                                            : m_macSchedSapUser->GetNumHarqProcess()) +
+                                  koffsetSlots;
+            ++process.m_timer;
+            if (nowSlot <= lastSlot + wait)
+            {
+                continue;
+            }
+            if (m_diagUlHarq)
+            {
+                std::ostringstream o;
+                o << "expire rnti " << rnti << " p" << +processId << " txSlot " << process.m_txSlot
+                  << " reps " << reps << " now " << nowSlot << " status " << +process.m_status
+                  << (process.m_dciElement ? " rv " + std::to_string(process.m_dciElement->m_rv)
+                                           : std::string());
+                DiagLog(o.str());
+            }
+            harq->Erase(processId, "ResetExpiredHARQ (no feedback after the transmission)");
+            continue;
+        }
 
         if (process.m_timer < harqLifetime)
         {
@@ -1571,7 +2350,17 @@ NrMacSchedulerNs3::ResetExpiredHARQ(uint16_t rnti, NrMacHarqVector* harq)
         }
         else
         {
-            harq->Erase(processId);
+            if (m_diagUlHarq)
+            {
+                std::ostringstream o;
+                o << "expire rnti " << rnti << " p" << +processId << " timer " << process.m_timer
+                  << " lifetime " << harqLifetime << " status " << +process.m_status
+                  << (process.m_dciElement
+                          ? " rv " + std::to_string(process.m_dciElement->m_rv)
+                          : std::string());
+                DiagLog(o.str());
+            }
+            harq->Erase(processId, "ResetExpiredHARQ (timer)");
             NS_LOG_INFO("Erased process for UE " << rnti << " number "
                                                  << static_cast<uint32_t>(processId)
                                                  << " for time limits");
@@ -1723,6 +2512,7 @@ NrMacSchedulerNs3::ComputeActiveHarq(ActiveHarqMap* activeUlHarq,
     for (const auto& feedback : ulHarqFeedback)
     {
         uint16_t rnti = feedback.m_rnti;
+        // (DiagCheckUlFeedback() has dropped what has no pending process)
         auto& schedInfo = m_ueMap.find(rnti)->second;
         auto beamIterator = activeUlHarq->find(schedInfo->m_beamId);
 
@@ -1966,6 +2756,7 @@ NrMacSchedulerNs3::DoScheduleDlData(PointInFTPlane* spoint,
                               << static_cast<uint32_t>(m_macSchedSapUser->GetSymbolsPerSlot()));
 
             HarqProcess harqProcess(true, HarqProcess::WAITING_FEEDBACK, 0, dci);
+            harqProcess.m_txSlot = slotAlloc->m_sfnSf.Normalize();
             uint8_t id;
 
             if (!ue.first->m_dlHarq.CanInsert())
@@ -2019,7 +2810,7 @@ NrMacSchedulerNs3::DoScheduleDlData(PointInFTPlane* spoint,
                 uint8_t lcId = byteDistribution.m_lcId;
                 uint8_t lcgId = byteDistribution.m_lcg;
                 // Consider the subPdu overhead
-                uint32_t bytes = byteDistribution.m_bytes - MAC_SUBHEADER_SIZE;
+                uint32_t bytes = MacSduIn(byteDistribution.m_bytes);
 
                 RlcPduInfo newRlcPdu(lcId, bytes);
                 HarqProcess& process = ue.first->m_dlHarq.Get(dci->m_harqProcess);
@@ -2046,7 +2837,7 @@ NrMacSchedulerNs3::DoScheduleDlData(PointInFTPlane* spoint,
             // will ignore. Reliability then has to come from RLC AM above.
             if (m_dlHarqFeedbackDisabled)
             {
-                ue.first->m_dlHarq.Erase(id);
+                ue.first->m_dlHarq.Erase(id, "DoScheduleDlData (feedback disabled)");
             }
         }
         if (assigned)
@@ -2191,6 +2982,15 @@ NrMacSchedulerNs3::DoScheduleUlData(PointInFTPlane* spoint,
 
             // The request has been answered by this grant.
             ue.first->m_srBytesPending = 0;
+            if (ue.first->m_srConfirmAhead > 0)
+            {
+                // CgBlockPacketOnly: the configuration is activated with a DCI sent before this
+                // grant's PUSCH, which carries its confirmation (TS 38.321 5.8.2)
+                dci->m_cgConfirmBytes = ue.first->m_srConfirmAhead;
+                dci->m_cgConfirmAhead = true;
+                dci->m_cgSerial = ue.first->m_srConfirmAheadSerial;
+                ue.first->m_srConfirmAhead = 0;
+            }
 
             assigned = true;
 
@@ -2207,10 +3007,27 @@ NrMacSchedulerNs3::DoScheduleUlData(PointInFTPlane* spoint,
             }
 
             HarqProcess harqProcess(true, HarqProcess::WAITING_FEEDBACK, 0, dci);
+            harqProcess.m_txSlot = slotAlloc->m_sfnSf.Normalize();
             uint8_t id;
             ue.first->m_ulHarq.Insert(&id, harqProcess);
 
             ue.first->m_ulHarq.Get(id).m_dciElement->m_harqProcess = id;
+            if (m_diagUlHarq)
+            {
+                std::ostringstream o;
+                o << "new block rnti " << ue.first->m_rnti << " p" << +id << " reps "
+                  << +dci->m_repetitions << " rbgs "
+                  << std::count(dci->m_rbgBitmask.begin(), dci->m_rbgBitmask.end(), true);
+                DiagLog(o.str());
+            }
+            if (ue.first->m_ulSinrMeas.empty())
+            {
+                m_ulMeasuredHarq.erase({ue.first->m_rnti, id});
+            }
+            else
+            {
+                m_ulMeasuredHarq.insert({ue.first->m_rnti, id});
+            }
 
             VarTtiAllocInfo slotInfo(dci);
 
@@ -2303,7 +3120,8 @@ NrMacSchedulerNs3::DoScheduleUlSr(PointInFTPlane* spoint, const std::list<uint16
         }
         NS_LOG_DEBUG("Owing a " << srGrantSize << " byte bootstrap grant to UE " << v
                                 << " because of a SR");
-        ueIt->second->m_srBytesPending = srGrantSize;
+        ueIt->second->m_srBytesPending = m_srGrantLearned ? LearnedSrGrant(v) : srGrantSize;
+        NS_LOG_LOGIC("SR RNTI " << v << " grant " << ueIt->second->m_srBytesPending << " B");
     }
 }
 
@@ -2368,7 +3186,7 @@ NrMacSchedulerNs3::ScheduleDl(const NrMacSchedSapProvider::SchedDlTriggerReqPara
     auto& ulAllocations = ulAllocationIt->second;
 
     const bool pdcchOn = PdcchOn();
-    const bool spsOn = pdcchOn && m_spsScenario != 0;
+    const bool spsOn = pdcchOn && m_spsScenario != 0 && m_spsDlOn;
     m_dlSpsSymsSlot = 0;
     if (spsOn)
     {
@@ -2377,15 +3195,60 @@ NrMacSchedulerNs3::ScheduleDl(const NrMacSchedSapProvider::SchedDlTriggerReqPara
         SpsPlanDl(params.m_snfSf.Normalize());
     }
 
+    // One PDSCH per UE and slot (the UE receives one transport block in a slot): a UE whose
+    // block has a transmission still to come (PDSCH aggregation, PlaceDlRepetitions()), or that
+    // has a block of its SPS configuration in this slot, gets no other PDSCH and no DCI; its
+    // retransmissions due wait for the next slot. (Before 2 Nov 2026 an SPS block and a HARQ
+    // retransmission could go to one UE in one slot: the UE took one of them, the other block
+    // was lost, about 3 % of the downlink voice with --scheduling=sps1. The uplink already had
+    // this rule for configured grants.)
+    std::vector<DlHarqInfo> feedback = dlHarqFeedback;
+    std::set<uint16_t> repeating = DlRepeatingUes();
+    if (spsOn)
+    {
+        for (const auto& block : m_spsBlocksSlot)
+        {
+            repeating.insert(block.rnti);
+        }
+    }
+    if (!repeating.empty())
+    {
+        std::erase_if(feedback, [&](const DlHarqInfo& f) {
+            const auto ue = m_ueMap.find(f.m_rnti);
+            if (!repeating.contains(f.m_rnti) || ue == m_ueMap.end() ||
+                !ue->second->m_dlHarq.Exist(f.m_harqProcessId) ||
+                ue->second->m_dlHarq.Get(f.m_harqProcessId).m_status !=
+                    HarqProcess::RECEIVED_FEEDBACK)
+            {
+                return false;
+            }
+            auto& process = ue->second->m_dlHarq.Find(f.m_harqProcessId)->second;
+            process.m_status = HarqProcess::WAITING_FEEDBACK;
+            process.m_timer = 0;
+            m_dlHarqToRetransmit.push_back(f);
+            return true;
+        });
+    }
+
     // compute active ue in the current subframe, group them by BeamId
     ActiveHarqMap activeDlHarq;
-    ComputeActiveHarq(&activeDlHarq, dlHarqFeedback);
+    ComputeActiveHarq(&activeDlHarq, feedback);
 
     ActiveUeMap activeDlUe;
     ComputeActiveUe(&activeDlUe,
                     &NrMacSchedulerUeInfo::GetDlLCG,
                     &NrMacSchedulerUeInfo::GetDlHarqVector,
                     "DL");
+    if (!repeating.empty())
+    {
+        for (auto it = activeDlUe.begin(); it != activeDlUe.end();)
+        {
+            std::erase_if(it->second, [&repeating](const UePtrAndBufferReq& ue) {
+                return repeating.contains(ue.first->m_rnti);
+            });
+            it = it->second.empty() ? activeDlUe.erase(it) : std::next(it);
+        }
+    }
 
     // With the PDCCH model on, the PDCCH comes first: a UE needs a candidate with free CCEs
     // to be scheduled, and the DCIs of the slot say how many symbols the PDCCH takes
@@ -2438,12 +3301,16 @@ NrMacSchedulerNs3::ScheduleDl(const NrMacSchedSapProvider::SchedDlTriggerReqPara
                                       &dlSlot.m_slotAllocInfo);
     }
 
-    DoScheduleDl(dlHarqFeedback,
+    DoScheduleDl(feedback,
                  activeDlHarq,
                  &activeDlUe,
                  params.m_snfSf,
                  ulAllocations,
                  &dlSlot.m_slotAllocInfo);
+    if (m_pdschAggregation != 1 || !m_dlRepetitions.empty())
+    {
+        QueueDlRepetitions(dlSlot.m_slotAllocInfo);
+    }
 
     if (spsOn)
     {
@@ -2620,7 +3487,7 @@ NrMacSchedulerNs3::DoScheduleUl(const std::vector<UlHarqInfo>& ulHarqFeedback,
     ++m_pdcchRound;
 
     const bool pdcchOn = PdcchOn();
-    const bool spsOn = pdcchOn && m_spsScenario != 0;
+    const bool spsOn = pdcchOn && m_spsScenario != 0 && m_spsUlOn;
     uint8_t dataSymPerSlot = m_macSchedSapUser->GetSymbolsPerSlot() - m_ulCtrlSymbols;
     if (type == LteNrTddSlotType::F)
     { // if it's a type F, we have to consider DL CTRL symbols, otherwise, don't
@@ -2729,7 +3596,27 @@ NrMacSchedulerNs3::DoScheduleUl(const std::vector<UlHarqInfo>& ulHarqFeedback,
                         &NrMacSchedulerUeInfo::GetUlLCG,
                         &NrMacSchedulerUeInfo::GetUlHarqVector,
                         "UL");
-        AdmitUlToPdcch(ulHarqFeedback, wanting, GetMaxUesPerSlot(ulSymAvail));
+        // A UE that sends a repetition of a block in this slot (PlaceUlRepetitions()) needs no
+        // DCI here: it can have no other PUSCH in the slot
+        std::vector<UlHarqInfo> admittable = ulHarqFeedback;
+        if (!m_ulRepetitions.empty())
+        {
+            std::set<uint16_t> repeating;
+            for (const auto& rep : m_ulRepetitions)
+            {
+                repeating.insert(rep.dci->m_rnti);
+            }
+            std::erase_if(admittable, [&repeating](const UlHarqInfo& f) {
+                return repeating.contains(f.m_rnti);
+            });
+            for (auto& [beam, ues] : wanting)
+            {
+                std::erase_if(ues, [&repeating](const UePtrAndBufferReq& ue) {
+                    return repeating.contains(ue.first->m_rnti);
+                });
+            }
+        }
+        AdmitUlToPdcch(admittable, wanting, GetMaxUesPerSlot(ulSymAvail));
         if (spsOn)
         {
             // The blocks take the last symbols that are free, before anything else is placed
@@ -2784,6 +3671,23 @@ NrMacSchedulerNs3::DoScheduleUl(const std::vector<UlHarqInfo>& ulHarqFeedback,
         m_ulRbgFreeForData = spsFreeRbgs;
         retxRegion = ulSymAvail;
     }
+    // PUSCH repetition: the further transmissions of earlier blocks come first, in the same
+    // region as the retransmissions
+    std::set<uint16_t> repUes;
+    if (!m_ulRepetitions.empty() && ulSymAvail > 0)
+    {
+        NS_ABORT_MSG_UNLESS(UseHarqInFrequency(),
+                            "PuschRepetitions needs an OFDMA scheduler and one beam");
+        if (m_ulRbgFreeForData.empty())
+        {
+            m_ulRbgFreeForData = GetUlBitmask();
+        }
+        repUes = PlaceUlRepetitions(ulAssignationStartPoint, ulSymAvail, allocInfo);
+        if (!repUes.empty())
+        {
+            retxRegion = ulSymAvail;
+        }
+    }
     if (!activeUlHarq.empty() && UseHarqInFrequency())
     {
         if (m_ulRbgFreeForData.empty())
@@ -2795,7 +3699,7 @@ NrMacSchedulerNs3::DoScheduleUl(const std::vector<UlHarqInfo>& ulHarqFeedback,
         std::vector<UlHarqInfo> feedback;
         for (const auto& f : ulHarqFeedback)
         {
-            if (!spsUes.contains(f.m_rnti))
+            if (!spsUes.contains(f.m_rnti) && !repUes.contains(f.m_rnti))
             {
                 feedback.push_back(f);
                 continue;
@@ -2804,7 +3708,14 @@ NrMacSchedulerNs3::DoScheduleUl(const std::vector<UlHarqInfo>& ulHarqFeedback,
             process.m_status = HarqProcess::WAITING_FEEDBACK;
             process.m_timer = 0;
             m_ulHarqToRetransmit.push_back(f);
+            if (m_diagUlHarq)
+            {
+                std::ostringstream o;
+                o << "requeue(cg/rep UE) " << f;
+                DiagLog(o.str());
+            }
         }
+        const std::size_t bufferedBefore = m_ulHarqToRetransmit.size();
         if (ulSymAvail > 0 && m_schedHarq->ScheduleUlHarqInFrequency(ulAssignationStartPoint,
                                                                      ulSymAvail,
                                                                      m_ueMap,
@@ -2817,13 +3728,42 @@ NrMacSchedulerNs3::DoScheduleUl(const std::vector<UlHarqInfo>& ulHarqFeedback,
         }
         else if (ulSymAvail == 0)
         {
-            // No data symbol in this slot: every retransmission waits for the next one
-            for (const auto& f : ulHarqFeedback)
+            // No data symbol in this slot: every retransmission waits for the next one. Those of
+            // the UEs with a configured grant or a repetition are in m_ulHarqToRetransmit
+            // already (above): only the rest, or a process would be queued twice and
+            // retransmitted twice
+            for (const auto& f : feedback)
             {
                 auto& process = m_ueMap.at(f.m_rnti)->m_ulHarq.Find(f.m_harqProcessId)->second;
                 process.m_status = HarqProcess::WAITING_FEEDBACK;
                 process.m_timer = 0;
                 m_ulHarqToRetransmit.push_back(f);
+                if (m_diagUlHarq)
+                {
+                    std::ostringstream o;
+                    o << "requeue(no symbols) " << f;
+                    DiagLog(o.str());
+                }
+            }
+        }
+        for (std::size_t i = bufferedBefore; i < m_ulHarqToRetransmit.size(); ++i)
+        if (m_diagUlHarq)
+        {
+            std::ostringstream o;
+            o << "requeue(no room/one already) " << m_ulHarqToRetransmit[i];
+            DiagLog(o.str());
+        }
+        for (const auto& alloc : allocInfo->m_varTtiAllocInfo)
+        {
+            const auto& dci = alloc.m_dci;
+            if (dci->m_format == DciInfoElementTdma::UL && dci->m_type == DciInfoElementTdma::DATA &&
+                dci->m_rv > 0)
+            if (m_diagUlHarq)
+            {
+                std::ostringstream o;
+                o << "placed retx rnti " << dci->m_rnti << " p" << +dci->m_harqProcess << " rv "
+                  << +dci->m_rv << " reps " << +dci->m_repetitions << " for " << ulSfn;
+                DiagLog(o.str());
             }
         }
     }
@@ -2920,6 +3860,7 @@ NrMacSchedulerNs3::DoScheduleUl(const std::vector<UlHarqInfo>& ulHarqFeedback,
         }
     }
     m_ulRbgFreeForData.clear();
+    QueueUlRepetitions(*allocInfo);
 
     if (pdcchOn)
     {
@@ -3068,8 +4009,14 @@ NrMacSchedulerNs3::DoScheduleSrs(PointInFTPlane* spoint, SlotAllocInfo* allocInf
 namespace
 {
 
-/// Bytes NrUeMac keeps of every uplink transport block for its buffer status report
-const uint32_t g_ulBsrBytes = 5;
+/// Bytes NrUeMac keeps of every uplink transport block for its buffer status report: 5, or 2
+/// with NrUeMac::CompactBsr (it was a fixed 5 here, so a configured grant sized for a packet
+/// was 3 bytes too large for a UE with the short BSR)
+uint32_t
+UlBsrBytes()
+{
+    return NrMacShortBsrCe::OverheadBytes();
+}
 
 /// The bearer with a 5QI among the logical channels of a UE, null if it has none
 NrMacSchedulerLC*
@@ -3332,7 +4279,23 @@ NrMacSchedulerNs3::SettlePdcch(SlotAllocInfo* allocInfo, bool isDl)
         {
             // The DCI for what a block of a configured grant left: one is enough
             const auto sps = m_spsUl.find(dci->m_rnti);
-            if (sps != m_spsUl.end() && sps->second.dynamicUntilDrained)
+            uint8_t backlogLcg;
+            uint8_t backlogLc;
+            NrMacSchedulerLC* backlog =
+                sps != m_spsUl.end() && sps->second.dynamicUntilDrained && m_cgBlockPacketOnly
+                    ? FindLcOfFiveQi(m_ueMap.at(dci->m_rnti)->m_ulLCG,
+                                     m_spsFiveQi,
+                                     &backlogLcg,
+                                     &backlogLc)
+                    : nullptr;
+            if (backlog != nullptr && backlog->m_rlcTransmissionQueueSize > 0)
+            {
+                // CgBlockPacketOnly: a block of the configuration has no room to spare, so what
+                // the reports say is left is granted in full, a grant per slot as long as the
+                // UE's grants are smaller than that (UlGrantRbs), not one per round trip
+                sps->second.leftover = 0;
+            }
+            else if (sps != m_spsUl.end() && sps->second.dynamicUntilDrained)
             {
                 sps->second.dynamicUntilDrained = false;
                 sps->second.leftover = 0;
@@ -3382,7 +4345,48 @@ NrMacSchedulerNs3::SpsUlTbBytes(uint8_t config) const
     // six with two (Multiple Entry Configured Grant Confirmation, 6.1.3.31).
     const uint32_t packet = (config == 1 ? m_spsSilenceTbBytes : m_spsTbBytes) +
                             (m_spsScenario == 2 ? m_spsFitExtraBytes : 0);
-    return packet + g_ulBsrBytes + (m_spsScenario == 2 ? 6 : 1);
+    const uint32_t ce = m_spsScenario == 2 ? m_cgMultiEntryCeBytes : 1U;
+    if (m_cgBlockPacketOnly)
+    {
+        // The packet alone: its buffer status report goes in when there is room for it, and
+        // the confirmation of an activation comes in the grant before the first block. The
+        // silence configuration of scenario 2 starts with no grant before it: its block holds
+        // the confirmation (and leaves room for a report in its later blocks).
+        return packet + (m_spsScenario == 2 && config == 1 ? ce : 0);
+    }
+    return packet + UlBsrBytes() + ce;
+}
+
+uint32_t
+NrMacSchedulerNs3::SpsUlTbBytesWithCe(uint8_t config) const
+{
+    // An activation the UE confirms in its first block: room for the confirmation
+    const uint32_t tb = SpsUlTbBytes(config);
+    if (!m_cgBlockPacketOnly || (m_spsScenario == 2 && config == 1))
+    {
+        return tb;
+    }
+    return tb + (m_spsScenario == 2 ? m_cgMultiEntryCeBytes : 1U);
+}
+
+uint32_t
+NrMacSchedulerNs3::LearnedSrGrant(uint16_t rnti) const
+{
+    const auto ue = m_ueMap.find(rnti);
+    if (!m_srGrantLearned || ue == m_ueMap.end())
+    {
+        return m_srGrantBytes;
+    }
+    uint8_t lcgId = 0;
+    uint8_t lcId = 0;
+    if (FindLcOfFiveQi(ue->second->m_ulLCG, m_spsFiveQi, &lcgId, &lcId) == nullptr)
+    {
+        return m_srGrantBytes;
+    }
+    const uint32_t last = NrPdcp::GetVoiceActivity(GetCellId(), rnti, lcId, false).lastPduBytes;
+    // the first request of the call: SrGrantBytes; then the last packet received, as it came
+    // (PDCP PDU, RLC header, MAC subheader), and a buffer status report
+    return last == 0 ? m_srGrantBytes : last + m_srGrantL2Bytes + UlBsrBytes();
 }
 
 bool
@@ -3478,7 +4482,8 @@ NrMacSchedulerNs3::SpsHasRoom(bool isDl,
                               uint8_t config,
                               uint32_t needTb,
                               uint8_t mcs,
-                              uint8_t rank) const
+                              uint8_t rank,
+                              uint8_t reps) const
 {
     const uint8_t budget = SpsSymbolBudget(isDl);
     SpsBlock shape;
@@ -3504,9 +4509,13 @@ NrMacSchedulerNs3::SpsHasRoom(bool isDl,
             continue;
         }
         // Two series of slots, each with its period, meet if and only if their first slots
-        // differ by a multiple of the greatest common divisor of the periods
-        const uint64_t apart = slot > st.startSlot ? slot - st.startSlot : st.startSlot - slot;
-        if (apart % std::gcd<uint64_t, uint64_t>(period, st.periodSlots) == 0)
+        // differ by a multiple of the greatest common divisor of the periods. With repetitions
+        // a block takes as many slots in a row; two series meet if any of these do.
+        const auto gcd = static_cast<int64_t>(std::gcd<uint64_t, uint64_t>(period, st.periodSlots));
+        const int64_t apart =
+            ((static_cast<int64_t>(slot) - static_cast<int64_t>(st.startSlot)) % gcd + gcd) % gcd;
+        if (apart <= static_cast<int64_t>(st.reps) - 1 ||
+            apart >= gcd - (static_cast<int64_t>(reps) - 1))
         {
             symbols += st.numSym;
             area += st.numSym * st.numRbg;
@@ -3532,6 +4541,198 @@ NrMacSchedulerNs3::SpsUlMcs(const std::shared_ptr<NrMacSchedulerUeInfo>& ue) con
     return last != m_spsUlWholeBandMcs.end() && last->second.first == ue->m_ulMcs
                ? last->second.second
                : ue->m_ulMcs;
+}
+
+std::pair<uint8_t, uint8_t>
+NrMacSchedulerNs3::SpsUlLink(const std::shared_ptr<NrMacSchedulerUeInfo>& ue,
+                             uint32_t needTb,
+                             double marginDb,
+                             uint8_t reps,
+                             double mcsMarginDb) const
+{
+    // the MCS at mcsMarginDb less SINR than measured (CgSinrPercentile)
+    const double scale = mcsMarginDb > 0.0 ? std::pow(10.0, -mcsMarginDb / 10.0) : 1.0;
+    const uint8_t fixed = ue->m_puschRepetitions;
+    if (GetUlGrantRbs() == 0 || fixed == 1 || !UseHarqInFrequency())
+    {
+        return {SpsUlMcs(ue), 1};
+    }
+    // The resource blocks of a block (SpsGeometry())
+    const auto mask = GetUlBitmask();
+    const auto nRbg = static_cast<uint32_t>(std::count(mask.begin(), mask.end(), true));
+    const uint32_t rbPerRbg = GetNumRbPerRbg();
+    const uint32_t rbs = std::min(nRbg, (GetUlGrantRbs() + rbPerRbg - 1) / rbPerRbg) * rbPerRbg;
+    if (reps == 0)
+    {
+        // K of a configured grant: numberOfRepetitions of its time domain allocation row, or repK
+        // (TS 38.214 6.1.2.3), here the numbers of TS 38.331 numberOfRepetitionsExt-r17; the K
+        // repetitions may not last longer than the period P (6.1.2.3.1), so not more than the
+        // slots of the talk period (the silence period is longer)
+        const uint32_t slotsOfPeriod = static_cast<uint32_t>(SpsPeriodSlots(0));
+        std::vector<uint8_t> allowed;
+        for (const uint8_t k : NrMacSchedulerUeInfo::kPuschRepetitionValues)
+        {
+            if (k <= std::max<uint32_t>(slotsOfPeriod, 1))
+            {
+                allowed.push_back(k);
+            }
+        }
+        reps = allowed.back();
+        const double sinr = ue->GetUlMeanSinrFor(rbs);
+        const double target = ue->m_puschRepSinr * std::pow(10.0, marginDb / 10.0);
+        for (const uint8_t k : allowed)
+        {
+            if (fixed > 1 ? k >= fixed : sinr * k >= target)
+            {
+                reps = k;
+                break;
+            }
+        }
+        if (fixed == 0 && sinr <= 0.0)
+        {
+            return {SpsUlMcs(ue), 1}; // no measurement yet
+        }
+        // The block has to hold its bytes in its resource blocks: more repetitions, a higher MCS
+        const uint32_t nprb = rbs * SpsSymbolBudget(false);
+        while (needTb > 0 && reps < allowed.back() &&
+               m_ulAmc->CalculateTbSize(ue->GetUlMcsForReps(rbs, reps, scale),
+                                        ue->m_ulRank,
+                                        nprb) < needTb)
+        {
+            reps = *std::upper_bound(allowed.begin(), allowed.end(), reps);
+        }
+    }
+    return {ue->GetUlMcsForReps(rbs, reps, scale), reps};
+}
+
+double
+NrMacSchedulerNs3::SpsUlSinr(const std::shared_ptr<NrMacSchedulerUeInfo>& ue) const
+{
+    // the resource blocks of a block, as SpsUlLink() takes them
+    const auto mask = GetUlBitmask();
+    const auto nRbg = static_cast<uint32_t>(std::count(mask.begin(), mask.end(), true));
+    const uint32_t rbPerRbg = GetNumRbPerRbg();
+    const uint32_t rbs = std::min(nRbg, (GetUlGrantRbs() + rbPerRbg - 1) / rbPerRbg) * rbPerRbg;
+    return ue->GetUlMeanSinrFor(rbs);
+}
+
+int
+NrMacSchedulerNs3::CgOutOfDate(SpsState& st, const std::shared_ptr<NrMacSchedulerUeInfo>& ue) const
+{
+    const Time now = Simulator::Now();
+    const double sinr = SpsUlSinr(ue);
+    if (sinr <= 0.0)
+    {
+        return 0; // no measurement
+    }
+    // K per the SINR (PuschRepetitions = 0): how far the configuration's K falls short of the
+    // target, or how much it leaves to spare
+    const bool perSinr = ue->m_puschRepetitions == 0;
+    const double shortDb =
+        perSinr ? 10.0 * std::log10(ue->m_puschRepSinr) - 10.0 * std::log10(sinr * st.reps) : 0.0;
+    // the MCS the configuration's K carries now, against the configuration's (SpsOutOfDate())
+    const int mcsState =
+        SpsOutOfDate(false, st, SpsUlLink(ue, 0, 0.0, st.reps).first, ue->m_ulRank);
+    const bool worse = (perSinr && shortDb >= m_cgRaiseDb) || mcsState < 0;
+    const bool better =
+        !worse && ((perSinr && SpsUlLink(ue, st.needTb, m_cgLowerDb).second < st.reps) ||
+                   mcsState > 0);
+    st.worseSince = worse ? (st.worseSince == Time::Min() ? now : st.worseSince) : Time::Min();
+    st.betterSince =
+        better ? (st.betterSince == Time::Min() ? now : st.betterSince) : Time::Min();
+
+    const bool urgent = (perSinr && shortDb >= m_cgUrgentDb) ||
+                        (m_cgFailures > 0 && st.failRun >= m_cgFailures &&
+                         ((perSinr && shortDb > 0.0) || mcsState < 0));
+    if (urgent)
+    {
+        return -1;
+    }
+    const bool intervalOver =
+        st.lastActivation == Time::Min() || now - st.lastActivation >= m_cgMinInterval;
+    if (!intervalOver)
+    {
+        return 0;
+    }
+    if (worse && now - st.worseSince >= m_cgRaiseTime)
+    {
+        return -1;
+    }
+    if (better && now - st.betterSince >= m_cgLowerTime)
+    {
+        return 1;
+    }
+    return 0;
+}
+
+double
+NrMacSchedulerNs3::CgMarginDb(SpsState& st,
+                              const std::shared_ptr<NrMacSchedulerUeInfo>& ue,
+                              uint64_t slot) const
+{
+    const Time now = Simulator::Now();
+    const double sinr = SpsUlSinr(ue);
+    if (sinr > 0.0 && (st.sinrDb.empty() || slot >= st.sinrSlot + SpsPeriodSlots(0)))
+    {
+        st.sinrDb.emplace_back(now, 10.0 * std::log10(sinr));
+        st.sinrSlot = slot;
+    }
+    while (!st.sinrDb.empty() && now - st.sinrDb.front().first > m_cgSinrWindow)
+    {
+        st.sinrDb.pop_front();
+    }
+    if (m_cgSinrPercentile <= 0.0 || st.sinrDb.size() < 2 || sinr <= 0.0)
+    {
+        return 0.0;
+    }
+    std::vector<double> v;
+    v.reserve(st.sinrDb.size());
+    for (const auto& sample : st.sinrDb)
+    {
+        v.push_back(sample.second);
+    }
+    std::sort(v.begin(), v.end());
+    // the percentile, interpolated between the nearest ranks
+    const double pos = m_cgSinrPercentile / 100.0 * static_cast<double>(v.size() - 1);
+    const auto lo = static_cast<size_t>(std::floor(pos));
+    const size_t hi = std::min(lo + 1, v.size() - 1);
+    const double pDb = v[lo] + (pos - static_cast<double>(lo)) * (v[hi] - v[lo]);
+    return std::max(0.0, 10.0 * std::log10(sinr) - pDb);
+}
+
+int
+NrMacSchedulerNs3::DlSpsOutOfDate(SpsState& st, const std::shared_ptr<NrMacSchedulerUeInfo>& ue) const
+{
+    // As CgOutOfDate() for the uplink: the MCS the link carries now against the configuration's
+    // (SpsOutOfDate(), SpsMcsTolerance), held for a while before the gNB activates again
+    const Time now = Simulator::Now();
+    const int state = SpsOutOfDate(true, st, ue->GetDlMcs(), ue->m_dlRank);
+    const bool worse = state < 0;
+    const bool better = state > 0;
+    st.worseSince = worse ? (st.worseSince == Time::Min() ? now : st.worseSince) : Time::Min();
+    st.betterSince =
+        better ? (st.betterSince == Time::Min() ? now : st.betterSince) : Time::Min();
+    const int stepsWorse = static_cast<int>(st.mcs) - static_cast<int>(ue->GetDlMcs());
+    const bool urgent =
+        (m_dlSpsUrgentSteps > 0 && stepsWorse >= static_cast<int>(m_dlSpsUrgentSteps)) ||
+        (m_dlSpsFailures > 0 && st.failRun >= m_dlSpsFailures && stepsWorse > 0);
+    if (urgent)
+    {
+        return -1;
+    }
+    if (st.lastActivation != Time::Min() && now - st.lastActivation < m_dlSpsMinInterval)
+    {
+        return 0;
+    }
+    if (worse && now - st.worseSince >= m_dlSpsRaiseTime)
+    {
+        return -1;
+    }
+    if (better && now - st.betterSince >= m_dlSpsLowerTime)
+    {
+        return 1;
+    }
+    return 0;
 }
 
 int
@@ -3602,7 +4803,7 @@ NrMacSchedulerNs3::SpsPlanDl(uint64_t slot)
         // The MAC PDU that empties the queue: the RLC PDUs (the RLC reports them with their
         // headers) and one MAC subheader
         const uint32_t queue = lc->m_rlcTransmissionQueueSize;
-        const uint32_t need = queue > 0 ? queue + MAC_SUBHEADER_SIZE : 0;
+        const uint32_t need = queue > 0 ? queue + MacSubheaderFor(queue) : 0;
         if (queue == 0)
         {
             // (a first packet after a change that is still to be sent, and is not there any
@@ -3611,9 +4812,23 @@ NrMacSchedulerNs3::SpsPlanDl(uint64_t slot)
             st.pieces = 0;
         }
         // The configuration the packet that came last asks for, and the block it would have
-        const uint8_t wantConfig =
-            m_spsScenario == 2 && st.lastKind == NrPdcp::SDU_SILENCE ? 1 : 0;
+        // (SpsDlSilenceAtSecondSid: with TS 26.093 DTX the first SID_UPDATE comes 3 frames
+        // after SID_FIRST and then every 8: the silence configuration starts with it, on its
+        // grid; SID_FIRST still goes on the talk configuration)
+        const bool silent =
+            st.lastKind == NrPdcp::SDU_SILENCE &&
+            (!m_spsDlSilenceAtSecondSid ||
+             NrPdcp::GetVoiceActivity(GetCellId(), rnti, block.lcId, true).run >= 2);
+        const uint8_t wantConfig = m_spsScenario == 2 && silent ? 1 : 0;
         const uint32_t baseTb = wantConfig == 1 ? m_spsSilenceTbBytes : m_spsTbBytes;
+        if (queue > 0)
+        {
+            NS_LOG_LOGIC("SPS DL slot " << slot << " RNTI " << rnti << " queue " << queue << " need "
+                                        << need << " kind " << +st.lastKind << " config "
+                                        << +st.config << " want " << +wantConfig << " active "
+                                        << st.active << " usable " << st.usable << " start "
+                                        << st.startSlot << " period " << st.periodSlots);
+        }
         const uint32_t fitTb = baseTb + (m_spsScenario == 2 ? m_spsFitExtraBytes : 0);
         bool hide = false;
 
@@ -3678,6 +4893,27 @@ NrMacSchedulerNs3::SpsPlanDl(uint64_t slot)
                                             << +st.config << " -> " << +wantConfig << " for "
                                             << need << " B");
             }
+            else if (wantConfig == 1 && st.config == 0)
+            {
+                // The speaker fell silent and his first silence descriptor, with its ROHC
+                // context update, is larger than the silence block: like scenario 1, in pieces
+                // over the occasions of the talk configuration that is still active (a
+                // descriptor is not urgent). What is left after this occasion fits the silence
+                // block and changes over, with it in the first block of the silence
+                // configuration (above, in the next slot). Every configuration keeps the block
+                // of its steady state: no room is carried for the update (decision of 30 Oct
+                // 2026).
+                hide = true; // it waits for the occasion
+                if (slot > st.startSlot && (slot - st.startSlot) % st.periodSlots == 0)
+                {
+                    block.config = st.config;
+                    block.segment = true;
+                    m_spsBlocksSlot.push_back(block);
+                    NS_LOG_LOGIC("SPS DL slot " << slot << " RNTI " << rnti << " descriptor of "
+                                                << need
+                                                << " B in pieces on config 0 before the change");
+                }
+            }
         }
         else
         {
@@ -3707,7 +4943,9 @@ NrMacSchedulerNs3::SpsPlanDl(uint64_t slot)
                 // configuration: then in pieces, over this occasion and the next
                 block.config = st.config;
                 block.segment = need > st.usable;
-                const int outOfDate = SpsOutOfDate(true, st, ue->GetDlMcs(), ue->m_dlRank);
+                const int outOfDate = m_dlSpsHysteresis
+                                          ? DlSpsOutOfDate(st, ue)
+                                          : SpsOutOfDate(true, st, ue->GetDlMcs(), ue->m_dlRank);
                 const bool room =
                     outOfDate != 0 &&
                     SpsHasRoom(true, rnti, slot, st.config, st.needTb, ue->GetDlMcs(), ue->m_dlRank);
@@ -3845,6 +5083,12 @@ NrMacSchedulerNs3::SpsPlanUl(uint64_t slot)
     const int64_t slotNs = m_macSchedSapUser->GetSlotPeriod().GetNanoSeconds();
     const uint64_t talkPeriod = SpsPeriodSlots(0);
     const uint64_t silencePeriod = SpsPeriodSlots(1);
+    // the first silence descriptor to the next (TS 26.093: SID_FIRST, SID_UPDATE 3 frames on)
+    const uint64_t sidGap =
+        m_spsSidGapMs > 0
+            ? static_cast<uint64_t>(m_spsSidGapMs * MilliSeconds(1).GetNanoSeconds() /
+                                    m_macSchedSapUser->GetSlotPeriod().GetNanoSeconds())
+            : silencePeriod;
     // The slot that is on the air now: what the gNB knows, it knows up to here
     const auto nowSlot = static_cast<uint64_t>(Simulator::Now().GetNanoSeconds() / slotNs);
     // A scheduling request arrives one propagation delay and a slot or two after the packet it
@@ -3873,6 +5117,7 @@ NrMacSchedulerNs3::SpsPlanUl(uint64_t slot)
             continue;
         }
         SpsState& st = m_spsUl[rnti];
+        st.cgMargin = m_cgHysteresis ? CgMarginDb(st, ue, slot) : 0.0;
 
         // The blocks the UE left unused: it had nothing to send, or it did not know of them
         for (auto sent = st.blocks.begin(); sent != st.blocks.end();)
@@ -3885,7 +5130,14 @@ NrMacSchedulerNs3::SpsPlanUl(uint64_t slot)
             const uint8_t id = sent->dci->m_harqProcess;
             if (ue->m_ulHarq.Get(id).m_active && ue->m_ulHarq.Get(id).m_dciElement == sent->dci)
             {
-                ue->m_ulHarq.Erase(id);
+                if (m_diagUlHarq)
+                {
+                    std::ostringstream o;
+                    o << "cg skipped rnti " << rnti << " p" << +id << " block slot " << sent->slot
+                      << " rv " << +sent->dci->m_rv;
+                    DiagLog(o.str());
+                }
+                ue->m_ulHarq.Erase(id, "SpsPlanUl (block skipped by the UE)");
             }
             const auto alloc = m_ulAllocationMap.find(sent->sfn);
             if (alloc != m_ulAllocationMap.end())
@@ -3894,6 +5146,18 @@ NrMacSchedulerNs3::SpsPlanUl(uint64_t slot)
                     return a.m_rnti == rnti && a.m_symStart == sent->dci->m_symStart;
                 });
             }
+            // Its repetitions: nothing comes in their slots either (one PUSCH per UE and slot)
+            for (const uint64_t repSfn : sent->repSfns)
+            {
+                const auto repAlloc = m_ulAllocationMap.find(repSfn);
+                if (repAlloc != m_ulAllocationMap.end())
+                {
+                    std::erase_if(repAlloc->second.m_ulAllocations,
+                                  [rnti](const AllocElem& a) { return a.m_rnti == rnti; });
+                }
+            }
+            std::erase_if(m_ulRepetitions,
+                          [&sent](const UlRepetition& r) { return r.dci == sent->dci; });
             if (!sent->dci->m_pdcchMissed)
             {
                 m_pdcch->NoteEvent(NrPdcch::UL_CG_EMPTY);
@@ -3932,6 +5196,9 @@ NrMacSchedulerNs3::SpsPlanUl(uint64_t slot)
             const auto note = [&](NrPdcch::Change what, uint64_t n) {
                 m_pdcch->NoteEvent(NrPdcch::ChangeEvent(false, toVoice, what), n);
             };
+            // (CgSilenceSwitch: a silence seen now on the talk configuration starts the change at
+            // once; a talk spurt cancels it)
+            st.switchNow = !toVoice;
             if (st.gaveDci || !st.active)
             {
                 note(NrPdcch::CHANGE_DCI, changes[toVoice]);
@@ -3953,6 +5220,10 @@ NrMacSchedulerNs3::SpsPlanUl(uint64_t slot)
         const uint32_t reported = lc->m_rlcTransmissionQueueSize;
         const bool asked = ue->m_srBytesPending > 0;
         const bool wants = reported > 0 || asked;
+        if (asked)
+        {
+            st.switchNow = false; // the speaker talks again
+        }
         if (kind == NrPdcp::SDU_UNKNOWN || st.heardSlot == 0)
         {
             st.heardSlot = nowSlot; // (stays where it is once the kind is known)
@@ -4002,7 +5273,31 @@ NrMacSchedulerNs3::SpsPlanUl(uint64_t slot)
             // scheduling request times the talk configuration instead
             st.pending = false;
         }
-        if (st.pending && slot >= st.pendingSlot)
+        if (m_cgSilenceSwitchNow && st.switchNow && st.active && m_spsScenario == 2 &&
+            st.config == 0 && kind == NrPdcp::SDU_SILENCE && slot > st.lastUsedSlot &&
+            st.lastUsedSlot >= st.startSlot)
+        {
+            // CgSilenceSwitch: the speaker has fallen silent and the gNB has his first silence
+            // descriptor: the talk configuration is released now (its occasions are not kept),
+            // and the silence configuration is activated when the next descriptor is due, one
+            // period after the first, so that its occasions fall where the descriptors are (an
+            // activation starts its occasions K2 + K_offset after the DCI: one sent now would
+            // put them a period out of step). If the speaker talks before that, the scheduling
+            // request times the talk configuration instead.
+            st.switchNow = false;
+            SpsRelease release;
+            release.rnti = rnti;
+            release.config = st.config;
+            m_spsReleasesSlot.push_back(release);
+            st.active = false;
+            st.pending = true;
+            st.pendingConfig = 1;
+            st.pendingSlot = st.lastUsedSlot + sidGap;
+            NS_LOG_LOGIC("SPS UL slot " << slot << " RNTI " << rnti
+                                        << " silent: release config 0 now, config 1 at slot "
+                                        << st.pendingSlot);
+        }
+        if (st.pending && slot >= st.pendingSlot && slot >= st.startRetrySlot)
         {
             // (from the slot it was timed for on: if its DCIs find no PDCCH candidate there,
             // in the next)
@@ -4012,7 +5307,7 @@ NrMacSchedulerNs3::SpsPlanUl(uint64_t slot)
         else if (st.active && m_spsScenario == 2 && st.config == 0 &&
                  kind == NrPdcp::SDU_SILENCE && slot > st.lastUsedSlot &&
                  st.lastUsedSlot >= st.startSlot &&
-                 (slot - st.lastUsedSlot) % silencePeriod < margin + 2)
+                 (slot - st.lastUsedSlot) % sidGap < margin + 2)
         {
             // The speaker has fallen silent: his first silence descriptor came in the block of
             // lastUsedSlot. The next is due one silence period later, and there the silence
@@ -4026,14 +5321,26 @@ NrMacSchedulerNs3::SpsPlanUl(uint64_t slot)
             st.pendingConfig = 1;
             st.pendingSlot = slot;
         }
-        const uint8_t ulMcs = SpsUlMcs(ue);
-        if (starts &&
-            !SpsHasRoom(false, rnti, slot, startConfig, SpsUlTbBytes(startConfig), ulMcs, ue->m_ulRank))
+        // (the block an activation here would have: with room for the confirmation unless it
+        // was sent ahead; the room is checked for that size, the block below gets it)
+        const uint32_t startTb =
+            st.aheadSent ? SpsUlTbBytes(startConfig) : SpsUlTbBytesWithCe(startConfig);
+        const auto [ulMcs, ulReps] =
+            SpsUlLink(ue, starts ? startTb : (st.active ? st.needTb : 0), st.cgMargin, 0, st.cgMargin);
+        if (starts && !SpsHasRoom(false,
+                                  rnti,
+                                  slot,
+                                  startConfig,
+                                  startTb,
+                                  ulMcs,
+                                  ue->m_ulRank,
+                                  ulReps))
         {
             starts = false; // the slots it would come back in are full: in a later slot
         }
         if (starts)
         {
+            st.switchNow = false; // (a silence seen before this configuration is over with)
             // (the same configuration in other slots is activated again there, which
             // re-initialises it, TS 38.321 5.8.2; only another configuration takes a release)
             if (st.active && st.config != startConfig)
@@ -4045,7 +5352,8 @@ NrMacSchedulerNs3::SpsPlanUl(uint64_t slot)
             }
             block.activation = true;
             block.config = startConfig;
-            block.needTb = SpsUlTbBytes(startConfig);
+            // (an activation no grant before it confirms ahead: room for the confirmation)
+            block.needTb = startTb;
             m_spsBlocksSlot.push_back(block);
             NS_LOG_LOGIC("SPS UL slot " << slot << " RNTI " << rnti << " "
                                         << (st.active ? "change to" : "activate") << " config "
@@ -4105,7 +5413,18 @@ NrMacSchedulerNs3::SpsPlanUl(uint64_t slot)
                                             talkPeriod;
                 ue->m_srBytesPending =
                     std::max(ue->m_srBytesPending,
-                             m_spsTbBytes + m_spsFitExtraBytes + g_ulBsrBytes);
+                             m_spsTbBytes + m_spsFitExtraBytes + UlBsrBytes());
+                if (m_cgBlockPacketOnly)
+                {
+                    // The talk spurt starts: the grant that answers the request carries the
+                    // confirmation of the release of the silence configuration and the
+                    // activation of the talk one (one Multiple Entry CE confirms both)
+                    ue->m_srConfirmAhead = static_cast<uint8_t>(m_cgMultiEntryCeBytes);
+                    ue->m_srConfirmAheadSerial = st.serial + 1;
+                    st.aheadSent = true;
+                    ue->m_srBytesPending = std::max(LearnedSrGrant(rnti), ue->m_srBytesPending) +
+                                           m_cgMultiEntryCeBytes;
+                }
             }
             else if (!st.dynamicUntilDrained && !st.pending && covered && wants)
             {
@@ -4122,14 +5441,43 @@ NrMacSchedulerNs3::SpsPlanUl(uint64_t slot)
                 // The block of the occasion: it comes whether or not the UE has something
                 // to send, which the gNB cannot know
                 block.config = st.config;
-                const int outOfDate = SpsOutOfDate(false, st, ulMcs, ue->m_ulRank);
-                if (outOfDate != 0 &&
-                    SpsHasRoom(false, rnti, slot, st.config, st.needTb, ulMcs, ue->m_ulRank))
+                // With repetitions: more of them, or (with 1 dB to spare) fewer; else the MCS
+                // for as many as the configuration has
+                int outOfDate = 0;
+                if (!m_cgHysteresis)
+                {
+                    if (ulReps > st.reps)
+                    {
+                        outOfDate = -1;
+                    }
+                    else if (ulReps < st.reps && SpsUlLink(ue, st.needTb, 1.0).second < st.reps)
+                    {
+                        outOfDate = 1;
+                    }
+                    else
+                    {
+                        const uint8_t mcsNow =
+                            ulReps == st.reps ? ulMcs : SpsUlLink(ue, 0, 0.0, st.reps).first;
+                        outOfDate = SpsOutOfDate(false, st, mcsNow, ue->m_ulRank);
+                    }
+                }
+                else
+                {
+                    outOfDate = CgOutOfDate(st, ue);
+                }
+                if (outOfDate != 0 && SpsHasRoom(false,
+                                                 rnti,
+                                                 slot,
+                                                 st.config,
+                                                 std::max(st.needTb, SpsUlTbBytesWithCe(st.config)),
+                                                 ulMcs,
+                                                 ue->m_ulRank,
+                                                 ulReps))
                 {
                     block.activation = true;
                     block.reactivation = true;
                     block.worse = outOfDate < 0;
-                    block.needTb = st.needTb;
+                    block.needTb = std::max(st.needTb, SpsUlTbBytesWithCe(st.config));
                     NS_LOG_LOGIC("SPS UL slot " << slot << " RNTI " << rnti << " MCS "
                                                 << +st.mcs << " -> " << +ulMcs
                                                 << ": activate again");
@@ -4159,6 +5507,8 @@ NrMacSchedulerNs3::SpsPlanUl(uint64_t slot)
             }
         }
         else if (asked && kind != NrPdcp::SDU_UNKNOWN && !st.pending &&
+                 !(m_cgStartAfterIr &&
+                   NrPdcp::GetVoiceActivity(GetCellId(), rnti, block.lcId, false).lastIr) &&
                  ((reported == 0 && ue->m_ulHarq.Size() == 0) ||
                   nowSlot > st.heardSlot + 10 * talkPeriod))
         {
@@ -4176,7 +5526,17 @@ NrMacSchedulerNs3::SpsPlanUl(uint64_t slot)
             const uint64_t period = st.pendingConfig == 1 ? silencePeriod : talkPeriod;
             st.pendingSlot = slot + (period + margin - (slot - nowSlot) % period) % period;
             ue->m_srBytesPending =
-                std::max(ue->m_srBytesPending, m_spsTbBytes + m_spsFitExtraBytes + g_ulBsrBytes);
+                std::max(ue->m_srBytesPending, m_spsTbBytes + m_spsFitExtraBytes + UlBsrBytes());
+            if (m_cgBlockPacketOnly && st.pendingConfig == 0)
+            {
+                // the grant that answers the request carries the confirmation
+                ue->m_srConfirmAhead =
+                    static_cast<uint8_t>(m_spsScenario == 2 ? m_cgMultiEntryCeBytes : 1U);
+                ue->m_srConfirmAheadSerial = st.serial + 1;
+                st.aheadSent = true;
+                // (the grant above: the larger of the learned one and a talk block, + the CE)
+                ue->m_srBytesPending += ue->m_srConfirmAhead;
+            }
         }
 
         // Out of sight of the scheduler for this slot: a UE that gets a block in it (one
@@ -4195,7 +5555,7 @@ NrMacSchedulerNs3::SpsPlanUl(uint64_t slot)
 void
 NrMacSchedulerNs3::SpsAdmit(bool isDl)
 {
-    if (m_spsScenario == 0)
+    if (m_spsScenario == 0 || !(isDl ? m_spsDlOn : m_spsUlOn))
     {
         return;
     }
@@ -4245,7 +5605,8 @@ NrMacSchedulerNs3::SpsAllocate(uint64_t slot,
     NS_LOG_FUNCTION(this << slot << isDl);
     auto& states = isDl ? m_spsDl : m_spsUl;
     const auto format = isDl ? DciInfoElementTdma::DL : DciInfoElementTdma::UL;
-    const auto confirmBytes = static_cast<uint8_t>(isDl ? 0 : (m_spsScenario == 2 ? 6 : 1));
+    const auto confirmBytes =
+        static_cast<uint8_t>(isDl ? 0 : (m_spsScenario == 2 ? m_cgMultiEntryCeBytes : 1U));
 
     // The blocks: their shape. A block of an active configuration has the one its activation
     // gave it; a block that comes with an activation gets the smallest that holds its bytes.
@@ -4256,8 +5617,11 @@ NrMacSchedulerNs3::SpsAllocate(uint64_t slot,
         SpsState& st = states[block.rnti];
         if (block.activation && block.grant)
         {
-            const uint8_t mcs = isDl ? ue->GetDlMcs() : SpsUlMcs(ue);
+            const auto ulLink = isDl ? std::pair<uint8_t, uint8_t>{0, 1}
+                                     : SpsUlLink(ue, block.needTb, st.cgMargin, 0, st.cgMargin);
+            const uint8_t mcs = isDl ? ue->GetDlMcs() : ulLink.first;
             const uint8_t rank = isDl ? ue->m_dlRank : ue->m_ulRank;
+            block.reps = ulLink.second;
             if (!SpsGeometry(isDl, mcs, rank, block.needTb, symAvail, &block))
             {
                 m_pdcch->Release(block.grant);
@@ -4268,7 +5632,19 @@ NrMacSchedulerNs3::SpsAllocate(uint64_t slot,
         {
             if (!block.reactivation)
             {
-                continue; // no PDCCH candidate, or no room for such a block: not this slot
+                // No PDCCH candidate, or no room for such a block: not this slot. The UE was
+                // kept from the DCIs of this slot for it; after two such slots in a row it is
+                // not tried again for a talk period, and what it asks for is answered with DCIs
+                // (before: tried, and the UE kept from DCIs, slot after slot)
+                if (!isDl && m_cgStartRetry && ++st.startFails >= 2)
+                {
+                    st.startFails = 0;
+                    st.startRetrySlot = slot + std::max<uint64_t>(st.periodSlots, 20);
+                    NS_LOG_LOGIC("SPS UL slot " << slot << " RNTI " << block.rnti
+                                                << " activation not placed twice: DCIs until slot "
+                                                << st.startRetrySlot);
+                }
+                continue;
             }
             block.activation = false; // the configuration stays as it was
             if (block.worse && isDl)
@@ -4304,6 +5680,7 @@ NrMacSchedulerNs3::SpsAllocate(uint64_t slot,
             block.numRbg = st.numRbg;
             block.mcs = st.mcs;
             block.rank = st.rank;
+            block.reps = st.reps;
             block.tbs = st.tbs;
             block.usable = st.usable;
         }
@@ -4397,11 +5774,37 @@ NrMacSchedulerNs3::SpsAllocate(uint64_t slot,
         dci->m_spsPeriodSlots = static_cast<uint16_t>(SpsPeriodSlots(block->config));
         dci->m_spsTbBytes = block->usable;
         dci->m_cgConfirmBytes = block->activation ? confirmBytes : 0;
+        dci->m_cgSerial = block->activation ? states[block->rnti].serial + 1 : 0;
+        // (uplink: the further transmissions of the block, PlaceUlRepetitions())
+        dci->m_repetitions = block->reps;
 
         HarqProcess harqProcess(true, HarqProcess::WAITING_FEEDBACK, 0, dci);
+        harqProcess.m_txSlot = slot;
         uint8_t id;
         harq.Insert(&id, harqProcess);
         harq.Get(id).m_dciElement->m_harqProcess = id;
+        if (!isDl)
+        {
+            // (whether the block's MCS comes from a measurement of the UE's uplink, for the
+            // UL OLLA, as for a dynamic grant; a stale flag of an earlier block on this id
+            // moved the OLLA before 1 Nov 2026)
+            if (ue->m_ulSinrMeas.empty())
+            {
+                m_ulMeasuredHarq.erase({ue->m_rnti, id});
+            }
+            else
+            {
+                m_ulMeasuredHarq.insert({ue->m_rnti, id});
+            }
+        }
+        if (!isDl)
+        if (m_diagUlHarq)
+        {
+            std::ostringstream o;
+            o << "cg block rnti " << ue->m_rnti << " p" << +id << " reps " << +dci->m_repetitions
+              << " for slot " << slot << (block->activation ? " (activation)" : "");
+            DiagLog(o.str());
+        }
 
         VarTtiAllocInfo slotInfo(dci);
         if (isDl)
@@ -4414,7 +5817,7 @@ NrMacSchedulerNs3::SpsAllocate(uint64_t slot,
                                              [lc](const auto& h) { return h.first == lc; });
             NS_ASSERT(hidden != m_spsHidden.end());
             lc->m_rlcTransmissionQueueSize = hidden->second;
-            const uint32_t bytes = block->usable - MAC_SUBHEADER_SIZE;
+            const uint32_t bytes = MacSduIn(block->usable);
             RlcPduInfo rlcPdu(block->lcId, bytes);
             slotInfo.m_rlcPduInfo.push_back(rlcPdu);
             harq.Get(id).m_rlcPduInfo.push_back(rlcPdu);
@@ -4424,7 +5827,7 @@ NrMacSchedulerNs3::SpsAllocate(uint64_t slot,
             allocInfo->m_varTtiAllocInfo.emplace_back(slotInfo);
             if (m_dlHarqFeedbackDisabled)
             {
-                harq.Erase(id);
+                harq.Erase(id, "SpsAllocate DL (feedback disabled)");
             }
         }
         else
@@ -4441,12 +5844,18 @@ NrMacSchedulerNs3::SpsAllocate(uint64_t slot,
             st.config = block->config;
             ++st.serial;
             st.startSlot = slot;
+            st.lastActivation = Simulator::Now();
+            st.aheadSent = false;
+            st.worseSince = Time::Min();
+            st.betterSince = Time::Min();
+            st.failRun = 0;
             st.periodSlots = SpsPeriodSlots(block->config);
             st.needTb = block->needTb;
             st.numSym = block->numSym;
             st.numRbg = block->numRbg;
             st.mcs = block->mcs;
             st.rank = block->rank;
+            st.reps = block->reps;
             st.tbs = block->tbs;
             st.usable = block->usable;
             st.dynamicUntilDrained = false;
@@ -4464,6 +5873,7 @@ NrMacSchedulerNs3::SpsAllocate(uint64_t slot,
                 st.switchFrom = -1;
             }
             activated.insert(block->rnti);
+            st.startFails = 0;
             (isDl ? m_dlPdcchLast : m_ulPdcchLast)[block->rnti] = m_pdcchRound;
         }
         else if (isDl)
@@ -4535,6 +5945,7 @@ NrMacSchedulerNs3::SpsAllocate(uint64_t slot,
                                                         GetTpc());
         dci->m_sps = DciInfoElementTdma::SPS_RELEASE;
         dci->m_spsConfig = release.config;
+        dci->m_cgSerial = m_spsUl.count(release.rnti) ? m_spsUl.at(release.rnti).serial : 0;
         dci->m_cgConfirmBytes = confirmBytes;
         allocInfo->m_dciOnly.push_back(dci);
         m_pdcch->Commit(release.grant,
@@ -4812,9 +6223,25 @@ NrMacSchedulerNs3::DoScheduleDl(const std::vector<DlHarqInfo>& dlHarqFeedback,
     // data shares (HarqInFrequency()); the region is these dlSymAvail symbols
     m_dlRbgFreeForData.clear();
     uint8_t retxRegion = 0;
+    // PDSCH aggregation: the further transmissions of earlier blocks come first, in the same
+    // region as the retransmissions
+    if (!m_dlRepetitions.empty())
+    {
+        NS_ABORT_MSG_UNLESS(UseHarqInFrequency(),
+                            "PdschAggregation needs an OFDMA scheduler, one beam and "
+                            "HarqRetxInFrequency");
+        m_dlRbgFreeForData = GetDlBitmask();
+        if (!PlaceDlRepetitions(dlAssignationStartPoint, dlSymAvail, allocInfo).empty())
+        {
+            retxRegion = dlSymAvail;
+        }
+    }
     if (!activeDlHarq.empty() && UseHarqInFrequency())
     {
-        m_dlRbgFreeForData = GetDlBitmask();
+        if (m_dlRbgFreeForData.empty())
+        {
+            m_dlRbgFreeForData = GetDlBitmask();
+        }
         if (m_schedHarq->ScheduleDlHarqInFrequency(dlAssignationStartPoint,
                                                    dlSymAvail,
                                                    activeDlHarq,
@@ -4941,6 +6368,10 @@ NrMacSchedulerNs3::DoSchedDlTriggerReq(
                             "NrMacSchedulerNs3::DlCtrlSymbols must be "
                                 << +m_pdcch->GetMinSymbols() << " with NrPdcch::Symbols = "
                                 << +m_pdcch->GetConfiguredSymbols());
+        m_pdcch->SetConfiguredUes(true,
+                                  std::count_if(m_spsDl.begin(), m_spsDl.end(), [](const auto& e) {
+                                      return e.second.active;
+                                  }));
         if (m_pdcch->StartDownlink(params.m_snfSf))
         {
             // The uplink grants of this PDCCH are scheduled first: by the scheduler of the
@@ -5004,6 +6435,21 @@ NrMacSchedulerNs3::DoSchedDlTriggerReq(
                 UpdateDlOlla(it->m_rnti, it->IsReceivedOk());
                 it = dlHarqFeedback.erase(it); /* INC */
             }
+            else if (!m_dlRepetitions.empty() &&
+                     std::any_of(m_dlRepetitions.begin(),
+                                 m_dlRepetitions.end(),
+                                 [&process](const UlRepetition& r) {
+                                     return r.dci == process.m_dciElement;
+                                 }))
+            {
+                // PDSCH aggregation: the block of this process has transmissions still to come,
+                // and the UE answers after the last. This feedback is for an earlier block of the
+                // process (reclaimed by ResetExpiredHARQ and reused): stale.
+                NS_LOG_WARN("Stale DL HARQ feedback for UE " << it->m_rnti << " process "
+                                                             << +it->m_harqProcessId
+                                                             << " (its block is still repeating)");
+                it = dlHarqFeedback.erase(it); /* INC */
+            }
             else
             {
                 auto itDuplicated = feedbacksDup.find(it->m_rnti);
@@ -5058,13 +6504,101 @@ NrMacSchedulerNs3::DoSchedDlTriggerReq(
  * @see ScheduleUl
  */
 void
+NrMacSchedulerNs3::DiagLog(const std::string& event) const
+{
+    if (!m_diagUlHarq)
+    {
+        return; // (every caller checks; a second net: no cost when the attribute is off)
+    }
+    std::ostringstream o;
+    o << Simulator::Now().As(Time::MS) << " " << event;
+    m_diagLog.push_back(o.str());
+    if (m_diagLog.size() > 30000)
+    {
+        m_diagLog.pop_front();
+    }
+}
+
+std::string
+NrMacSchedulerNs3::DiagEvents(uint16_t rnti) const
+{
+    // The events of one UE (and every expiry), the whole window
+    const std::string a = " rnti " + std::to_string(rnti) + " ";
+    const std::string b = " of UE " + std::to_string(rnti) + " ";
+    std::ostringstream o;
+    for (const auto& e : m_diagLog)
+    {
+        if (e.find(a) != std::string::npos || e.find(b) != std::string::npos ||
+            e.find("expire") != std::string::npos)
+        {
+            o << "  " << e << "\n";
+        }
+    }
+    return o.str();
+}
+
+void
+NrMacSchedulerNs3::DiagCheckUlFeedback(std::vector<UlHarqInfo>* ulHarqFeedback,
+                                       const char* stage) const
+{
+    // A pending retransmission must have a live process in RECEIVED_FEEDBACK with a DCI. One
+    // that has not (its process reclaimed or reused meanwhile) would be read by the sort of the
+    // retransmissions and by their placement: it is dropped here, with a warning; with
+    // DiagUlHarq the UE's history is printed too
+    for (auto it = ulHarqFeedback->begin(); it != ulHarqFeedback->end();)
+    {
+        const auto ueIt = m_ueMap.find(it->m_rnti);
+        bool ok = ueIt != m_ueMap.end() && ueIt->second->m_ulHarq.Exist(it->m_harqProcessId);
+        std::string why = ok ? "" : "no such UE or process";
+        if (ok)
+        {
+            const HarqProcess& p = ueIt->second->m_ulHarq.Get(it->m_harqProcessId);
+            ok = p.m_active && p.m_status == HarqProcess::RECEIVED_FEEDBACK &&
+                 p.m_dciElement != nullptr;
+            if (!ok)
+            {
+                std::ostringstream o;
+                o << "process active=" << p.m_active << " status=" << +p.m_status
+                  << " dci=" << (p.m_dciElement ? "set" : "NULL");
+                why = o.str();
+            }
+        }
+        if (ok)
+        {
+            ++it;
+            continue;
+        }
+        NS_LOG_WARN("UL HARQ " << stage << ": feedback " << *it << " without a pending process ("
+                               << why << ") at " << Simulator::Now().As(Time::S) << ": dropped");
+        if (m_diagUlHarq)
+        {
+            std::cerr << "DIAG UL HARQ " << stage << ": " << *it << " without a pending process ("
+                      << why << ") at " << Simulator::Now().As(Time::S) << "\n";
+            if (ueIt != m_ueMap.end())
+            {
+                std::cerr << ueIt->second->m_ulHarq
+                          << "last erase: " << ueIt->second->m_ulHarq.LastErase() << "\nEVENTS\n"
+                          << DiagEvents(it->m_rnti);
+            }
+        }
+        it = ulHarqFeedback->erase(it);
+    }
+}
+
+void
 NrMacSchedulerNs3::DoSchedUlTriggerReq(
     const NrMacSchedSapProvider::SchedUlTriggerReqParameters& params)
 {
     NS_LOG_FUNCTION(this);
+    NrMacHarqVector::s_diagnostics = m_diagUlHarq;
 
     if (PdcchOn())
     {
+        // (the UEs whose power control commands come in DCI 2_2)
+        m_pdcch->SetConfiguredUes(false,
+                                  std::count_if(m_spsUl.begin(), m_spsUl.end(), [](const auto& e) {
+                                      return e.second.active;
+                                  }));
         m_pdcch->StartUplink();
     }
 
@@ -5073,12 +6607,28 @@ NrMacSchedulerNs3::DoSchedUlTriggerReq(
 
     // Merge not-retransmitted and received feedback
     std::vector<UlHarqInfo> ulHarqFeedback;
+    const uint64_t nowSlot = static_cast<uint64_t>(
+        Simulator::Now().GetNanoSeconds() / m_macSchedSapUser->GetSlotPeriod().GetNanoSeconds());
     if (!params.m_ulHarqInfoList.empty() || !m_ulHarqToRetransmit.empty())
     {
         // m_ulHarqToRetransmit will be cleared inside MergeHARQ
         uint64_t existingSize = m_ulHarqToRetransmit.size();
         uint64_t inSize = params.m_ulHarqInfoList.size();
 
+        for (const auto& f : m_ulHarqToRetransmit)
+        if (m_diagUlHarq)
+        {
+            std::ostringstream o;
+            o << "in(buffered) " << f;
+            DiagLog(o.str());
+        }
+        for (const auto& f : params.m_ulHarqInfoList)
+        if (m_diagUlHarq)
+        {
+            std::ostringstream o;
+            o << "in(phy) " << f;
+            DiagLog(o.str());
+        }
         ulHarqFeedback = MergeHARQ(&m_ulHarqToRetransmit, params.m_ulHarqInfoList, "UL");
 
         NS_ASSERT(m_ulHarqToRetransmit.empty());
@@ -5130,25 +6680,72 @@ NrMacSchedulerNs3::DoSchedUlTriggerReq(
             {
                 NS_LOG_WARN("UE was released, but HARQ feedback remained in a buffer. We dispose "
                             "of it here.");
+                if (m_diagUlHarq)
+                {
+                    std::ostringstream o;
+                    o << "drop(no UE) " << *it;
+                    DiagLog(o.str());
+                }
                 it = ulHarqFeedback.erase(it);
                 continue;
             }
             auto& ueInfo = m_ueMap.find(it->m_rnti)->second;
+            if (!ueInfo->m_ulHarq.Exist(it->m_harqProcessId))
+            {
+                // (a process id outside the UE's HARQ vector would be read through the map's end())
+                NS_LOG_WARN("UL HARQ feedback for a process the UE has not: " << *it << ": dropped");
+                it = ulHarqFeedback.erase(it);
+                continue;
+            }
             auto& process = ueInfo->m_ulHarq.Find(it->m_harqProcessId)->second;
             if (!process.m_active)
             {
                 NS_LOG_INFO("Feedback for UE " << it->m_rnti << " process "
                                                << static_cast<uint32_t>(it->m_harqProcessId)
                                                << " ignored because process is INACTIVE");
+                if (m_diagUlHarq)
+                {
+                    std::ostringstream o;
+                    o << "drop(inactive) " << *it;
+                    DiagLog(o.str());
+                }
                 it = ulHarqFeedback.erase(it);
+                continue;
             }
-            else
+            // A feedback is for the transmission the process holds now: the same redundancy
+            // version, and not before that transmission can have been received. Otherwise it is
+            // for an earlier block whose process was reclaimed (ResetExpiredHARQ) and reused:
+            // stale, and taking it would retransmit, or release, the wrong block
             {
-                ++it;
+                const auto& dci = process.m_dciElement;
+                const uint64_t reps = dci && dci->m_repetitions > 0 ? dci->m_repetitions : 1U;
+                const bool tooSoon =
+                    process.m_txSlot > 0 && nowSlot < process.m_txSlot + reps - 1;
+                const bool otherRv = dci && it->m_numRetx != dci->m_rv;
+                if (tooSoon || otherRv)
+                {
+                    NS_LOG_WARN("Stale UL HARQ feedback for UE "
+                                << it->m_rnti << " process " << +it->m_harqProcessId
+                                << (otherRv ? " (another redundancy version)" : " (too soon)")
+                                << ": ignored");
+                    if (m_diagUlHarq)
+                    {
+                        std::ostringstream o;
+                        o << "drop(stale" << (otherRv ? ", rv " : ", too soon, txSlot ")
+                          << (otherRv ? std::to_string(dci->m_rv)
+                                      : std::to_string(process.m_txSlot))
+                          << ") " << *it;
+                        DiagLog(o.str());
+                    }
+                    it = ulHarqFeedback.erase(it);
+                    continue;
+                }
             }
+            ++it;
         }
 
         ProcessHARQFeedbacks(&ulHarqFeedback, NrMacSchedulerUeInfo::GetUlHarqVector, "UL");
+        DiagCheckUlFeedback(&ulHarqFeedback, "after ProcessHARQFeedbacks");
     }
 
     // Reclaim after this slot's feedback has been consumed; see the DL path for why.
@@ -5156,6 +6753,7 @@ NrMacSchedulerNs3::DoSchedUlTriggerReq(
     {
         ResetExpiredHARQ(itUe.second->m_rnti, &itUe.second->m_ulHarq);
     }
+    DiagCheckUlFeedback(&ulHarqFeedback, "after ResetExpiredHARQ");
 
     ScheduleUl(params, ulHarqFeedback);
 }

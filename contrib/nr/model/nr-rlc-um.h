@@ -202,6 +202,16 @@ class NR_EXPORT NrRlcUm : public NrRlc
     uint32_t m_discardTimerMs{0};       //!< the discard timer value in milliseconds
     double m_delayBudgetSpentMs{0.0};   //!< the `DelayBudgetSpentMs` attribute
     bool m_outOfOrderDelivery{false};   //!< whether to deliver RLC SDUs without reordering timer
+    uint32_t m_ueTxStaleMs{0};          //!< the `UeTxStaleMs` attribute
+    bool m_ueSide{false};               //!< the `UeSide` attribute: this entity is in a UE
+    uint16_t m_ueCellId{0};             //!< the `UeCellId` attribute: the cell of that UE
+
+    /**
+     * Drop the SDUs that have waited in the transmit buffer longer than `UeTxStaleMs` (UE side
+     * only), the oldest first. A stale voice frame is of no use to the call any more, and the
+     * link that was too bad to send it would only send it late, in front of the fresh ones.
+     */
+    void DiscardStale();
 
     /**
      * Reassembling state
@@ -230,6 +240,7 @@ class NR_EXPORT NrRlcUm : public NrRlc
     Time m_maxRxSenderTimestamp;
 
     bool m_expBsrTimer{false};
+    uint32_t m_segmentOffsetBytes{0}; ///< SegmentOffsetBytes attribute (NR segment offset)
 };
 
 } // namespace ns3

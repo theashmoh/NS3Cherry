@@ -60,6 +60,7 @@ NrMacSchedulerCQIManagement::UlSBCQIReported(
     // resource blocks (NrMacSchedulerUeInfo::GetUlMcsFor())
     ueInfo->m_ulSinrMeas.clear();
     ueInfo->m_ulMcsByRbs.clear();
+    ueInfo->m_ulMcsByRbsReps.clear();
     ueInfo->m_ulMaxRbs = 0;
     ueInfo->m_ulModel = model;
 
@@ -244,8 +245,13 @@ NrMacSchedulerCQIManagement::RefreshUlCqiMaps(
             ue->m_ulCqi.m_cqiType = NrMacSchedulerUeInfo::CqiInfo::WB;
             ue->m_ulMcs = GetStartMcsUl();
             ue->m_ulSinrMeas.clear();
+            ue->m_ulSinrFilt = 0.0;
             ue->m_ulMcsByRbs.clear();
+            ue->m_ulMcsByRbsReps.clear();
             ue->m_ulMaxRbs = 0;
+            // The outer loop corrected the measurement that has just expired: the next one
+            // starts it again from 0
+            ue->m_ulOlla = 0.0;
         }
         else
         {

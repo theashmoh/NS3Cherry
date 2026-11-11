@@ -7,6 +7,7 @@
 #include "nr-mac-scheduler-ofdma-symbol-per-beam.h"
 #include "nr-mac-scheduler-ue-info-pf.h"
 
+#include "ns3/boolean.h"
 #include "ns3/double.h"
 #include "ns3/log.h"
 
@@ -38,7 +39,31 @@ NrMacSchedulerOfdmaPF::GetTypeId()
                 DoubleValue(99),
                 MakeDoubleAccessor(&NrMacSchedulerOfdmaPF::SetTimeWindow,
                                    &NrMacSchedulerOfdmaPF::GetTimeWindow),
-                MakeDoubleChecker<float>(0));
+                MakeDoubleChecker<float>(0))
+            .AddAttribute(
+                "RepetitionAware",
+                "PUSCH repetition: a block sent in K slots costs K slots, so the average "
+                "throughput of the UE and its potential rate count it over K times the symbols. "
+                "False (the default): as the module without repetitions (a block costs one "
+                "slot). In a 30-UE voice cell the two gave the same on-time share to within "
+                "0.3 points, three seeds, so the module's accounting is kept.",
+                BooleanValue(false),
+                MakeBooleanAccessor(&NrMacSchedulerOfdmaPF::m_repAware),
+                MakeBooleanChecker())
+            .AddAttribute(
+                "UlMarginalRate",
+                "Uplink: rank the UEs by what the next resource block group adds to the "
+                "transport block of each, per average throughput, and give a UE no group that "
+                "adds nothing. A UE spreads its power over the groups it gets, so with "
+                "UlMcsPerRbs a wider grant has the MCS of its width and its block grows less "
+                "than the groups: the whole band for the UE with the best rate, as PF gives it "
+                "without this, is a block a UE at low SINR cannot send. false (the default): "
+                "the rate of a fixed reference grant, as the module. Without UlMcsPerRbs the "
+                "MCS does not depend on the width and the two rank alike, but for the rounding "
+                "of the transport block size (0.1 % of the sum rate in a 10-UE test).",
+                BooleanValue(false),
+                MakeBooleanAccessor(&NrMacSchedulerOfdmaPF::m_marginalUl),
+                MakeBooleanChecker());
     return tid;
 }
 
@@ -80,11 +105,14 @@ NrMacSchedulerOfdmaPF::CreateUeRepresentation(
     const NrMacCschedSapProvider::CschedUeConfigReqParameters& params) const
 {
     NS_LOG_FUNCTION(this);
-    return std::make_shared<NrMacSchedulerUeInfoPF>(
+    auto ue = std::make_shared<NrMacSchedulerUeInfoPF>(
         m_alpha,
         params.m_rnti,
         params.m_beamId,
         std::bind(&NrMacSchedulerOfdmaPF::GetNumRbPerRbg, this));
+    ue->m_repAware = m_repAware;
+    ue->m_marginalUl = m_marginalUl;
+    return ue;
 }
 
 std::function<bool(const NrMacSchedulerNs3::UePtrAndBufferReq& lhs,
@@ -130,6 +158,21 @@ NrMacSchedulerOfdmaPF::AssignedUlResources(const UePtrAndBufferReq& ue,
     NS_LOG_FUNCTION(this);
     auto uePtr = std::dynamic_pointer_cast<NrMacSchedulerUeInfoPF>(ue.first);
     uePtr->UpdateUlPFMetric(totAssigned, m_timeWindow);
+    if (m_marginalUl)
+    {
+        // the next group is worth what it adds to the block the UE has now
+        uePtr->UpdateUlMarginal(totAssigned.m_sym);
+    }
+}
+
+bool
+NrMacSchedulerOfdmaPF::UlGrantCanGrow(const UePtrAndBufferReq& ue) const
+{
+    if (!m_marginalUl || ue.first->m_ulRBG.empty())
+    {
+        return true;
+    }
+    return std::dynamic_pointer_cast<NrMacSchedulerUeInfoPF>(ue.first)->m_potentialTputUl > 0.0;
 }
 
 void

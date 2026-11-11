@@ -50,3 +50,12 @@ vcpkg/
 
 # Ignore local cache used by e.g. clangd
 .cache/
+
+# simulation outputs / archives (kept on disk, not in git)
+sweep_*/
+sweep-rohc-sps/*
+!sweep-rohc-sps/summary.*
+results/
+/home/
+*.rar
+ntnlab-backup-*.tgz

@@ -220,7 +220,9 @@ struct NR_EXPORT DciInfoElementTdma
           m_bwpIndex(o.m_bwpIndex),
           m_harqProcess(o.m_harqProcess),
           m_rbgBitmask(o.m_rbgBitmask),
-          m_tpc(o.m_tpc)
+          m_tpc(o.m_tpc),
+          m_repetitions(o.m_repetitions),
+          m_mcsPlanned(o.m_mcsPlanned)
     {
     }
 
@@ -249,7 +251,9 @@ struct NR_EXPORT DciInfoElementTdma
           m_bwpIndex(o.m_bwpIndex),
           m_harqProcess(o.m_harqProcess),
           m_rbgBitmask(rbgBitmask),
-          m_tpc(o.m_tpc)
+          m_tpc(o.m_tpc),
+          m_repetitions(o.m_repetitions),
+          m_mcsPlanned(o.m_mcsPlanned)
     {
     }
 
@@ -272,7 +276,9 @@ struct NR_EXPORT DciInfoElementTdma
           m_bwpIndex(o.m_bwpIndex),
           m_harqProcess(o.m_harqProcess),
           m_rbgBitmask(o.m_rbgBitmask),
-          m_tpc(o.m_tpc)
+          m_tpc(o.m_tpc),
+          m_repetitions(o.m_repetitions),
+          m_mcsPlanned(o.m_mcsPlanned)
     {
     }
 
@@ -292,6 +298,34 @@ struct NR_EXPORT DciInfoElementTdma
     std::vector<bool> m_rbgBitmask{}; //!< RBG mask: 0 if the RBG is not used, 1 otherwise
     const uint8_t m_tpc{0};           //!< Tx power control command
     /**
+     * Uplink grant: PUSCH repetition type A (TS 38.214 6.1.2.1, Rel-17: up to 32), the number
+     * of consecutive uplink slots that carry this transport block, the gNB combining them all
+     * before it decodes. Downlink assignment: PDSCH repetition (TS 38.214 5.1.2.1,
+     * pdsch-AggregationFactor or repetitionNumber-r16), the downlink slots in a row that carry
+     * it, the UE combining them. 1: no repetition. A retransmission is repeated as often.
+     */
+    uint8_t m_repetitions{1};
+    /**
+     * Not a field of the DCI. A downlink assignment whose MCS the scheduler lowered below the
+     * one link adaptation chose, to fill its resource blocks with a more robust code
+     * (NrMacSchedulerNs3::DlMcsFill): that chosen MCS; 255 = not lowered. Copied by the copy
+     * constructors (a retransmission keeps the MCS and size of its block).
+     */
+    uint8_t m_mcsPlanned{255};
+    /**
+     * Not a field of the DCI: which of the m_repetitions transmissions of the block this
+     * allocation is, 0 = the one the DCI schedules (the others, PUSCH_REPETITION, have no DCI of
+     * their own). Not copied by the copy constructors.
+     */
+    uint8_t m_repIndex{0};
+    /**
+     * Not a field of the DCI. A further transmission (PUSCH_REPETITION): the allocation of the
+     * block it repeats. The UE sends it only if it sent that block, so of a configured grant's
+     * block the UE left unused (m_cgSkipped) there is no repetition either. Not copied by the
+     * copy constructors.
+     */
+    std::shared_ptr<const DciInfoElementTdma> m_repFirst;
+    /**
      * Not a field of the DCI. With NrUePhy::PdcchErrorModel the UE the DCI is for writes here
      * that it could not decode it. Who receives the data reads it: the UE itself for a downlink
      * assignment, the gNB for an uplink grant. To them the transport block was not received
@@ -306,14 +340,22 @@ struct NR_EXPORT DciInfoElementTdma
      */
     enum SpsKind : uint8_t
     {
-        DYNAMIC = 0,    //!< a DCI of its own on the PDCCH (C-RNTI; CS-RNTI for a retransmission)
-        SPS_ACTIVATION, //!< the DCI that activates a configuration and schedules its first block
-        SPS_RELEASE,    //!< the DCI that releases a configuration; it schedules nothing
-        SPS_OCCASION    //!< a block of an active configuration: sent without any PDCCH
+        DYNAMIC = 0,     //!< a DCI of its own on the PDCCH (C-RNTI; CS-RNTI for a retransmission)
+        SPS_ACTIVATION,  //!< the DCI that activates a configuration and schedules its first block
+        SPS_RELEASE,     //!< the DCI that releases a configuration; it schedules nothing
+        SPS_OCCASION,    //!< a block of an active configuration: sent without any PDCCH
+        PUSCH_REPETITION, //!< one more transmission of the block of an uplink grant
+                          //!< (m_repetitions): no PDCCH; the UE sends it if it decoded that grant
+        PDSCH_REPETITION  //!< one more transmission of the block of a downlink assignment or SPS
+                          //!< occasion (pdsch-AggregationFactor / repetitionNumber-r16): no
+                          //!< PDCCH; the UE receives it if it decoded that assignment
     };
     uint8_t m_pdcchAl{0};      //!< aggregation level of the PDCCH that carries this DCI, 0 = none
+    uint8_t m_pdcchReps{1};    //!< copies of that PDCCH (Rel-17 linked search spaces): 1 or 2
     uint16_t m_pdcchCce{0};    //!< its first CCE
     uint8_t m_pdcchSymbols{0}; //!< PDCCH symbols of the slot that carries it, 0 = not modelled
+    double m_pdcchBoostDb{0.0}; //!< power of its PDCCH resource elements above the reference signal
+                                //!< (NrPdcch BoostMaxDb; set when the slot is over), dB
     SpsKind m_sps{DYNAMIC};    //!< semi-persistent scheduling (DL) or configured grant Type 2 (UL)
     uint8_t m_spsConfig{0};    //!< index of the configuration (sps-ConfigIndex)
     uint32_t m_spsSerial{0};   //!< not a field: which activation of the configuration this is (or
@@ -333,6 +375,18 @@ struct NR_EXPORT DciInfoElementTdma
      * only), 6 octets with several (Multiple Entry Configured Grant Confirmation).
      */
     uint8_t m_cgConfirmBytes{0};
+    /**
+     * Not a field of the DCI. A dynamic grant whose PUSCH comes after the UE has the DCI that
+     * activates (and releases) a configuration: it carries their confirmation, and the UE does
+     * not confirm them again in the first block of the configuration.
+     */
+    bool m_cgConfirmAhead{false};
+    /**
+     * Not a field of the DCI. Activation, release, and a grant that confirms ahead: the serial
+     * of the activation they belong to (an activation: its own; a release: that of the
+     * configuration it ends; an ahead grant: that of the activation it confirms)
+     */
+    uint32_t m_cgSerial{0};
 };
 
 /**
@@ -653,6 +707,8 @@ struct NR_EXPORT ExpectedTb
     uint8_t m_numSym{0};         //!< Num sym
     SfnSf m_sfn;                 //!< SFN
     bool m_pdcchMissed{false};   //!< The UE did not decode the DCI of this TB (PdcchErrorModel)
+    uint8_t m_repLeft{0}; //!< PUSCH repetition: transmissions of this block still to come; the
+                          //!< gNB decodes it after the last (0)
 };
 
 struct NR_EXPORT TransportBlockInfo
@@ -709,7 +765,9 @@ struct NR_EXPORT RxPacketTraceParams
           m_bwpId(bwpId),
           m_rbAssignedNum(static_cast<uint32_t>(tbInfo.m_expected.m_rbBitmap.size())),
           m_cqi(cqi),
-          m_pdcchMissed(tbInfo.m_expected.m_pdcchMissed) {};
+          m_pdcchMissed(tbInfo.m_expected.m_pdcchMissed),
+          m_harqId(tbInfo.m_expected.m_harqProcessId),
+          m_repLeft(tbInfo.m_expected.m_repLeft) {};
     uint64_t m_cellId{0};
     uint16_t m_rnti{0};
     uint32_t m_frameNum{std::numeric_limits<uint32_t>::max()};
@@ -729,6 +787,8 @@ struct NR_EXPORT RxPacketTraceParams
     uint32_t m_rbAssignedNum{std::numeric_limits<uint32_t>::max()};
     uint8_t m_cqi{std::numeric_limits<uint8_t>::max()};
     bool m_pdcchMissed{false}; //!< corrupt because the UE did not decode the DCI of the TB
+    uint8_t m_harqId{0};  //!< HARQ process of the block
+    uint8_t m_repLeft{0}; //!< repetitions of this transmission still to come (0: the last)
 };
 
 /**
