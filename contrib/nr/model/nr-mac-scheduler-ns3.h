@@ -1161,6 +1161,7 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
         uint8_t config{0};        //!< which: 0 = talk, 1 = silence
         uint32_t serial{0};       //!< counts the activations
         uint64_t startSlot{0};    //!< the slot of its first block
+        uint64_t alignSince{0};   //!< SpsDlAlignMs: slot + 1 the packet that starts one was first seen
         uint32_t periodSlots{0};  //!< its period
         uint32_t needTb{0};       //!< the block size it was made for, in bytes
         uint8_t numSym{0};        //!< its block: symbols,
@@ -1703,6 +1704,10 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
     bool m_cgBlockPacketOnly{false};   //!< CgBlockPacketOnly attribute
     bool m_cgStartAfterIr{false};      //!< CgStartAfterIr attribute
     bool m_cgStartRetry{false};        //!< CgStartRetry attribute
+    double m_cgMaxRepShare{1.0};       //!< CgMaxRepShare attribute
+    bool m_spsSrsSafe{false};          //!< SpsSrsSafe attribute
+    uint32_t m_spsDlMaxWaitMs{0};      //!< SpsDlMaxWaitMs attribute
+    uint32_t m_spsDlAlignMs{0};        //!< SpsDlAlignMs attribute
     bool m_srGrantLearned{false};      //!< SrGrantLearned attribute
     uint32_t m_srGrantL2Bytes{3};      //!< SrGrantL2Bytes attribute
     uint32_t m_spsSidGapMs{0};         //!< SpsSidGapMs attribute

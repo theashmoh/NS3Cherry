@@ -291,6 +291,26 @@ NrMacSchedulerNs3::GetTypeId()
                           BooleanValue(false),
                           MakeBooleanAccessor(&NrMacSchedulerNs3::m_cgStartAfterIr),
                           MakeBooleanChecker())
+            .AddAttribute("CgMaxRepShare",
+                          "Uplink: the repetitions K of a configured grant take at most this share of the slots of its period (1: up to all of them, v10.2)",
+                          DoubleValue(1.0),
+                          MakeDoubleAccessor(&NrMacSchedulerNs3::m_cgMaxRepShare),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("SpsSrsSafe",
+                          "Uplink: a configured grant's block takes only the symbols a slot with SRS leaves, so it fits every occasion (false: v10.2, it is not placed in SRS slots)",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&NrMacSchedulerNs3::m_spsSrsSafe),
+                          MakeBooleanChecker())
+            .AddAttribute("SpsDlMaxWaitMs",
+                          "Downlink: a packet whose next SPS occasion is more than this many ms away is sent with a DCI of its own (0: it waits, v10.2)",
+                          UintegerValue(0),
+                          MakeUintegerAccessor(&NrMacSchedulerNs3::m_spsDlMaxWaitMs),
+                          MakeUintegerChecker<uint32_t>())
+            .AddAttribute("SpsDlAlignMs",
+                          "Downlink: a configuration starts this many ms after the packet that starts it came, so that the later packets, jittered, come before their occasions (0: at once, v10.2)",
+                          UintegerValue(0),
+                          MakeUintegerAccessor(&NrMacSchedulerNs3::m_spsDlAlignMs),
+                          MakeUintegerChecker<uint32_t>())
             .AddAttribute("CgStartRetry",
                           "Uplink: an activation whose block is not placed two slots in a row waits a talk period, the UE answered with DCIs meanwhile (false: v9/v10, tried every slot)",
                           BooleanValue(false),
@@ -4568,11 +4588,16 @@ NrMacSchedulerNs3::SpsUlLink(const std::shared_ptr<NrMacSchedulerUeInfo>& ue,
         // (TS 38.214 6.1.2.3), here the numbers of TS 38.331 numberOfRepetitionsExt-r17; the K
         // repetitions may not last longer than the period P (6.1.2.3.1), so not more than the
         // slots of the talk period (the silence period is longer)
+        // (CgMaxRepShare < 1: at most that share of them, so that the UE has slots left for
+        // the DCI of what a block leaves)
         const uint32_t slotsOfPeriod = static_cast<uint32_t>(SpsPeriodSlots(0));
+        const uint32_t maxK = m_cgMaxRepShare < 1.0
+                                  ? static_cast<uint32_t>(std::floor(slotsOfPeriod * m_cgMaxRepShare))
+                                  : slotsOfPeriod;
         std::vector<uint8_t> allowed;
         for (const uint8_t k : NrMacSchedulerUeInfo::kPuschRepetitionValues)
         {
-            if (k <= std::max<uint32_t>(slotsOfPeriod, 1))
+            if (k <= std::max<uint32_t>(maxK, 1))
             {
                 allowed.push_back(k);
             }
@@ -4831,6 +4856,31 @@ NrMacSchedulerNs3::SpsPlanDl(uint64_t slot)
         }
         const uint32_t fitTb = baseTb + (m_spsScenario == 2 ? m_spsFitExtraBytes : 0);
         bool hide = false;
+        // SpsDlAlignMs: a configuration that starts with this packet starts that long after it
+        // came (it waits), so that its occasions come after the later packets, which jitter
+        // (N6); true = it may start now
+        const uint64_t alignSlots =
+            static_cast<uint64_t>(m_spsDlAlignMs) * SpsPeriodSlots(0) / m_spsPeriodMs;
+        if (queue == 0)
+        {
+            st.alignSince = 0;
+        }
+        auto aligned = [&]() {
+            if (alignSlots == 0)
+            {
+                return true;
+            }
+            if (st.alignSince == 0)
+            {
+                st.alignSince = slot + 1;
+            }
+            if (slot + 1 - st.alignSince < alignSlots)
+            {
+                return false;
+            }
+            st.alignSince = 0;
+            return true;
+        };
 
         if (st.releaseAgain)
         {
@@ -4847,7 +4897,12 @@ NrMacSchedulerNs3::SpsPlanDl(uint64_t slot)
             // (the first of a call, with the whole header) goes the usual way, with a DCI; so
             // does what is no packet of the speaker at all (ROHC feedback for the other
             // direction of a one-way call).
-            if (need > 0 && need <= fitTb && st.lastKind != NrPdcp::SDU_UNKNOWN &&
+            const bool canStart = need > 0 && need <= fitTb && st.lastKind != NrPdcp::SDU_UNKNOWN;
+            if (canStart && !aligned())
+            {
+                hide = true; // SpsDlAlignMs: not yet
+            }
+            else if (canStart &&
                 SpsHasRoom(true,
                            rnti,
                            slot,
@@ -4872,7 +4927,11 @@ NrMacSchedulerNs3::SpsPlanDl(uint64_t slot)
             // configuration, a second activates the other, with this packet in its first block.
             // (A packet too large even for that goes the usual way; the next one changes over.
             // So does a packet that comes when the slots of the other configuration are full.)
-            if (need <= fitTb && SpsHasRoom(true,
+            if (need <= fitTb && !aligned())
+            {
+                hide = true; // SpsDlAlignMs: not yet
+            }
+            else if (need <= fitTb && SpsHasRoom(true,
                                             rnti,
                                             slot,
                                             wantConfig,
@@ -4929,7 +4988,25 @@ NrMacSchedulerNs3::SpsPlanDl(uint64_t slot)
             }
             else if (!occasion)
             {
-                hide = true; // it waits for its occasion
+                // it waits for its occasion; SpsDlMaxWaitMs: unless that is too far away (a
+                // silence descriptor that came just after its occasion), then it goes with a DCI
+                const uint64_t toNext =
+                    slot > st.startSlot
+                        ? st.periodSlots - (slot - st.startSlot) % st.periodSlots
+                        : st.startSlot - slot;
+                const uint64_t maxWait =
+                    static_cast<uint64_t>(m_spsDlMaxWaitMs) * SpsPeriodSlots(0) / m_spsPeriodMs;
+                if (m_spsDlMaxWaitMs > 0 && need > 0 && toNext > maxWait)
+                {
+                    m_pdcch->NoteEvent(NrPdcch::DL_SPS_WAIT);
+                    NS_LOG_LOGIC("SPS DL slot " << slot << " RNTI " << rnti << " " << need
+                                                << " B, next occasion in " << toNext
+                                                << " slots: a DCI of its own");
+                }
+                else
+                {
+                    hide = true;
+                }
             }
             else if (need == 0)
             {
@@ -5622,7 +5699,10 @@ NrMacSchedulerNs3::SpsAllocate(uint64_t slot,
             const uint8_t mcs = isDl ? ue->GetDlMcs() : ulLink.first;
             const uint8_t rank = isDl ? ue->m_dlRank : ue->m_ulRank;
             block.reps = ulLink.second;
-            if (!SpsGeometry(isDl, mcs, rank, block.needTb, symAvail, &block))
+            // SpsSrsSafe: the symbols every uplink slot has, SRS or not (SpsSymbolBudget())
+            const uint8_t shapeSym =
+                !isDl && m_spsSrsSafe ? std::min(symAvail, SpsSymbolBudget(false)) : symAvail;
+            if (!SpsGeometry(isDl, mcs, rank, block.needTb, shapeSym, &block))
             {
                 m_pdcch->Release(block.grant);
                 block.grant = NrPdcch::Grant();

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_sweep.sh - v10.1: run the voice scenarios for a list of user counts, seeds and runs,
+# run_sweep.sh - v10.3: run the voice scenarios for a list of user counts, seeds and runs,
 # then plot them (plot_sweep.py, next to this file).
 #
 #   bash run_sweep.sh [options] [-- extra script options]

@@ -28,6 +28,15 @@ namespace ns3
 NS_LOG_COMPONENT_DEFINE("NrSpectrumPhy");
 NS_OBJECT_ENSURE_REGISTERED(NrSpectrumPhy);
 
+// uplink control / data dropped for overlapping in time at a gNB (StartRxUlCtrl, StartRxData)
+static std::array<uint64_t, 2> s_ulOverlapDrops{0, 0};
+
+std::array<uint64_t, 2>
+NrSpectrumPhy::GetUlOverlapDrops()
+{
+    return s_ulOverlapDrops;
+}
+
 std::ostream&
 operator<<(std::ostream& os, const enum NrSpectrumPhy::State state)
 {
@@ -1307,6 +1316,14 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
     case RX_UL_CTRL:
         /* no break */
     case RX_UL_SRS:
+        if (m_isGnb)
+        {
+            // the same as in StartRxUlCtrl, the other way round: dropped and counted
+            ++s_ulOverlapDrops[1];
+            NS_LOG_WARN("Cannot receive DATA while receiving UL CTRL/SRS: dropped. cellId "
+                        << GetCellId());
+            return;
+        }
         NS_FATAL_ERROR("Cannot receive DATA while receiving CTRL.");
         break;
     case CCA_BUSY:
@@ -1452,7 +1469,12 @@ NrSpectrumPhy::StartRxUlCtrl(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& p
         NS_FATAL_ERROR("Cannot RX UL CTRL while TX.");
         break;
     case RX_DATA:
-        NS_FATAL_ERROR("Cannot RX UL CTRL while receiving DATA.");
+        // A UE whose uplink is off the gNB's symbol grid (its timing advance does not match the
+        // path, NrNtnPropagationDelayModel) lands its control in another UE's data: the gNB
+        // cannot receive it. Drop it and count it (it stays in the interference) instead of
+        // stopping the run; a run with such drops says so (GetUlOverlapDrops)
+        ++s_ulOverlapDrops[0];
+        NS_LOG_WARN("Cannot RX UL CTRL while receiving DATA: dropped. cellId " << GetCellId());
         break;
     case RX_UL_SRS:
         NS_FATAL_ERROR("Cannot start RX UL CTRL while already receiving SRS.");

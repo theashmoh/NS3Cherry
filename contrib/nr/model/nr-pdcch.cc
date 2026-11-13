@@ -204,6 +204,21 @@ NrPdcch::GetTypeId()
                           DoubleValue(0.5),
                           MakeDoubleAccessor(&NrPdcch::m_ulMaxShare),
                           MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("UlBalance",
+                          "How uplink grants and downlink assignments share the CCEs: fixed (UlMaxShare) or demand (each direction's share follows the CCEs it asked for, averaged over UlBalanceSlots).",
+                          StringValue("fixed"),
+                          MakeStringAccessor(&NrPdcch::m_ulBalance),
+                          MakeStringChecker())
+            .AddAttribute("UlBalanceSlots",
+                          "UlBalance demand: the slots the demand of each direction is averaged over.",
+                          DoubleValue(20.0),
+                          MakeDoubleAccessor(&NrPdcch::m_ulBalanceSlots),
+                          MakeDoubleChecker<double>(1.0))
+            .AddAttribute("UlBalanceMin",
+                          "UlBalance demand: the least share either direction keeps (0 to 0.5).",
+                          DoubleValue(0.2),
+                          MakeDoubleAccessor(&NrPdcch::m_ulBalanceMin),
+                          MakeDoubleChecker<double>(0.0, 0.5))
             .AddAttribute(
                 "BoostMaxDb",
                 "The most the CCEs in use of a slot may be boosted with the energy of the CCEs "
@@ -550,6 +565,8 @@ NrPdcch::SetCarrier(uint32_t dlRbs, uint8_t numerology)
     m_numerology = numerology;
     m_hasCarrier = true;
     NS_ABORT_MSG_UNLESS(m_sib1PeriodMs % 10 == 0, "NrPdcch::Sib1PeriodMs must be a multiple of 10");
+    NS_ABORT_MSG_UNLESS(m_ulBalance == "fixed" || m_ulBalance == "demand",
+                        "NrPdcch::UlBalance must be fixed or demand");
     for (const uint8_t al :
          {m_sib1AlAttr, m_otherSiAlAttr, m_pagingAlAttr, m_rarAlAttr, m_tpcAlAttr})
     {
@@ -1043,6 +1060,7 @@ NrPdcch::NewSlotIfNeeded()
     }
     FinishSlot();
     m_prevDlDemandCce = m_dlDemandCce;
+    m_prevUlDemandCce = m_ulDemandCce;
     m_slotNs = now;
     m_dlStarted = false;
     m_fixed = m_symbols != 0;
@@ -1050,6 +1068,7 @@ NrPdcch::NewSlotIfNeeded()
     m_entries.clear();
     m_ulCce = 0;
     m_dlDemandCce = 0;
+    m_ulDemandCce = 0;
     for (uint8_t d = 1; d <= 3; ++d)
     {
         m_owner[d].assign(m_hasCarrier ? GetNumCce(d) : 0, -1);
@@ -1061,8 +1080,28 @@ NrPdcch::NewSlotIfNeeded()
     // The credit of the uplink grants: UlMaxShare of the CCEs of every slot, saved up to the
     // size of the largest grant the CORESET holds (or to one slot's share, if that is more)
     const uint32_t nCce = GetNumCce(m_slotSymbols);
-    const double share = m_ulMaxShare * nCce;
-    m_ulCredit = m_ulMaxShare > 0.0
+    // UlBalance demand: the share of the uplink follows what each direction asked for in the
+    // slots before (CCEs of the DCIs it wanted, sent or blocked), an exponential average over
+    // UlBalanceSlots, kept between UlBalanceMin and 1 - UlBalanceMin: when both directions
+    // want more than the CORESET holds, each gets it in proportion to its demand
+    double ulShare = m_ulMaxShare;
+    if (m_ulBalance == "demand")
+    {
+        const uint32_t both = m_prevUlDemandCce + m_prevDlDemandCce;
+        if (both > 0)
+        {
+            const double alpha = 1.0 / m_ulBalanceSlots;
+            m_ulDemandShare +=
+                alpha * (static_cast<double>(m_prevUlDemandCce) / both - m_ulDemandShare);
+        }
+        ulShare = std::clamp(m_ulDemandShare, m_ulBalanceMin, 1.0 - m_ulBalanceMin);
+        if (m_counting && m_enabled)
+        {
+            m_stats.ulShareSum += ulShare;
+        }
+    }
+    const double share = ulShare * nCce;
+    m_ulCredit = ulShare > 0.0
                      ? std::min(m_ulCredit + share, std::max<double>(share, std::min(16U, nCce)))
                      : 0.0;
     // The slot these requests are for: the downlink scheduler names it (StartDownlink); until it
@@ -1115,6 +1154,7 @@ NrPdcch::StartDownlink(const SfnSf& target)
         {
             m_slotNs = -1;
             m_dlDemandCce = m_prevDlDemandCce;
+            m_ulDemandCce = m_prevUlDemandCce;
             m_entries.clear();
         }
     }
@@ -1172,6 +1212,10 @@ NrPdcch::Request(uint16_t rnti, Purpose purpose)
     if (!uplink)
     {
         m_dlDemandCce += twoCopies ? 2 * wanted : wanted;
+    }
+    else if (!common)
+    {
+        m_ulDemandCce += twoCopies ? 2 * wanted : wanted;
     }
 
     int32_t cce = -1;

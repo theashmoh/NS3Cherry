@@ -20,6 +20,7 @@
 #include "ns3/spectrum-channel.h"
 #include "ns3/traced-callback.h"
 
+#include <array>
 #include <functional>
 
 namespace ns3
@@ -80,6 +81,13 @@ class NR_EXPORT NrSpectrumPhy : public SpectrumPhy
      * @return the object TypeId
      */
     static TypeId GetTypeId();
+
+    /**
+     * \brief Uplink control and data a gNB could not receive because they overlapped in time
+     * (a UE whose uplink timing is off the gNB's symbol grid): the signal is dropped, not
+     * decoded, and counted here (index 0: control during data, 1: data during control)
+     */
+    static std::array<uint64_t, 2> GetUlOverlapDrops();
 
     /**
      * @brief NrSpectrumPhy constructor

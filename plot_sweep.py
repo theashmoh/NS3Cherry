@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""plot_sweep.py - plots and tables of a run_sweep.sh folder (v10.1).
+"""plot_sweep.py - plots and tables of a run_sweep.sh folder (v10.3).
 
     python3 plot_sweep.py <sweep folder> [--pdb 100] [--target 95]
 
@@ -14,6 +14,9 @@ Reads <folder>/runs/<label>/n<users>/s<seed>_r<run>/out_*.csv of the runs that f
   4a_delay_p98.png          98th percentile of all packets' UE<->UPF delay (UL, DL), PDB line
   4b_delay_call_p98.png     per configuration: median and 5-95 % of the calls' own p98, UL and DL
   4c_delay_cdf_ul.png, 4c_delay_cdf_dl.png   per configuration: delay CDF, one curve per user count
+  6_pdcch_blocking.png      DCIs not sent for want of CCEs, % of tries: all; uplink new data (no free candidate /
+                            held back by NrPdcch::UlMaxShare); downlink new + retransmissions; CCEs of the
+                            common search space (SIB1, SI, paging, DCI 2_2) in % of the possible
   5_per_loss.png            UL and DL: PER (lost / on bearer, 1 % line), over PDB (late + discard, 2 % line),
                             % of call directions with PER <= 1 % - all calls of a run pooled
 
@@ -112,6 +115,28 @@ for label in sorted(os.listdir(root), key=label_key):
             pd = rows(os.path.join(d, "out_pdcch.csv"))
             if pd and num(pd[0].get("blockedPct")) is not None:
                 met["pdcchBlockedPct"] = num(pd[0]["blockedPct"])
+            if pd:
+                p0 = {k: (num(v) or 0.0) for k, v in pd[0].items()}
+                # blocked: a DCI not sent in a slot (it is tried again in the next); % of the tries
+                tries = p0.get("dcis", 0) + p0.get("blocked", 0)
+                if tries > 0:
+                    met["pdcchBlockedOfTriesPct"] = 100.0 * p0.get("blocked", 0) / tries
+                ulTries = p0.get("ulNewDcis", 0) + p0.get("ulNewBlocked", 0)
+                if ulTries > 0:
+                    met["ulNewBlockedPct"] = 100.0 * p0.get("ulNewBlocked", 0) / ulTries
+                    met["ulNewCappedPct"] = 100.0 * p0.get("ulCapped", 0) / ulTries
+                    met["ulNewNoCandidatePct"] = 100.0 * (p0.get("ulNewBlocked", 0) - p0.get("ulCapped", 0)) / ulTries
+                dlB = p0.get("dlNewBlocked", 0) + p0.get("dlRetxBlocked", 0)
+                dlTries = p0.get("dlNewDcis", 0) + p0.get("dlRetxDcis", 0) + dlB
+                if dlTries > 0:
+                    met["dlBlockedPct"] = 100.0 * dlB / dlTries
+                if p0.get("ccePossible", 0) > 0:
+                    common = sum(p0.get(k + "Cces", 0) for k in ("sib1", "otherSi", "paging", "rar", "tpcGroup"))
+                    met["commonCcePct"] = 100.0 * common / p0["ccePossible"]
+                    met["ueCcePct"] = 100.0 * (p0.get("cceUsed", 0) - common) / p0["ccePossible"]
+                slots = p0.get("slots", 0)
+                if slots > 0:
+                    met["blockedPerSlot"] = p0.get("blocked", 0) / slots
             # 2), 3) directions and calls meeting 5QI 1
             okDir = {"all": [], "ul": [], "dl": []}
             byCall = defaultdict(list)
@@ -142,7 +167,10 @@ for label in sorted(os.listdir(root), key=label_key):
                 mine = [r for r in calls if r["dir"] == k]
                 onb = sum(num(r.get("onBearer")) or 0 for r in mine)
                 if onb > 0:
-                    met[f"perPct_{k}"] = 100.0 * sum(num(r.get("lost")) or 0 for r in mine) / onb
+                    # PER of 5QI 1: lost on the radio or by ROHC; the CSV's "lost" also counts the
+                    # packets discarded as late, which belong to "over PDB", not here
+                    met[f"perPct_{k}"] = 100.0 * sum(
+                        max(0.0, (num(r.get("lost")) or 0) - (num(r.get("discard")) or 0)) for r in mine) / onb
                     met[f"overPdbCallsPct_{k}"] = 100.0 * sum(
                         (num(r.get("late")) or 0) + (num(r.get("discard")) or 0) for r in mine) / onb
                 pers = [num(r.get("perPct")) for r in mine if num(r.get("perPct")) is not None]
@@ -232,6 +260,22 @@ ax.set_title("PDCCH utilisation vs users\n(dotted: busiest cell; " + note + ")",
 ax.legend(ncol=3, fontsize=8)
 fig.tight_layout()
 fig.savefig(os.path.join(plots, "1_pdcch_utilization.png"), dpi=150)
+plt.close(fig)
+
+# 6) PDCCH blocking
+fig, axs = plt.subplots(2, 2, figsize=(13, 9))
+plot_metric(axs[0][0], "pdcchBlockedOfTriesPct", "DCIs blocked [% of tries]")
+axs[0][0].set_title("All DCIs: not sent for want of CCEs (tried again next slot)", fontsize=10)
+axs[0][0].legend(ncol=3, fontsize=8)
+plot_metric(axs[0][1], "ulNewNoCandidatePct", "UL new-data grants blocked [% of tries]", "ulNewCappedPct")
+axs[0][1].set_title("Uplink grants, new data: solid = no free candidate,\ndotted = a candidate was free but NrPdcch::UlMaxShare held it back", fontsize=10)
+plot_metric(axs[1][0], "dlBlockedPct", "DL assignments blocked [% of tries]")
+axs[1][0].set_title("Downlink assignments, new data + retransmissions", fontsize=10)
+plot_metric(axs[1][1], "ueCcePct", "CCEs [% of possible]", "commonCcePct")
+axs[1][1].set_title("CCEs used: solid = UE-specific DCIs, dotted = common search space\n(SIB1, other SI, paging, DCI 2_2)", fontsize=10)
+fig.suptitle(f"PDCCH blocking   ({note})", fontsize=10)
+fig.tight_layout()
+fig.savefig(os.path.join(plots, "6_pdcch_blocking.png"), dpi=150)
 plt.close(fig)
 
 # 2) directions meeting QoS

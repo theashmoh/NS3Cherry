@@ -2117,8 +2117,9 @@ NrPdcp::CompressWithTable(Ptr<Packet> p)
     else if (sidRule && tsJump && !marker && m_tableUpdateLeft == 0)
     {
         // DTX with RohcTableSidUpdateSize: the first SID_UPDATE changes the timestamp pattern
-        // (a context update), the later ones carry their jump in a UOR-2-TS
-        const bool first = m_tableJumps == 1;
+        // (a context update, repeated in the first RohcTableUpdatePackets SID_UPDATEs as any
+        // context update is), the later ones carry their jump in a UOR-2-TS
+        const bool first = m_tableJumps <= std::max<uint32_t>(1, m_rohcTableUpdatePackets);
         type = first ? "UOR-2-EXT-3 (first SID_UPDATE)" : "UOR-2-TS (SID_UPDATE)";
         row = first ? NrRohcSizeTableTag::UPDATE : NrRohcSizeTableTag::SPURT_UOR2;
         compressed = first ? m_rohcTableUpdateSize : m_rohcTableSidUpdateSize;

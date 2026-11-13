@@ -1083,6 +1083,12 @@
  *                          while its own satellite is high enough above it and the gateway sees
  *                          that satellite at 10 deg (--ownSatPass=0: every UE timed by the first)
  *   --geometryOnly=1       print the layout and the full-load C/I of every cell, no simulation
+ *   --geometryOnly=2       SINR map (v10.5): the SINR of one RB for the centre cell's UEs, DL, UL and
+ *                          PDCCH, the other beams of the colour on it at random with each load of
+ *                          --mapLoads (or --mapUsers calls per beam, --mapVaf, --mapCallRbs), the
+ *                          header's link budget, the simulation's beam pattern, pruning and DL power
+ *                          rules, shadowing and fading drawn per link; flying: at each of
+ *                          --mapElevations of the pass. Writes <csv>_sinrmap.csv (0.1 dB histograms)
  *   --progressS=10         a line on stderr every 10 s of a run: where in the pass it is
  *   --sinrTrace=1          per-slot SINR traces to CSV files
  *   --satAntennaGainDbi, --satApertureM, --satGtDbPerK, --satEirpDbwPerMHz   override the set
@@ -1132,6 +1138,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <random>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -1532,6 +1539,31 @@ DlSinr(uint32_t ue, uint16_t cellId, uint16_t rnti, double sinr, uint16_t bwpId)
     }
 }
 
+// --rbLoad (v10.5): the RBs each cell uses, downlink (each data allocation) and uplink (each
+// PUSCH received, a repetition is one), while the calls run: the measured load of --geometryOnly=2
+bool g_rbLoadOn{false};
+Time g_rbLoadFrom;
+Time g_rbLoadTo;
+std::map<uint16_t, std::array<double, 4>> g_rbLoad; // cell id -> RBs: downlink, uplink; allocations: downlink, uplink
+
+void
+RbLoadAdd(uint16_t cellId, std::size_t dir, uint32_t rbs)
+{
+    const Time now = Simulator::Now();
+    if (now >= g_rbLoadFrom && now < g_rbLoadTo)
+    {
+        g_rbLoad[cellId][dir] += rbs;
+        g_rbLoad[cellId][dir + 2] += 1.0;
+    }
+}
+
+// "DlDataPower" of the satellite gNB, for --rbLoad
+void
+DlRbLoad(uint32_t cellId, uint16_t rnti, uint32_t rbs, double powerDbm)
+{
+    RbLoadAdd(static_cast<uint16_t>(cellId), 0, rbs);
+}
+
 // "RxPacketTraceGnb" of the satellite gNB: every PUSCH transmission it receives (a repetition is
 // one), with the SINR over its resource blocks. One the UE did not send (it missed the DCI)
 // has no signal and is left out.
@@ -1542,6 +1574,10 @@ UlSinr(RxPacketTraceParams p)
     if (it == g_rntiUe.end() || p.m_pdcchMissed || p.m_sinr <= 0.0 || p.m_rbAssignedNum == 0)
     {
         return;
+    }
+    if (g_rbLoadOn)
+    {
+        RbLoadAdd(p.m_cellId, 1, p.m_rbAssignedNum);
     }
     // The UE's power is spread over the RBs of the grant: on g_ulSnrRbs it has that many times less
     const double db = 10.0 * std::log10(p.m_sinr);
@@ -1705,6 +1741,9 @@ struct Connection
 };
 
 std::vector<std::vector<Connection>> g_connections;
+// UE i's connections to a cell other than its first one (after a radio link failure the UE
+// attaches to the strongest cell it hears: with several beams or satellites, maybe another)
+std::vector<uint32_t> g_otherCell;
 std::vector<Ipv4Address> g_ueAddress; // of UE i, for NrPdcp::GetPacketCounts()
 
 void
@@ -1724,6 +1763,17 @@ ConnectionEstablished(uint32_t ue, uint64_t imsi, uint16_t cellId, uint16_t rnti
     if (!g_outages[ue].empty() && g_outages[ue].back().second == Time::Max())
     {
         g_outages[ue].back().second = Simulator::Now();
+    }
+    if (!g_connections[ue].empty() && g_connections[ue].front().cellId != cellId)
+    {
+        if (g_otherCell.size() <= ue)
+        {
+            g_otherCell.resize(ue + 1, 0);
+        }
+        ++g_otherCell[ue];
+        std::cerr << "[cell] t = " << Simulator::Now().As(Time::S) << ": UE " << ue
+                  << " attached to cell " << cellId << " after a radio link failure (dropped in cell "
+                  << g_connections[ue].front().cellId << ")" << std::endl;
     }
     g_connections[ue].push_back({Simulator::Now(),
                                  rnti,
@@ -2558,6 +2608,45 @@ class FixedLevelChannelConditionModel : public ChannelConditionModel
         m_levels[PeekPointer(ue)] = {obstructionLevel, shadowingLevel};
     }
 
+    // --perSatLinks, --shadowingDecorDeg (v10.4). perSat: the levels of a UE towards each
+    // satellite are its own (independent of the other satellites'; towards its own satellite,
+    // those of AddUe). decorDeg > 0: the shadowing level follows the direction of the satellite
+    // seen from the UE: a new independent N(0,1) knot every decorDeg of the angle the path turned
+    // through, blended between knots with cos / sin weights (z = cos(pi f/2) z0 + sin(pi f/2) z1,
+    // f the share of the way to the next knot): z stays N(0,1), moves without a jump, and is
+    // independent of its value two knots before. Either: sigma is interpolated in the elevation.
+    void SetLinkLevels(bool perSat, double decorDeg, Ptr<NormalRandomVariable> innovation)
+    {
+        m_perSat = perSat;
+        m_decorRad = decorDeg * M_PI / 180.0;
+        m_innovation = innovation;
+        m_interpolate = perSat || decorDeg > 0.0;
+    }
+
+    // the satellite of a cell's end of the links (its mobility)
+    void SetSatOf(Ptr<const MobilityModel> cellEnd, uint32_t sat)
+    {
+        m_satOf[PeekPointer(cellEnd)] = sat;
+    }
+
+    // UE ue: its own satellite and its levels towards every satellite (index: satellite;
+    // the own satellite's entries are not used: AddUe's are)
+    void SetUeSats(Ptr<const MobilityModel> ue,
+                   uint32_t ownSat,
+                   const std::vector<double>& obstruction,
+                   const std::vector<double>& shadowing)
+    {
+        const MobilityModel* key = PeekPointer(ue);
+        m_ownSat[key] = ownSat;
+        for (uint32_t s = 0; s < obstruction.size(); ++s)
+        {
+            if (s != ownSat)
+            {
+                m_pair[{key, s}] = {obstruction[s], shadowing[s], Vector(), false, shadowing[s], 0.0, 0.0};
+            }
+        }
+    }
+
     // The UE of a link, or null if neither end is one
     const MobilityModel* UeOf(Ptr<const MobilityModel> a, Ptr<const MobilityModel> b) const
     {
@@ -2583,7 +2672,7 @@ class FixedLevelChannelConditionModel : public ChannelConditionModel
     {
         const MobilityModel* ue = UeOf(a, b);
         NS_ABORT_MSG_UNLESS(ue, "line of sight was asked for a link without a UE");
-        return m_levels.at(ue).obstruction < m_table.losProbability[Row(a, b)];
+        return PairOf(a, b, ue).obstruction < m_table.losProbability[Row(a, b)];
     }
 
     // The shadow fading of a link as a gain in dB: negative makes the signal weaker
@@ -2596,8 +2685,20 @@ class FixedLevelChannelConditionModel : public ChannelConditionModel
             return -m_fixedShadowingDb;
         }
         const std::size_t row = Row(a, b);
-        const double sigma = IsLos(a, b) ? m_table.sigmaLos[row] : m_table.sigmaNlos[row];
-        return -m_levels.at(ue).shadowing * sigma;
+        const bool los = IsLos(a, b);
+        const auto& column = los ? m_table.sigmaLos : m_table.sigmaNlos;
+        double sigma = column[row];
+        if (m_interpolate)
+        {
+            // linear in the elevation between the rows of 10, 20 ... 90 deg
+            const double elevation =
+                std::get<0>(ThreeGppChannelConditionModel::GetQuantizedElevationAngle(a, b));
+            const double x = std::clamp((elevation - 10.0) / 10.0, 0.0, 8.0);
+            const auto lo = static_cast<std::size_t>(std::floor(x));
+            const std::size_t hi = std::min<std::size_t>(lo + 1, 8);
+            sigma = column[lo] + (x - lo) * (column[hi] - column[lo]);
+        }
+        return -Evolve(a, b, ue) * sigma;
     }
 
     Ptr<ChannelCondition> GetChannelCondition(Ptr<const MobilityModel> a,
@@ -2617,7 +2718,125 @@ class FixedLevelChannelConditionModel : public ChannelConditionModel
         double obstruction;
         double shadowing;
     };
+    struct PairLevels
+    {
+        double obstruction;
+        double shadowing;
+        Vector direction; // to the satellite, when the shadowing was last moved on
+        bool hasDirection;
+        // --shadowingDecorDeg: the level is a smooth blend of independent N(0,1) knots, one per
+        // decorrelation angle of the satellite's motion: z = cos(pi f / 2) z0 + sin(pi f / 2) z1
+        double knot0{0.0};
+        double knot1{0.0};
+        double turned{0.0}; // rad since knot0
+    };
+
+    // the satellite of the other end of a link with UE ue (its own one if not known)
+    uint32_t SatOfLink(Ptr<const MobilityModel> a, Ptr<const MobilityModel> b, const MobilityModel* ue) const
+    {
+        const MobilityModel* other = PeekPointer(a) == ue ? PeekPointer(b) : PeekPointer(a);
+        const auto it = m_satOf.find(other);
+        const auto own = m_ownSat.find(ue);
+        const uint32_t ownSat = own != m_ownSat.end() ? own->second : 0;
+        return it != m_satOf.end() ? it->second : ownSat;
+    }
+
+    // the levels of the link: of the pair (UE, satellite), or the UE's own (AddUe), kept in
+    // m_pair once they move (--shadowingDecorDeg)
+    PairLevels& PairOf(Ptr<const MobilityModel> a, Ptr<const MobilityModel> b, const MobilityModel* ue) const
+    {
+        const auto own = m_ownSat.find(ue);
+        const uint32_t ownSat = own != m_ownSat.end() ? own->second : 0;
+        const uint32_t sat = m_perSat ? SatOfLink(a, b, ue) : ownSat;
+        auto it = m_pair.find({ue, sat});
+        if (it == m_pair.end())
+        {
+            const Levels& l = m_levels.at(ue);
+            it = m_pair.emplace(std::make_pair(ue, sat),
+                                PairLevels{l.obstruction, l.shadowing, Vector(), false, l.shadowing, 0.0, 0.0})
+                     .first;
+        }
+        return it->second;
+    }
+
+    // the shadowing level of the link now: moved on by the angle the satellite turned through
+    // since the last time, seen from the UE (one level per UE without --perSatLinks: moved on
+    // by the direction of its own satellite only)
+    double Evolve(Ptr<const MobilityModel> a, Ptr<const MobilityModel> b, const MobilityModel* ue) const
+    {
+        PairLevels& p = PairOf(a, b, ue);
+        if (m_decorRad <= 0.0)
+        {
+            return p.shadowing;
+        }
+        if (!m_perSat)
+        {
+            const auto own = m_ownSat.find(ue);
+            if (own != m_ownSat.end() && SatOfLink(a, b, ue) != own->second)
+            {
+                return p.shadowing; // the direction of another satellite does not move it
+            }
+        }
+        const MobilityModel* other = PeekPointer(a) == ue ? PeekPointer(b) : PeekPointer(a);
+        auto ecef = [](const MobilityModel* m) {
+            const auto* geo = dynamic_cast<const GeocentricConstantPositionMobilityModel*>(m);
+            return geo ? geo->GetGeocentricPosition() : m->GetPosition();
+        };
+        const Vector from = ecef(ue);
+        const Vector to = ecef(other);
+        Vector d(to.x - from.x, to.y - from.y, to.z - from.z);
+        const double len = d.GetLength();
+        if (len <= 0.0)
+        {
+            return p.shadowing;
+        }
+        d = Vector(d.x / len, d.y / len, d.z / len);
+        if (!p.hasDirection)
+        {
+            p.direction = d;
+            p.hasDirection = true;
+            p.knot0 = p.shadowing; // the level drawn at the start
+            p.knot1 = m_innovation->GetValue();
+            p.turned = 0.0;
+            return p.shadowing;
+        }
+        const double cosPsi =
+            std::clamp(d.x * p.direction.x + d.y * p.direction.y + d.z * p.direction.z, -1.0, 1.0);
+        const double psi = std::acos(cosPsi);
+        if (psi > 1e-9)
+        {
+            // past a knot: the next one is a new, independent draw
+            p.turned += psi;
+            while (p.turned >= m_decorRad)
+            {
+                p.turned -= m_decorRad;
+                p.knot0 = p.knot1;
+                p.knot1 = m_innovation->GetValue();
+            }
+            const double f = p.turned / m_decorRad;
+            // cos^2 + sin^2 = 1: z stays N(0,1) all along, and moves without a jump
+            p.shadowing = std::cos(M_PI_2 * f) * p.knot0 + std::sin(M_PI_2 * f) * p.knot1;
+            p.direction = d;
+            static const bool trace = std::getenv("NTN_SHADOWTRACE") != nullptr;
+            if (trace)
+            {
+                std::cerr << std::defaultfloat << std::setprecision(9) << "SHADOW "
+                          << Simulator::Now().GetSeconds() << " " << ue << " "
+                          << SatOfLink(a, b, ue) << " " << psi * 180.0 / M_PI << " " << p.shadowing
+                          << std::endl;
+            }
+        }
+        return p.shadowing;
+    }
+
     std::map<const MobilityModel*, Levels> m_levels;
+    std::map<const MobilityModel*, uint32_t> m_satOf;
+    std::map<const MobilityModel*, uint32_t> m_ownSat;
+    mutable std::map<std::pair<const MobilityModel*, uint32_t>, PairLevels> m_pair;
+    bool m_perSat{false};
+    bool m_interpolate{false};
+    double m_decorRad{0.0};
+    Ptr<NormalRandomVariable> m_innovation;
     LargeScaleTable m_table{};
     double m_fixedShadowingDb{NAN}; // NaN: --shadowing=table
     // outdoor UEs, as ns-3's models make them
@@ -3156,6 +3375,10 @@ double NtnTdlProcess::s_sampleS = 0.0;
 // --fastFadingDb is put on top as a loss of its own on every resource block. It takes the place
 // of ns-3's ThreeGppChannelModel in the carrier's ThreeGppSpectrumPropagationLossModel, which
 // still turns the channel into the received signal.
+// --perSatLinks: a cell's node id -> the node id of the first cell of its satellite (empty: the
+// fading of every cell's link is its own)
+std::map<uint32_t, uint32_t> g_tdlNodeOfSat;
+
 class LosOnlyChannelModel : public MatrixBasedChannelModel
 {
   public:
@@ -3226,11 +3449,19 @@ class LosOnlyChannelModel : public MatrixBasedChannelModel
         // the two node ids, the smaller first, so that the realisation does not depend on which
         // end transmitted first, within the block of the carrier (review of 1 Nov 2026; before,
         // sId * 65536 + uId with sId the first transmitter, in a block of 1e7 it could leave)
+        // (--perSatLinks: the cells of one satellite are one end for this: its beams share the
+        // path to a UE and so its fading, g_tdlNodeOfSat)
         if (m_tdlProfile != 0 && !link.tdl)
         {
+            const auto keyOf = [](uint32_t id) {
+                const auto it = g_tdlNodeOfSat.find(id);
+                return it != g_tdlNodeOfSat.end() ? it->second : id;
+            };
+            const uint32_t sKey = keyOf(sId);
+            const uint32_t uKey = keyOf(uId);
             Ptr<UniformRandomVariable> random = CreateObject<UniformRandomVariable>();
             random->SetStream(m_tdlFirstStream +
-                              (static_cast<int64_t>(std::min(sId, uId)) << 16) + std::max(sId, uId));
+                              (static_cast<int64_t>(std::min(sKey, uKey)) << 16) + std::max(sKey, uKey));
             link.tdl = std::make_shared<NtnTdlProcess>(m_tdlProfile,
                                                        m_tdlDelaySpreadS,
                                                        m_tdlDopplerHz,
@@ -3582,6 +3813,539 @@ PfdRbLimitDbm(double pfd, double marginDb, double distM, double antennaGainDb, d
 {
     const double eirpDbwPerMHz = pfd + 10.0 * std::log10(4.0 * M_PI * distM * distM) + marginDb;
     return eirpDbwPerMHz + 30.0 + 10.0 * std::log10(rbHz / 1e6) - antennaGainDb;
+}
+
+// --geometryOnly=2 (v10.5): the SINR map. The cells and the UEs as --geometryOnly=1 plans and
+// drops them, and for every UE of the centre cell the SINR of one RB, downlink and uplink, with
+// the other beams of its colour sending on that RB at random with a given load, and the PDCCH's
+// SINR (the control symbols take the whole band in every cell: full load, as the simulation has
+// them). The link budget is the header's (the run's EIRP density, antenna gains, noise figures,
+// free space, gases, scintillation, --linkMarginDb, --ulPolarizationLossDb), the beam pattern and
+// the pruning are the simulation's, and so are the power rules of the downlink: an idle RB sends
+// nothing, an RB in use takes the idle RBs' power of its symbol up to --dlBoostMaxDb and the PFD
+// limit. Shadowing: --shadowing=fixed or table (a level per UE, or per UE and satellite with
+// --perSatLinks, sigma of the link's elevation); fast fading (--mapFading=1): one flat draw per
+// link and sample from the profile of --fastFading=ntn-tdl-* (the RB is far narrower than the
+// coherence bandwidth of a 10 ns delay spread), or the fixed loss of --fastFading=fixed.
+// Load: --mapLoads, the share of a beam's RBs in use (each beam of the colour sends on the RB with
+// that probability, independently); --mapUsers, N calls per beam, each direction of each call
+// talking with probability --mapVaf (independently, as the simulation's voice sources are), a
+// talking call taking --mapCallRbs RBs a second (downlink:uplink).
+struct SinrMapSetup
+{
+    std::vector<OrbitPredictor> orbits; // the satellites
+    bool flying{false};
+    Time tFrom;
+    Time tTo;
+    Vector ue0;
+    std::vector<double> elevations; // flying: the elevations of satellite 0 over UE 0 to map
+    std::vector<uint32_t> cellSat;
+    std::vector<Vector> cellCentre;
+    std::vector<int> cellColour;
+    std::vector<Vector> uePos;
+    std::vector<uint32_t> ueCell;
+    uint32_t mapCell{0};
+    double kaDl{0.0};
+    double kaUl{0.0};
+    double floorDb{-80.0};
+    double pruneDb{40.0};
+    double dlHz{0.0}; // the map cell's colour
+    double ulHz{0.0};
+    uint32_t carrierRbs{25};
+    double rbHz{180e3};
+    double slotsPerS{1000.0};
+    double eirpRbDbm{0.0};   // an RB's EIRP at its share of the power, beam peak
+    double shareDbm{0.0};    // an RB's share of TxPower, into the antenna
+    double satGainDl{0.0};   // the satellite antenna's gain (the PFD limit)
+    double boostMaxDb{0.0};  // --dlBoostMaxDb (0: none)
+    double pfdLimit{0.0};    // --dlPfdLimit (0: none)
+    double pfdMarginDb{0.0};
+    double ueGainDbi{0.0};
+    double ueNfDb{7.0};
+    double satGainUlDbi{0.0};
+    double satNfDb{0.0};
+    double ueTxDbm{23.0};
+    Ptr<ServiceLinkLossModel> lossDl;
+    Ptr<ServiceLinkLossModel> lossUl;
+    double marginDlDb{0.0}; // --linkMarginDb
+    double marginUlDb{0.0}; // --linkMarginDb + --ulPolarizationLossDb
+    bool fixedShadowing{true};
+    double fixedShadowingDb{0.0};
+    LargeScaleTable table;
+    bool interpolateSigma{false};
+    bool perSat{false};
+    int fading{0}; // 0 none, 1 fixed loss, 2 profile draws
+    double fixedFadingDb{0.0};
+    double ricianK{0.0}; // linear, of the profile (0: Rayleigh)
+    std::vector<std::pair<double, double>> loads; // downlink, uplink
+    std::vector<uint32_t> users;
+    double vaf{0.5};
+    double callRbsDl{294.0};
+    double callRbsUl{144.0};
+    uint32_t blockDl{25}; // RBs of one allocation: a cell's RBs in use come in blocks of this
+    uint32_t blockUl{1};
+    bool packed{true};    // a cell's blocks from RB 0 up, as the nr schedulers place them (else random)
+    uint32_t draws{10};
+    uint64_t seed{1};
+    std::string csv;
+    uint32_t beams{1};
+    uint32_t satellites{1};
+    uint32_t reuse{1};
+};
+
+int
+RunSinrMap(const SinrMapSetup& m)
+{
+    std::mt19937_64 rng(m.seed);
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
+    std::normal_distribution<double> gauss(0.0, 1.0);
+    const std::size_t cells = m.cellSat.size();
+    const std::size_t nUes = m.uePos.size();
+    const int colour = m.cellColour[m.mapCell];
+    const uint32_t mapSat = m.cellSat[m.mapCell];
+    const double R = m.carrierRbs;
+    auto lin = [](double db) { return std::pow(10.0, db / 10.0); };
+
+    // the cells of the map cell's colour, and the UEs of each
+    std::vector<uint32_t> sameColour;
+    for (uint32_t c = 0; c < cells; ++c)
+    {
+        if (m.cellColour[c] == colour)
+        {
+            sameColour.push_back(c);
+        }
+    }
+    std::vector<std::vector<uint32_t>> uesOf(cells);
+    for (uint32_t i = 0; i < nUes; ++i)
+    {
+        uesOf[m.ueCell[i]].push_back(i);
+    }
+    const std::vector<uint32_t>& victims = uesOf[m.mapCell];
+    NS_ABORT_MSG_IF(victims.empty(), "--geometryOnly=2: no UE was dropped in the centre cell");
+
+    // shadowing levels: one per UE, and with --perSatLinks one per UE and satellite
+    const std::size_t sats = m.orbits.size();
+    std::vector<double> z(nUes * sats);
+    for (uint32_t i = 0; i < nUes; ++i)
+    {
+        const double own = gauss(rng);
+        for (std::size_t s = 0; s < sats; ++s)
+        {
+            z[i * sats + s] = m.perSat ? gauss(rng) : own;
+        }
+    }
+    auto sigmaDb = [&](double elevDeg) {
+        const auto& t = m.table.sigmaLos;
+        if (m.interpolateSigma)
+        {
+            const double x = std::clamp(elevDeg, 10.0, 90.0);
+            const std::size_t k = std::min<std::size_t>(7, static_cast<std::size_t>((x - 10.0) / 10.0));
+            const double f = (x - 10.0 - 10.0 * k) / 10.0;
+            return t[k] + f * (t[k + 1] - t[k]);
+        }
+        const long row = std::clamp(std::lround(elevDeg / 10.0), 1L, 9L) - 1;
+        return t[row];
+    };
+    // the loss of shadowing on a link (dB)
+    auto shadowDb = [&](uint32_t ue, std::size_t sat, double elevDeg) {
+        return m.fixedShadowing ? m.fixedShadowingDb : z[ue * sats + sat] * sigmaDb(elevDeg);
+    };
+    // a draw of the fast fading's power gain on a link (linear, mean 1)
+    auto fade = [&]() {
+        if (m.fading != 2)
+        {
+            return m.fading == 1 ? lin(-m.fixedFadingDb) : 1.0;
+        }
+        const double phase = 2.0 * M_PI * uni(rng);
+        const double a = std::sqrt(m.ricianK / (m.ricianK + 1.0));
+        const double b = std::sqrt(1.0 / (2.0 * (m.ricianK + 1.0)));
+        const double re = a * std::cos(phase) + b * gauss(rng);
+        const double im = a * std::sin(phase) + b * gauss(rng);
+        return re * re + im * im;
+    };
+    auto binomial = [&](uint32_t n, double p) -> uint32_t {
+        if (n == 0 || p <= 0.0)
+        {
+            return 0;
+        }
+        if (p >= 1.0)
+        {
+            return n;
+        }
+        std::binomial_distribution<uint32_t> b(n, p);
+        return b(rng);
+    };
+
+    // the elevations: a flying run maps each asked elevation of satellite 0 over UE 0 on the
+    // rising half of the pass; a standing run maps where it stands
+    std::vector<std::pair<double, Time>> when;
+    if (m.flying)
+    {
+        Time peak = m.tFrom;
+        double peakDeg = -90.0;
+        for (Time t = m.tFrom; t <= m.tTo; t += Seconds(1))
+        {
+            const double e = ElevationDeg(m.orbits[0].At(t), m.ue0);
+            if (e > peakDeg)
+            {
+                peakDeg = e;
+                peak = t;
+            }
+        }
+        const double startDeg = ElevationDeg(m.orbits[0].At(m.tFrom), m.ue0);
+        for (double want : m.elevations)
+        {
+            if (want > peakDeg && want < peakDeg + 1.0)
+            {
+                when.emplace_back(peakDeg, peak); // the top of the pass
+                continue;
+            }
+            if (want < startDeg - 0.05 || want > peakDeg)
+            {
+                std::cout << "  (elevation " << want << " deg is not in the pass: "
+                          << Num(startDeg, 1) << " to " << Num(peakDeg, 1) << " deg; left out)\n";
+                continue;
+            }
+            Time lo = m.tFrom;
+            Time hi = peak;
+            for (int k = 0; k < 60; ++k)
+            {
+                const Time mid = (lo + hi) / 2;
+                (ElevationDeg(m.orbits[0].At(mid), m.ue0) < want ? lo : hi) = mid;
+            }
+            when.emplace_back(want, (lo + hi) / 2);
+        }
+    }
+    else
+    {
+        when.emplace_back(ElevationDeg(m.orbits[0].pos0, m.ue0), Seconds(0));
+    }
+    NS_ABORT_MSG_IF(when.empty(), "--geometryOnly=2: no elevation to map");
+
+    // the loads: (downlink, uplink) per beam, or users per beam
+    struct Load
+    {
+        double rhoDl{0.0};
+        double rhoUl{0.0};
+        int32_t users{-1};
+    };
+    std::vector<Load> loads;
+    for (const auto& [dlRho, ulRho] : m.loads)
+    {
+        loads.push_back({dlRho, ulRho, -1});
+    }
+    for (uint32_t n : m.users)
+    {
+        loads.push_back({0.0, 0.0, static_cast<int32_t>(n)});
+    }
+    NS_ABORT_MSG_IF(loads.empty(), "--geometryOnly=2 needs --mapLoads or --mapUsers");
+    const double rbsPerS = R * m.slotsPerS;
+
+    // histograms: 0.1 dB bins from -50 to +50 dB
+    const int bins = 1000;
+    auto binOf = [&](double db) { return std::clamp(static_cast<int>(std::floor((db + 50.0) * 10.0)), 0, bins - 1); };
+    // key: elevation index, load index (-1: PDCCH, load free), direction 0 dl 1 ul 2 pdcch, 0 sinr 1 snr
+    std::map<std::tuple<int, int, int, int>, std::vector<uint64_t>> hist;
+    auto add = [&](int e, int l, int dir, int q, double db) {
+        auto& h = hist[{e, l, dir, q}];
+        if (h.empty())
+        {
+            h.assign(bins, 0);
+        }
+        ++h[binOf(db)];
+    };
+
+    const double noiseDlMw = lin(-174.0 + m.ueNfDb + 10.0 * std::log10(m.rbHz));
+    const double noiseUlMw = lin(-174.0 + m.satNfDb + 10.0 * std::log10(m.rbHz));
+    const double ueRbDbm = m.ueTxDbm - 10.0 * std::log10(m.blockUl);
+
+    for (std::size_t e = 0; e < when.size(); ++e)
+    {
+        std::vector<Vector> satAt(sats);
+        for (std::size_t s = 0; s < sats; ++s)
+        {
+            satAt[s] = m.flying ? m.orbits[s].At(when[e].second) : m.orbits[s].pos0;
+        }
+        // the cap of an RB's boost in each cell (dB): --dlBoostMaxDb and the PFD limit
+        std::vector<double> capDb(cells, 0.0);
+        for (uint32_t c : sameColour)
+        {
+            double cap = INFINITY;
+            if (m.boostMaxDb > 0.0)
+            {
+                cap = m.boostMaxDb;
+            }
+            if (m.pfdLimit != 0.0)
+            {
+                const double distM = (satAt[m.cellSat[c]] - m.cellCentre[c]).GetLength();
+                cap = std::min(cap,
+                               PfdRbLimitDbm(m.pfdLimit, m.pfdMarginDb, distM, m.satGainDl, m.rbHz) -
+                                   m.shareDbm);
+            }
+            capDb[c] = std::isfinite(cap) ? cap : 0.0;
+        }
+        const bool boosting = m.boostMaxDb > 0.0 || m.pfdLimit != 0.0;
+        auto boostDb = [&](uint32_t c, uint32_t used) {
+            if (!boosting)
+            {
+                return 0.0;
+            }
+            return std::min(capDb[c], 10.0 * std::log10(R / std::max<uint32_t>(1, used)));
+        };
+        // the control symbols at the share, cut where the PFD limit is under it
+        auto ctrlDb = [&](uint32_t c) { return m.pfdLimit != 0.0 ? std::min(0.0, capDb[c]) : 0.0; };
+
+        // downlink: what each cell of the colour gives each victim on an RB at its share (mW,
+        // before shadowing and fading), 0 where the simulation prunes the link
+        struct DlLink
+        {
+            uint32_t cell;
+            double mw;
+            double elevDeg;
+        };
+        std::vector<std::vector<DlLink>> dl(victims.size());
+        std::vector<double> dlOwnMw(victims.size());
+        std::vector<double> dlOwnElev(victims.size());
+        for (std::size_t v = 0; v < victims.size(); ++v)
+        {
+            const Vector& u = m.uePos[victims[v]];
+            const double ownTaper =
+                BeamTaperDb(satAt[mapSat], m.cellCentre[m.mapCell], u, m.kaDl, m.floorDb);
+            for (uint32_t c : sameColour)
+            {
+                const Vector& sat = satAt[m.cellSat[c]];
+                const double taper = BeamTaperDb(sat, m.cellCentre[c], u, m.kaDl, m.floorDb);
+                if (c != m.mapCell && taper < ownTaper - m.pruneDb)
+                {
+                    continue;
+                }
+                const double elev = ElevationDeg(sat, u);
+                const double db = m.eirpRbDbm + taper + m.ueGainDbi -
+                                  FeederLinkLossModel::FreeSpaceDb(m.dlHz, (sat - u).GetLength()) -
+                                  m.lossDl->AtmosphericDb(elev) - m.lossDl->ScintillationDb() -
+                                  m.marginDlDb;
+                if (c == m.mapCell)
+                {
+                    dlOwnMw[v] = lin(db);
+                    dlOwnElev[v] = elev;
+                }
+                else
+                {
+                    dl[v].push_back({c, lin(db), elev});
+                }
+            }
+        }
+        // uplink: what each UE of the colour's cells gives the map cell's beam on an RB (mW)
+        std::vector<double> ulMw(nUes, 0.0);
+        std::vector<double> ulElev(nUes, 0.0);
+        std::vector<uint8_t> ulPruned(nUes, 1);
+        for (uint32_t c : sameColour)
+        {
+            for (uint32_t i : uesOf[c])
+            {
+                const Vector& u = m.uePos[i];
+                const double toMap =
+                    BeamTaperDb(satAt[mapSat], m.cellCentre[m.mapCell], u, m.kaUl, m.floorDb);
+                const double toOwn =
+                    BeamTaperDb(satAt[m.cellSat[c]], m.cellCentre[c], u, m.kaUl, m.floorDb);
+                if (c != m.mapCell && toMap < toOwn - m.pruneDb)
+                {
+                    continue;
+                }
+                const double elev = ElevationDeg(satAt[mapSat], u);
+                ulMw[i] = lin(ueRbDbm + m.ueGainDbi + m.satGainUlDbi + toMap -
+                              FeederLinkLossModel::FreeSpaceDb(m.ulHz, (satAt[mapSat] - u).GetLength()) -
+                              m.lossUl->AtmosphericDb(elev) - m.lossUl->ScintillationDb() -
+                              m.marginUlDb);
+                ulElev[i] = elev;
+                ulPruned[i] = 0;
+            }
+        }
+
+        for (std::size_t v = 0; v < victims.size(); ++v)
+        {
+            const uint32_t ue = victims[v];
+            for (uint32_t d = 0; d < m.draws; ++d)
+            {
+                // the PDCCH: every cell of the colour on its control symbols, at its share
+                {
+                    const double s = dlOwnMw[v] * lin(ctrlDb(m.mapCell)) *
+                                     lin(-shadowDb(ue, mapSat, dlOwnElev[v])) * fade();
+                    double i = 0.0;
+                    for (const DlLink& l : dl[v])
+                    {
+                        i += l.mw * lin(ctrlDb(l.cell)) *
+                             lin(-shadowDb(ue, m.cellSat[l.cell], l.elevDeg)) * fade();
+                    }
+                    add(e, -1, 2, 0, 10.0 * std::log10(s / (noiseDlMw + i)));
+                }
+                for (std::size_t l = 0; l < loads.size(); ++l)
+                {
+                    // each cell's load on this draw
+                    auto rhoOf = [&](uint32_t c, bool downlink) {
+                        if (loads[l].users < 0)
+                        {
+                            return downlink ? loads[l].rhoDl : loads[l].rhoUl;
+                        }
+                        const uint32_t n = static_cast<uint32_t>(loads[l].users);
+                        const uint32_t talking = c == m.mapCell
+                                                     ? 1 + binomial(n > 0 ? n - 1 : 0, m.vaf)
+                                                     : binomial(n, m.vaf);
+                        return std::min(1.0, talking * (downlink ? m.callRbsDl : m.callRbsUl) / rbsPerS);
+                    };
+                    // A cell's RBs in use in a slot come in k blocks of `block` RBs, k of K =
+                    // R / block with probability p each so that the mean share is the load; the
+                    // victim's block is one of its own cell's k (at least its own). Packed: the
+                    // blocks of every cell start at RB 0, as the nr schedulers place them, so
+                    // another cell's k_j blocks cover the victim's when its index is under k_j;
+                    // random: with probability k_j / K.
+                    auto blocks = [&](uint32_t block) { return std::max<uint32_t>(1, static_cast<uint32_t>(R) / block); };
+                    auto pOf = [&](double rho, uint32_t block) {
+                        return std::min(1.0, rho * R / (blocks(block) * static_cast<double>(block)));
+                    };
+                    auto covers = [&](uint32_t victimIndex, uint32_t kOther, uint32_t K) {
+                        return m.packed ? victimIndex < kOther : uni(rng) * K < kOther;
+                    };
+                    // downlink
+                    const uint32_t kDl = blocks(m.blockDl);
+                    const uint32_t ownDl = 1 + binomial(kDl - 1, pOf(rhoOf(m.mapCell, true), m.blockDl));
+                    const uint32_t vDl = std::min(ownDl - 1, static_cast<uint32_t>(uni(rng) * ownDl));
+                    const double s = dlOwnMw[v] * lin(boostDb(m.mapCell, ownDl * m.blockDl)) *
+                                     lin(-shadowDb(ue, mapSat, dlOwnElev[v])) * fade();
+                    double i = 0.0;
+                    for (const DlLink& k : dl[v])
+                    {
+                        const uint32_t kj = binomial(kDl, pOf(rhoOf(k.cell, true), m.blockDl));
+                        if (kj == 0 || !covers(vDl, kj, kDl))
+                        {
+                            continue;
+                        }
+                        i += k.mw * lin(boostDb(k.cell, kj * m.blockDl)) *
+                             lin(-shadowDb(ue, m.cellSat[k.cell], k.elevDeg)) * fade();
+                    }
+                    add(e, l, 0, 0, 10.0 * std::log10(s / (noiseDlMw + i)));
+                    add(e, l, 0, 1, 10.0 * std::log10(s / noiseDlMw));
+                    // uplink: the victim on its block, and a UE of each other cell whose blocks cover it
+                    const uint32_t kUl = blocks(m.blockUl);
+                    const uint32_t ownUl = 1 + binomial(kUl - 1, pOf(rhoOf(m.mapCell, false), m.blockUl));
+                    const uint32_t vUl = std::min(ownUl - 1, static_cast<uint32_t>(uni(rng) * ownUl));
+                    const double su = ulMw[ue] * lin(-shadowDb(ue, mapSat, ulElev[ue])) * fade();
+                    double iu = 0.0;
+                    for (uint32_t c : sameColour)
+                    {
+                        if (c == m.mapCell || uesOf[c].empty())
+                        {
+                            continue;
+                        }
+                        const uint32_t kj = binomial(kUl, pOf(rhoOf(c, false), m.blockUl));
+                        if (kj == 0 || !covers(vUl, kj, kUl))
+                        {
+                            continue;
+                        }
+                        const uint32_t k = uesOf[c][std::min<std::size_t>(
+                            uesOf[c].size() - 1,
+                            static_cast<std::size_t>(uni(rng) * uesOf[c].size()))];
+                        if (ulPruned[k])
+                        {
+                            continue;
+                        }
+                        iu += ulMw[k] * lin(-shadowDb(k, mapSat, ulElev[k])) * fade();
+                    }
+                    add(e, l, 1, 0, 10.0 * std::log10(su / (noiseUlMw + iu)));
+                    add(e, l, 1, 1, 10.0 * std::log10(su / noiseUlMw));
+                }
+            }
+        }
+    }
+
+    // report: percentiles from the histograms
+    auto pct = [&](const std::vector<uint64_t>& h, double q) {
+        uint64_t total = 0;
+        for (uint64_t c : h)
+        {
+            total += c;
+        }
+        uint64_t run = 0;
+        for (int b = 0; b < bins; ++b)
+        {
+            run += h[b];
+            if (run >= q * total)
+            {
+                return -50.0 + (b + 0.5) / 10.0;
+            }
+        }
+        return 50.0;
+    };
+    auto loadName = [&](int l) {
+        if (l < 0)
+        {
+            return std::string("full (control)");
+        }
+        return loads[l].users < 0
+                   ? "load " + Num(loads[l].rhoDl, 3) +
+                         (loads[l].rhoUl != loads[l].rhoDl ? "/" + Num(loads[l].rhoUl, 3) : std::string())
+                   : std::to_string(loads[l].users) + " calls/beam";
+    };
+    const char* dirName[3] = {"downlink", "uplink", "PDCCH"};
+    std::cout << "\n SINR MAP of the centre cell (cell " << m.mapCell << ", " << victims.size()
+              << " UEs x " << m.draws << " draws; one RB)\n"
+              << "  elev[deg]  load                 link        SINR[dB]:  5%    50%    95%"
+                 "    SNR 50%\n";
+    for (std::size_t e = 0; e < when.size(); ++e)
+    {
+        for (int l = -1; l < static_cast<int>(loads.size()); ++l)
+        {
+            for (int dir = 0; dir < 3; ++dir)
+            {
+                auto it = hist.find({static_cast<int>(e), l, dir, 0});
+                if (it == hist.end())
+                {
+                    continue;
+                }
+                auto snr = hist.find({static_cast<int>(e), l, dir, 1});
+                std::cout << std::fixed << std::setprecision(1) << std::setw(10) << when[e].first
+                          << "  " << std::left << std::setw(20) << loadName(l) << " "
+                          << std::setw(10) << dirName[dir] << std::right << std::setw(12)
+                          << pct(it->second, 0.05) << std::setw(7) << pct(it->second, 0.5)
+                          << std::setw(7) << pct(it->second, 0.95);
+                if (snr != hist.end())
+                {
+                    std::cout << std::setw(11) << pct(snr->second, 0.5);
+                }
+                std::cout << "\n";
+            }
+        }
+    }
+    std::cout << "SINR of one RB of a UE of the centre cell: the other beams of its colour on that RB at random with "
+                 "the load (PDCCH: all of them, the control symbols take the whole band), shadowing and fast fading "
+                 "drawn per link (--mapFading); SNR: the same without interference.\n";
+    if (!m.csv.empty())
+    {
+        std::ostringstream lines;
+        for (const auto& [key, h] : hist)
+        {
+            const auto [e, l, dir, q] = key;
+            for (int b = 0; b < bins; ++b)
+            {
+                if (h[b] == 0)
+                {
+                    continue;
+                }
+                lines << m.satellites << "," << m.beams << "," << m.reuse << "," << CsvNum(when[e].first)
+                      << "," << (l < 0 ? std::string("1")
+                                       : (loads[l].users < 0 ? CsvNum(dir == 0 ? loads[l].rhoDl : loads[l].rhoUl)
+                                                             : std::string("")))
+                      << "," << (l < 0 || loads[l].users < 0 ? std::string("") : std::to_string(loads[l].users))
+                      << "," << (dir == 0 ? "dl" : dir == 1 ? "ul" : "pdcch") << ","
+                      << (q == 0 ? "sinr" : "snr") << "," << CsvNum(-50.0 + (b + 0.5) / 10.0) << ","
+                      << h[b] << "\n";
+            }
+        }
+        WriteCsvFile(m.csv + "_sinrmap.csv",
+                     "satellites,beams,beamReuse,elevDeg,load,users,dir,quantity,sinrDb,count",
+                     lines.str());
+    }
+    return 0;
 }
 
 // The DCIs the cell sends of its own, in the common search space, as the report names them
@@ -6049,6 +6813,8 @@ main(int argc, char* argv[])
     // are those of TR 38.821's link budget (Table 6.1.3.3-1, S-band) with --scenario=NTN-LOS
     std::string shadowing = "fixed";  // fixed: --shadowingDb for every UE; table: TR 38.811
     double shadowingDb = 3.0;         // --shadowing=fixed: TR 38.821's shadowing margin
+    bool perSatLinks = false;         // v10.4: shadowing and fast fading per (UE, satellite)
+    double shadowingDecorDeg = 0.0;   // v10.4: 0 = one shadowing level per call; > 0 = it moves
     std::string atmosphere = "table"; // table: TR 38.821's 0.1 + 2.2 dB; location: by elevation
     double latitudeDeg = 45.0;        // --atmosphere=location: magnetic latitude of the UEs
     std::string fastFading = "fixed"; // fixed: --fastFadingDb on every RB; model: 3GPP channel
@@ -6201,7 +6967,17 @@ main(int argc, char* argv[])
     std::string bsr = "module";   // buffer status reports: module or standard
     std::string beamArea = "best"; // where a UE may be dropped in a cell: best or contour
     double beamEdgeDb = 10.0;    // --beamArea=best: the lowest gain (dB under the peak) of a UE's beam
-    bool geometryOnly = false;   // plan the cells, drop the UEs, print the geometric C/I and stop
+    uint32_t geometryOnly = 0;   // 1: plan the cells, drop the UEs, print the geometric C/I and stop; 2: the SINR map (v10.5)
+    std::string mapLoads = "0.1,0.25,0.5,1"; // --geometryOnly=2: loads (share of a beam's RBs in use)
+    std::string mapUsers;                    // --geometryOnly=2: calls per beam instead (or as well)
+    double mapVaf = -1.0;                    // --geometryOnly=2: a direction's talk probability (-1: --vafMean)
+    std::string mapCallRbs = "294:144";      // --geometryOnly=2: RBs a second of a talking call, DL:UL
+    std::string mapElevations;               // --geometryOnly=2, flying: elevations of the pass (a,b or from:to:step)
+    uint32_t mapDraws = 10;                  // --geometryOnly=2: draws per UE and load
+    bool mapFading = true;                   // --geometryOnly=2: fast fading drawn per link (--fastFading)
+    std::string mapBlockRbs = "0:0";         // --geometryOnly=2: RBs of a DL:UL allocation (0: the carrier : --ulGrantRbs)
+    std::string mapRbChoice = "packed";      // --geometryOnly=2: where a cell's blocks lie: packed (from RB 0) or random
+    bool rbLoad = false;                     // v10.5: write <csv>_rbload.csv, the RBs each cell used
     double gatewayDiameterKm = 200.0; // transparent only: the gateway is somewhere in a circle of
                                       // this diameter around UE 0; 0 = where UE 0 is
     // The feeder link, transparent only: gateway -> satellite in Ka band (see the top of the file)
@@ -6230,6 +7006,13 @@ main(int argc, char* argv[])
     std::string pdcchBlerTable; // SINR:BLER pairs for aggregation level 1; empty = NrPdcch's own
     std::string scheduling = "dynamic"; // dynamic, sps1 or sps2 (voice only)
     std::string spsDirection = "both";  // --scheduling=sps1/sps2 on: both, dl (SPS only), ul (CG only)
+    double cgMaxRepShare = 1.0;         // v10.3: CG repetitions K at most this share of the period
+    bool cgSrsSafe = false;             // v10.3: CG blocks fit the symbols an SRS slot leaves
+    uint32_t spsDlMaxWaitMs = 0;        // v10.3: DL SPS: a DCI when the next occasion is further
+    uint32_t spsDlAlignMs = 0;          // v10.3: DL SPS: start a configuration this long after its packet
+    double pdcchUlMaxShare = -1.0;      // NrPdcch::UlMaxShare, -1 = as the attribute (0.5)
+    std::string pdcchBalance = "fixed"; // v10.3: UL/DL share of the CCEs: fixed or demand
+    bool srs = true;                    // v10.3: SRS on (nr default); its SINR is not used here
     double progressS = 10.0;            // a progress line on stderr every this many simulated s
     uint32_t spsFitExtraBytes = 0;      // sps2: 0 = blocks of the steady state (see --spsFitExtraBytes)
     std::string cgSilenceSwitch = "nextSid"; // sps2 uplink: nextSid | immediate
@@ -6479,9 +7262,18 @@ main(int argc, char* argv[])
                  gatewayDiameterKm);
     cmd.AddValue("gatewayGainDbi", "Feeder link: gateway antenna gain (dBi)", gatewayGainDbi);
     cmd.AddValue("geometryOnly",
-                 "Plan the cells and drop the UEs, print each cell's geometric full-load C/I "
-                 "(BEAMS) and stop: no simulation, so --nUes can be in the thousands",
+                 "No simulation: 1 = print each cell's full-load C/I (BEAMS) and stop; 2 = SINR map of the centre cell's UEs (v10.5)",
                  geometryOnly);
+    cmd.AddValue("mapLoads", "--geometryOnly=2: loads to map, the share of a beam's RBs in use, or downlink/uplink (comma list, e.g. 0.1,0.02/0.05)", mapLoads);
+    cmd.AddValue("mapUsers", "--geometryOnly=2: calls per beam to map instead or as well (comma list)", mapUsers);
+    cmd.AddValue("mapVaf", "--geometryOnly=2, --mapUsers: probability a call's direction talks (-1 = --vafMean)", mapVaf);
+    cmd.AddValue("mapCallRbs", "--geometryOnly=2, --mapUsers: RBs a second of a talking call, downlink:uplink", mapCallRbs);
+    cmd.AddValue("mapElevations", "--geometryOnly=2, flying: elevations of the pass to map, a list or from:to:step (empty = --elevation to the top, 10 deg steps)", mapElevations);
+    cmd.AddValue("mapDraws", "--geometryOnly=2: draws of load, shadowing and fading per UE and load", mapDraws);
+    cmd.AddValue("mapFading", "--geometryOnly=2: 1 = fast fading drawn per link from --fastFading, 0 = none", mapFading);
+    cmd.AddValue("mapBlockRbs", "--geometryOnly=2: RBs of one allocation, downlink:uplink (0 = the whole carrier : --ulGrantRbs; --rbLoad measures them)", mapBlockRbs);
+    cmd.AddValue("mapRbChoice", "--geometryOnly=2: a cell's allocations from RB 0 up as the nr schedulers place them (packed) or at random RBs (random)", mapRbChoice);
+    cmd.AddValue("rbLoad", "Write <csv>_rbload.csv: the share of each cell's RBs in use, DL and UL, while the calls run (--mapLoads)", rbLoad);
     cmd.AddValue("gfbrKbps", "Guaranteed bit rate of the 5QI 1 voice flow (kbit/s)", gfbrKbps);
     cmd.AddValue("hangoverFrames",
                  "--rtp=1: voice frames still sent after the talk stops, before DTX",
@@ -6629,7 +7421,7 @@ main(int argc, char* argv[])
                  "Size table: packets in a row with that header at a talk-spurt start; 0 = --rohcUpdatePackets",
                  rohcSpurtStartPackets);
     cmd.AddValue("rohcUpdatePackets",
-                 "Size table: context updates in a row for each change of the header",
+                 "Size table: context updates in a row for each change of the header; --rohcCase=variable: every 13 B packet (talk-spurt start, first SID_UPDATE)",
                  rohcUpdatePackets);
     cmd.AddValue("rtp", "1 = RTP source: 40 B headers, hangover; 0 = NGMN generator: 28 B", rtp);
     cmd.AddValue("satAntennaGainDbi",
@@ -6663,6 +7455,27 @@ main(int argc, char* argv[])
     cmd.AddValue("scheduling",
                  "Voice: dynamic, or semi-persistent: sps1, sps2 (scenario 1, 2)",
                  scheduling);
+    cmd.AddValue("cgMaxRepShare",
+                 "CG repetitions K at most this share of the period's slots, leaving slots for the DCI of leftover data (1: v10.2, up to all)",
+                 cgMaxRepShare);
+    cmd.AddValue("cgSrsSafe",
+                 "CG blocks sized to the symbols a slot with SRS leaves, so no occasion is dropped in SRS slots (0: v10.2)",
+                 cgSrsSafe);
+    cmd.AddValue("spsDlMaxWaitMs",
+                 "DL SPS: a packet whose next occasion is more than this many ms away goes with a DCI (0: v10.2, it waits; 40 suggested)",
+                 spsDlMaxWaitMs);
+    cmd.AddValue("spsDlAlignMs",
+                 "DL SPS: a configuration starts this many ms after its first packet came, so jittered later packets come before their occasions (0: v10.2)",
+                 spsDlAlignMs);
+    cmd.AddValue("pdcchUlMaxShare",
+                 "Share of the CORESET uplink grants may take when the downlink wants the CCEs (-1: NrPdcch::UlMaxShare, 0.5; 1: no cap)",
+                 pdcchUlMaxShare);
+    cmd.AddValue("pdcchBalance",
+                 "How UL grants and DL assignments share the CCEs: fixed (--pdcchUlMaxShare) or demand (in proportion to what each asks for)",
+                 pdcchBalance);
+    cmd.AddValue("srs",
+                 "Sounding reference signals: 1 = nr default (a symbol per UE every 80 slots), 0 = none (this model takes UL SINR from PUSCH only)",
+                 srs);
     cmd.AddValue("spsDirection",
                  "--scheduling=sps1/sps2 on: both, dl (downlink SPS, uplink dynamic) or ul (uplink CG, downlink dynamic)",
                  spsDirection);
@@ -6670,6 +7483,12 @@ main(int argc, char* argv[])
                  "fixed = --shadowingDb, all UEs; table = random per UE (TR 38.811)",
                  shadowing);
     cmd.AddValue("shadowingDb", "--shadowing=fixed: its loss (dB)", shadowingDb);
+    cmd.AddValue("perSatLinks",
+                 "Shadowing level and fast fading per (UE, satellite): shared by a satellite's beams, independent between satellites (0: one per UE / one per beam, v10.3)",
+                 perSatLinks);
+    cmd.AddValue("shadowingDecorDeg",
+                 "--shadowing=table: 0 = a UE's shadowing level is drawn once per call; > 0 = a new independent level every this many deg of the satellite's motion seen from the UE, blended smoothly (stays N(0,1))",
+                 shadowingDecorDeg);
     cmd.AddValue("sidIntervalMs",
                  "DTX: a SID frame at once, then every this many ms (multiple of 20)",
                  sidIntervalMs);
@@ -6803,7 +7622,9 @@ main(int argc, char* argv[])
     if (rohcCase == "constant3" || rohcCase == "variable")
     {
         rohcSpurtStartSize = rohcCase == "constant3" ? 3 : 13;
-        rohcSpurtStartPackets = 1;
+        // (variable: the talk-spurt start repeats as many times as any context update, so
+        // --rohcUpdatePackets sets the count of every 13 B packet; constant3 keeps 1)
+        rohcSpurtStartPackets = rohcCase == "constant3" ? 1 : 0;
         rohcUpdatePackets = 1;
     }
     cmd.Parse(argc, argv);
@@ -7048,6 +7869,10 @@ main(int argc, char* argv[])
     // NTN-LOS: the rural environment with every UE in line of sight all the time
     const bool alwaysLos = (scenario == "NTN-LOS");
     const std::string environment = alwaysLos ? std::string("NTN-Rural") : scenario;
+    NS_ABORT_MSG_UNLESS(std::isfinite(shadowingDecorDeg) && shadowingDecorDeg >= 0.0,
+                        "--shadowingDecorDeg: 0 or more");
+    NS_ABORT_MSG_IF(shadowingDecorDeg > 0.0 && shadowing != "table",
+                    "--shadowingDecorDeg moves the random shadowing level: it needs --shadowing=table");
     NS_ABORT_MSG_UNLESS(shadowing == "fixed" || shadowing == "table",
                         "--shadowing must be fixed or table");
     NS_ABORT_MSG_UNLESS(atmosphere == "table" || atmosphere == "location",
@@ -7077,6 +7902,8 @@ main(int argc, char* argv[])
     const bool fixedFastFading = (fastFading == "fixed");
     // --fastFading=ntn-tdl-*: the profile's letter (0: not that), its Doppler
     const char tdlProfile = fastFading.rfind("ntn-tdl-", 0) == 0 ? fastFading.back() : 0;
+    NS_ABORT_MSG_IF(geometryOnly > 2, "--geometryOnly is 0, 1 or 2");
+    NS_ABORT_MSG_IF(rbLoad && csv.empty(), "--rbLoad writes <csv>_rbload.csv: give --csv");
     NS_ABORT_MSG_UNLESS(std::isfinite(vafMean) && vafMean >= 0.0 && vafMean <= 0.99 &&
                             std::isfinite(vafStd) && vafStd >= 0.0 && vafStd <= 1.0,
                         "--vafMean must be 0 to 0.99 and --vafStd 0 to 1 (a mean outside the range "
@@ -7323,7 +8150,7 @@ main(int argc, char* argv[])
     {
         // Case A: every compressed header 3 B (UOR-2, UDP checksum off), IR 39 B. Case B (UDP
         // checksum on): UO-0 3 B on voice and SID_FIRST, the first SID_UPDATE and the talk-spurt
-        // start 13 B (UOR-2-EXT-3), later SID_UPDATEs 5 B (UOR-2-TS); one packet each
+        // start 13 B (UOR-2-EXT-3), later SID_UPDATEs 5 B (UOR-2-TS); --rohcUpdatePackets of each
         const bool constant = rohcCase == "constant3";
         Config::SetDefault("ns3::NrPdcp::RohcTableUo0Size", UintegerValue(3));
         Config::SetDefault("ns3::NrPdcp::RohcTableUpdateSize", UintegerValue(constant ? 3 : 13));
@@ -7531,6 +8358,30 @@ main(int argc, char* argv[])
                         "--spsDirection must be both, dl or ul");
     NS_ABORT_MSG_IF(spsScenario == 0 && spsDirection != "both",
                     "--spsDirection=" << spsDirection << " needs --scheduling=sps1 or sps2");
+    NS_ABORT_MSG_UNLESS(cgMaxRepShare > 0.0 && cgMaxRepShare <= 1.0, "--cgMaxRepShare: more than 0, at most 1");
+    NS_ABORT_MSG_IF(spsDlAlignMs >= 20, "--spsDlAlignMs: less than the 20 ms talk period (a few ms)");
+    NS_ABORT_MSG_IF(spsDlMaxWaitMs > 0 && spsDlMaxWaitMs <= 20,
+                    "--spsDlMaxWaitMs: 0, or more than the 20 ms talk period (it is meant for the 160 ms silence occasions)");
+    NS_ABORT_MSG_UNLESS(pdcchUlMaxShare == -1.0 || (pdcchUlMaxShare >= 0.0 && pdcchUlMaxShare <= 1.0),
+                        "--pdcchUlMaxShare: 0 to 1, or -1");
+    Config::SetDefault("ns3::NrMacSchedulerNs3::CgMaxRepShare", DoubleValue(cgMaxRepShare));
+    Config::SetDefault("ns3::NrMacSchedulerNs3::SpsSrsSafe", BooleanValue(cgSrsSafe));
+    Config::SetDefault("ns3::NrMacSchedulerNs3::SpsDlMaxWaitMs", UintegerValue(spsDlMaxWaitMs));
+    Config::SetDefault("ns3::NrMacSchedulerNs3::SpsDlAlignMs", UintegerValue(spsDlAlignMs));
+    if (pdcchUlMaxShare >= 0.0)
+    {
+        Config::SetDefault("ns3::NrPdcch::UlMaxShare", DoubleValue(pdcchUlMaxShare));
+    }
+    NS_ABORT_MSG_UNLESS(pdcchBalance == "fixed" || pdcchBalance == "demand",
+                        "--pdcchBalance: fixed or demand");
+    NS_ABORT_MSG_IF(pdcchBalance == "demand" && pdcchUlMaxShare >= 0.0,
+                    "--pdcchUlMaxShare is for --pdcchBalance=fixed");
+    Config::SetDefault("ns3::NrPdcch::UlBalance", StringValue(pdcchBalance));
+    if (!srs)
+    {
+        Config::SetDefault("ns3::NrMacSchedulerNs3::EnableSrsInUlSlots", BooleanValue(false));
+        Config::SetDefault("ns3::NrMacSchedulerNs3::EnableSrsInFSlots", BooleanValue(false));
+    }
     NS_ABORT_MSG_UNLESS(cgSilenceSwitch == "nextSid" || cgSilenceSwitch == "immediate",
                         "--cgSilenceSwitch: nextSid or immediate");
     uint32_t spsTbBytes = 0;
@@ -8442,6 +9293,230 @@ main(int argc, char* argv[])
         }
     }
 
+    if (geometryOnly == 2)
+    {
+        // The SINR map (v10.5): see RunSinrMap()
+        auto numbers = [](const std::string& text, const std::string& what) {
+            std::vector<double> out;
+            std::stringstream ss(text);
+            std::string tok;
+            while (std::getline(ss, tok, ','))
+            {
+                if (tok.empty())
+                {
+                    continue;
+                }
+                const auto colon = tok.find(':');
+                if (colon != std::string::npos)
+                {
+                    // from:to:step
+                    double from = 0.0;
+                    double to = 0.0;
+                    double step = 0.0;
+                    char c1 = 0;
+                    char c2 = 0;
+                    std::stringstream ts(tok);
+                    ts >> from >> c1 >> to >> c2 >> step;
+                    NS_ABORT_MSG_UNLESS(ts && c1 == ':' && c2 == ':' && step > 0.0 && to >= from,
+                                        what << ": " << tok << " is not from:to:step");
+                    for (double x = from; x <= to + 1e-9; x += step)
+                    {
+                        out.push_back(x);
+                    }
+                    continue;
+                }
+                std::size_t used = 0;
+                double x = NAN;
+                try
+                {
+                    x = std::stod(tok, &used);
+                }
+                catch (...)
+                {
+                }
+                NS_ABORT_MSG_UNLESS(std::isfinite(x) && used == tok.size(),
+                                    what << ": " << tok << " is not a number");
+                out.push_back(x);
+            }
+            return out;
+        };
+        NS_ABORT_MSG_IF(bigCell, "--geometryOnly=2 maps a cell per beam: not with --singleCell=1");
+        NS_ABORT_MSG_IF(dlPowerRefDeg > 0.0 || ulPowerRefDeg > 0.0 || dlClosedLoop > 0 || ulClosedLoop,
+                        "--geometryOnly=2 does not model the power controls (--dlPowerRefDeg, "
+                        "--ulPowerRefDeg, --dlClosedLoop, --ulClosedLoop): leave them off");
+        NS_ABORT_MSG_UNLESS(alwaysLos,
+                            "--geometryOnly=2 maps links in line of sight: use --scenario=NTN-LOS");
+        NS_ABORT_MSG_IF(mapFading && fastFading == "model",
+                        "--geometryOnly=2: --fastFading=model has no flat draw here; use "
+                        "--fastFading=ntn-tdl-c (or -a, -b, -d), fixed, or --mapFading=0");
+        NS_ABORT_MSG_IF(mapDraws == 0, "--mapDraws must be at least 1");
+        SinrMapSetup m;
+        m.orbits = satOrbits;
+        m.flying = !freezeGeometry;
+        m.tFrom = callsStart;
+        m.tTo = callsEnd;
+        m.ue0 = centrePosition;
+        std::vector<double> elevations = numbers(mapElevations, "--mapElevations");
+        if (elevations.empty())
+        {
+            for (double e = elevation; e <= 90.0 + 1e-9; e += 10.0)
+            {
+                elevations.push_back(e);
+            }
+        }
+        NS_ABORT_MSG_IF(freezeGeometry && !mapElevations.empty(),
+                        "--mapElevations is for a flying satellite (--freezeGeometry=0 or "
+                        "--fullPass=1); a standing one is mapped at --elevation");
+        m.elevations = elevations;
+        for (uint32_t c = 0; c < nCells; ++c)
+        {
+            m.cellSat.push_back(beamPlan.empty() ? 0 : beamPlan[c].sat);
+            m.cellCentre.push_back(c == 0 || beamPlan.empty() ? centrePosition : beamPlan[c].centre);
+            m.cellColour.push_back(beamPlan.empty() ? 0 : beamPlan[c].colour);
+        }
+        for (uint32_t i = 0; i < nUes; ++i)
+        {
+            m.uePos.push_back(ueMobility[i]->GetPosition());
+            m.ueCell.push_back(ueCell[i]);
+        }
+        m.kaDl = g_scene.beamKa[0];
+        m.kaUl = g_scene.beamKa[1];
+        m.floorDb = floorDb;
+        m.pruneDb = multiCell ? beamPruneDb : 1e9;
+        const int col = m.cellColour[0];
+        m.dlHz = dlFrequencyHz + (multiCell ? col : 0) * bandwidthHz;
+        m.ulHz = ulFrequencyHz + (multiCell ? col : 0) * bandwidthHz;
+        m.carrierRbs = carrierRbs;
+        m.rbHz = occupiedHz / carrierRbs;
+        m.slotsPerS = 1000.0; // 15 kHz
+        m.eirpRbDbm = satEirpDbwPerMHz + 30.0 + 10.0 * std::log10(m.rbHz / 1e6);
+        m.shareDbm = satEirpDbm - satAntennaGainDb - 10.0 * std::log10(carrierRbs);
+        m.satGainDl = satAntennaGainDb;
+        m.boostMaxDb = dlBoostMaxDb;
+        m.pfdLimit = dlPfdLimit;
+        m.pfdMarginDb = dlPfdMarginDb;
+        m.ueGainDbi = ueAntennaGainDbi;
+        m.ueNfDb = ueNoiseFigureDb;
+        m.satGainUlDbi = satAntennaGainDbi;
+        m.satNfDb = satNoiseFigureDb;
+        m.ueTxDbm = ueTxPowerDbm;
+        m.lossDl = CreateObject<ServiceLinkLossModel>();
+        m.lossDl->Set(m.dlHz, atmosphereTable, equatorial, linkMarginDb);
+        m.lossUl = CreateObject<ServiceLinkLossModel>();
+        m.lossUl->Set(m.ulHz, atmosphereTable, equatorial, linkMarginDb + ulPolarizationLossDb);
+        m.marginDlDb = linkMarginDb;
+        m.marginUlDb = linkMarginDb + ulPolarizationLossDb;
+        m.fixedShadowing = fixedShadowing;
+        m.fixedShadowingDb = shadowingDb;
+        m.table = g_largeScaleTables.at(environment);
+        m.perSat = perSatLinks;
+        m.interpolateSigma = perSatLinks || shadowingDecorDeg > 0.0;
+        if (mapFading && fixedFastFading)
+        {
+            m.fading = 1;
+            m.fixedFadingDb = fastFadingDb;
+        }
+        else if (mapFading && tdlProfile != 0)
+        {
+            m.fading = 2;
+            double los = 0.0;
+            double scattered = 0.0;
+            for (const auto& tap : NtnTdlProcess::Taps(tdlProfile))
+            {
+                (tap.los ? los : scattered) += std::pow(10.0, tap.powerDb / 10.0);
+            }
+            m.ricianK = los / scattered;
+        }
+        {
+            // a load, or downlink/uplink
+            std::stringstream ss(mapLoads);
+            std::string tok;
+            while (std::getline(ss, tok, ','))
+            {
+                if (tok.empty())
+                {
+                    continue;
+                }
+                const auto slash = tok.find('/');
+                const auto dlRho = numbers(tok.substr(0, slash), "--mapLoads");
+                const auto ulRho = slash == std::string::npos ? dlRho : numbers(tok.substr(slash + 1), "--mapLoads");
+                NS_ABORT_MSG_UNLESS(dlRho.size() == 1 && ulRho.size() == 1 && dlRho[0] >= 0.0 &&
+                                        dlRho[0] <= 1.0 && ulRho[0] >= 0.0 && ulRho[0] <= 1.0,
+                                    "--mapLoads: a load is 0 to 1, or downlink/uplink (0.02/0.05), not " << tok);
+                m.loads.emplace_back(dlRho[0], ulRho[0]);
+            }
+        }
+        for (double n : numbers(mapUsers, "--mapUsers"))
+        {
+            NS_ABORT_MSG_UNLESS(n >= 1.0 && n == std::floor(n), "--mapUsers: whole numbers of calls, not " << n);
+            m.users.push_back(static_cast<uint32_t>(n));
+        }
+        m.vaf = mapVaf < 0.0 ? vafMean : mapVaf;
+        NS_ABORT_MSG_UNLESS(m.vaf >= 0.0 && m.vaf <= 1.0, "--mapVaf must be 0 to 1");
+        {
+            const auto colon = mapCallRbs.find(':');
+            NS_ABORT_MSG_IF(colon == std::string::npos, "--mapCallRbs is downlink:uplink, e.g. 294:144");
+            const auto dlRbs = numbers(mapCallRbs.substr(0, colon), "--mapCallRbs");
+            const auto ulRbs = numbers(mapCallRbs.substr(colon + 1), "--mapCallRbs");
+            NS_ABORT_MSG_UNLESS(dlRbs.size() == 1 && ulRbs.size() == 1 && dlRbs[0] > 0.0 && ulRbs[0] > 0.0,
+                                "--mapCallRbs is downlink:uplink, e.g. 294:144");
+            m.callRbsDl = dlRbs[0];
+            m.callRbsUl = ulRbs[0];
+        }
+        {
+            const auto colon = mapBlockRbs.find(':');
+            NS_ABORT_MSG_IF(colon == std::string::npos, "--mapBlockRbs is downlink:uplink, e.g. 25:1");
+            const auto dlB = numbers(mapBlockRbs.substr(0, colon), "--mapBlockRbs");
+            const auto ulB = numbers(mapBlockRbs.substr(colon + 1), "--mapBlockRbs");
+            NS_ABORT_MSG_UNLESS(dlB.size() == 1 && ulB.size() == 1 && dlB[0] >= 0.0 && ulB[0] >= 0.0 &&
+                                    dlB[0] <= carrierRbs && ulB[0] <= carrierRbs,
+                                "--mapBlockRbs is downlink:uplink RBs, 0 to " << carrierRbs);
+            m.blockDl = dlB[0] > 0.0 ? static_cast<uint32_t>(std::lround(dlB[0])) : carrierRbs;
+            m.blockUl = ulB[0] > 0.0 ? static_cast<uint32_t>(std::lround(ulB[0]))
+                                     : (ulGrantRbs > 0 ? ulGrantRbs : carrierRbs);
+        }
+        NS_ABORT_MSG_UNLESS(mapRbChoice == "packed" || mapRbChoice == "random",
+                            "--mapRbChoice is packed or random");
+        m.packed = mapRbChoice == "packed";
+        m.draws = mapDraws;
+        m.seed = RngSeedManager::GetSeed() * 1000003ULL + RngSeedManager::GetRun();
+        m.csv = csv;
+        m.beams = beams;
+        m.satellites = satellites;
+        m.reuse = multiCell ? beamReuse : 1;
+        Frame("SINR MAP (--geometryOnly=2)",
+              std::to_string(nCells) + " cells: " + std::to_string(beams) + " beam" +
+                  (beams == 1 ? "" : "s") + " x " + std::to_string(satellites) + " satellite" +
+                  (satellites == 1 ? "" : "s") + ", frequency reuse " + std::to_string(m.reuse) +
+                  ", " + std::to_string(nUesPerCell) + " UEs dropped in each");
+        Setting("satellite", m.flying ? "flying: the map is taken where satellite 0 is at each elevation of the rising half of the pass"
+                                      : "standing at --elevation");
+        Setting("link budget", "the header's: EIRP " + Num(satEirpDbwPerMHz, 2) + " dBW/MHz, UE " +
+                                   Num(ueTxPowerDbm, 0) + " dBm on " + std::to_string(m.blockUl) +
+                                   " RB, UE antenna " + Num(ueAntennaGainDbi, 1) + " dBi, noise figures UE " +
+                                   Num(ueNoiseFigureDb, 0) + " / satellite " + Num(satNoiseFigureDb, 2) + " dB");
+        Setting("shadowing", fixedShadowing ? Num(shadowingDb, 1) + " dB on every link"
+                                            : std::string("table: a level per UE") +
+                                                  (perSatLinks ? " and satellite" : "") + ", sigma of the link's elevation");
+        Setting("fast fading", m.fading == 2 ? "a flat draw per link, profile " + fastFading + " (K = " +
+                                                   Num(10.0 * std::log10(std::max(m.ricianK, 1e-12)), 2) + " dB)"
+                               : m.fading == 1 ? Num(fastFadingDb, 1) + " dB on every link"
+                                               : std::string("none"));
+        Setting("downlink power", m.boostMaxDb > 0.0 || m.pfdLimit != 0.0
+                                      ? "an RB in use takes the idle RBs' power of its symbol up to the cap (--dlBoostMaxDb, PFD limit)"
+                                      : std::string("each RB in use at its share"));
+        Setting("allocations", "a cell's RBs in use come in blocks of " + std::to_string(m.blockDl) + " DL / " +
+                                   std::to_string(m.blockUl) + " UL RBs (--mapBlockRbs), " +
+                                   (m.packed ? "every cell's from RB 0 up, as the nr schedulers place them"
+                                             : "at random RBs") + " (--mapRbChoice)");
+        if (!m.users.empty())
+        {
+            Setting("calls", "a direction of a call talks with probability " + Num(m.vaf, 2) +
+                                 ", a talking call takes " + Num(m.callRbsDl, 0) + " DL / " +
+                                 Num(m.callRbsUl, 0) + " UL RBs a second (--mapCallRbs)");
+        }
+        return RunSinrMap(m);
+    }
     if (geometryOnly)
     {
         // The geometry of the cells and the interference at full load, nothing is simulated
@@ -8620,6 +9695,53 @@ main(int argc, char* argv[])
             levels->AddUe(ueMobility[i],
                           alwaysLos ? 0.0 : obstructionLevel,
                           shadowingLevel->GetValue());
+        }
+        // --perSatLinks: the levels towards the other satellites, each pair its own, from
+        // streams of their own (UE by UE, satellite by satellite), so that nothing else moves
+        if (perSatLinks && satellites > 1)
+        {
+            Ptr<UniformRandomVariable> pairObstruction =
+                CreateObjectWithAttributes<UniformRandomVariable>("Stream", IntegerValue(311));
+            Ptr<NormalRandomVariable> pairShadowing =
+                CreateObjectWithAttributes<NormalRandomVariable>("Stream", IntegerValue(312));
+            for (uint32_t i = 0; i < nUes; ++i)
+            {
+                std::vector<double> u(satellites);
+                std::vector<double> z(satellites);
+                for (uint32_t sat = 0; sat < satellites; ++sat)
+                {
+                    const double ob = pairObstruction->GetValue();
+                    u[sat] = alwaysLos ? 0.0 : ob;
+                    z[sat] = pairShadowing->GetValue();
+                }
+                levels->SetUeSats(ueMobility[i], beamPlan[ueCell[i]].sat, u, z);
+            }
+        }
+        for (uint32_t c = 0; c < nCells; ++c)
+        {
+            levels->SetSatOf(cellMobility[c], beamPlan[c].sat);
+        }
+        if (!perSatLinks || satellites == 1)
+        {
+            for (uint32_t i = 0; i < nUes; ++i)
+            {
+                levels->SetUeSats(ueMobility[i], beamPlan[ueCell[i]].sat, {}, {});
+            }
+        }
+        levels->SetLinkLevels(perSatLinks,
+                              shadowingDecorDeg,
+                              CreateObjectWithAttributes<NormalRandomVariable>("Stream",
+                                                                               IntegerValue(313)));
+        // --perSatLinks: the cells of one satellite share its fading to a UE
+        if (perSatLinks)
+        {
+            std::map<uint32_t, uint32_t> firstNodeOfSat;
+            for (uint32_t c = 0; c < nCells; ++c)
+            {
+                const uint32_t id = cellNodes.Get(c)->GetId();
+                const auto it = firstNodeOfSat.emplace(beamPlan[c].sat, id).first;
+                g_tdlNodeOfSat[id] = it->second;
+            }
         }
     }
     g_scene.levels = levels;
@@ -9121,7 +10243,11 @@ main(int argc, char* argv[])
                                  "UlSinrAvgTime",
                                  "UlWideGrantRbs",
                                  "UlWideSinrDb",
-                                 "UlWideLoadPct"})
+                                 "UlWideLoadPct",
+                                 "CgMaxRepShare",
+                                 "SpsSrsSafe",
+                                 "SpsDlMaxWaitMs",
+                                 "SpsDlAlignMs"})
         {
             nrHelper->SetSchedulerAttribute(name, *moduleDefault("ns3::NrMacSchedulerNs3", name));
         }
@@ -9422,15 +10548,34 @@ main(int argc, char* argv[])
     // Timing advance: each UE sends early by its one-way delay to the gNB (feeder link included
     // when transparent), on both of its BWP PHYs. The UE PHY asks again before every slot, so the
     // advance follows a moving satellite.
+    // The satellite is that of the UE's serving cell now: after a radio link failure the UE
+    // attaches to the strongest cell it hears (NrUeRrc), which with several beams or satellites
+    // can be another one (its GNSS position and the ephemeris of that satellite, TS 38.300
+    // 16.14.2); until it has one, the satellite of the cell it was dropped in
+    auto satOfCellId = std::make_shared<std::map<uint16_t, Ptr<MobilityModel>>>();
+    for (uint32_t c = 0; c < nCells; ++c)
+    {
+        Ptr<NrGnbNetDevice> gnbDev = DynamicCast<NrGnbNetDevice>(gnbDevs.Get(gnbOfCell[c]));
+        if (gnbDev)
+        {
+            (*satOfCellId)[gnbDev->GetCellId()] = cellMobility[c];
+        }
+    }
     for (uint32_t i = 0; i < nUes; ++i)
     {
         for (uint32_t bwp = 0; bwp < allBwps.size(); ++bwp)
         {
-            NrHelper::GetUePhy(ueDevs.Get(i), bwp)
-                ->SetTimingAdvanceCallback(
-                    Callback<Time>([ntnDelay, sat = cellMobility[ueCell[i]], ue = ueMobility[i]]() {
-                        return ntnDelay->GetOneWayDelay(sat, ue);
-                    }));
+            Ptr<NrUePhy> uePhy = NrHelper::GetUePhy(ueDevs.Get(i), bwp);
+            uePhy->SetTimingAdvanceCallback(Callback<Time>(
+                [ntnDelay,
+                 satOfCellId,
+                 phy = PeekPointer(uePhy),
+                 home = Ptr<MobilityModel>(cellMobility[ueCell[i]]),
+                 ue = ueMobility[i]]() {
+                    const auto it = satOfCellId->find(phy->GetCellId());
+                    return ntnDelay->GetOneWayDelay(it != satOfCellId->end() ? it->second : home,
+                                                    ue);
+                }));
         }
     }
 
@@ -9738,6 +10883,17 @@ main(int argc, char* argv[])
                                     ->TraceConnectWithoutContext("RxPacketTraceGnb",
                                                                  MakeCallback(&UlSinr)),
                                 "no RxPacketTraceGnb trace source on the gNB spectrum PHY");
+        }
+        if (rbLoad)
+        {
+            g_rbLoadOn = true;
+            g_rbLoadFrom = callsStart;
+            g_rbLoadTo = callsEnd;
+            Connect(NrHelper::GetGnbPhy(gnbDevs.Get(g), 0),
+                    "DlDataPower",
+                    MakeBoundCallback(&DlRbLoad,
+                                      static_cast<uint32_t>(
+                                          gnbDevs.Get(g)->GetObject<NrGnbNetDevice>()->GetCellId())));
         }
         if (dlPfdLimit != 0.0 || dlBoostMaxDb > 0.0 || dlPowerRefDeg > 0.0)
         {
@@ -10114,6 +11270,13 @@ main(int argc, char* argv[])
                     std::to_string(spurtPackets ? spurtPackets : rohcUpdatePackets) +
                     " times (--rohcSpurtStartSize, --rohcSpurtStartPackets; the ROHC library sends "
                     "11 B, 5 times)");
+        if (valueOf("RohcTableSidUpdateSize") > 0 && rohcUpdatePackets > 1)
+        {
+            Setting("",
+                    "silence: the first " + std::to_string(rohcUpdatePackets) +
+                        " SID_UPDATEs are the context update (UOR-2-EXT-3 " + std::to_string(update) +
+                        " B), the later ones UOR-2-TS (--rohcUpdatePackets)");
+        }
         Setting("",
                 "a STATIC-NACK is answered with " + std::to_string(rohcRepairIrPackets) +
                     " IR packet" + (rohcRepairIrPackets == 1 ? "" : "s"));
@@ -10358,7 +11521,9 @@ main(int argc, char* argv[])
         }
         Setting("handover",
                 "none: a UE belongs to the cell it was dropped in, where its beam is the "
-                "strongest of all (--beamArea, --beamEdgeDb), all through the calls");
+                "strongest of all (--beamArea, --beamEdgeDb); only after a radio link failure "
+                "does it attach to the strongest cell it hears, which may be another (its timing "
+                "advance follows; stderr \"[cell]\", the UE table)");
         if (!freezeGeometry)
         {
             Setting("flying",
@@ -10685,8 +11850,25 @@ main(int argc, char* argv[])
                 fixedShadowing ? Num(shadowingDb, 2) +
                                      " dB for every UE all the time (--shadowingDb; TR 38.821's "
                                      "margin: 3 dB)"
-                               : "each UE's level x the sigma of its state and elevation (TR "
+                               : "each UE's level z ~ N(0,1) x the sigma of its state and elevation (TR "
                                  "38.811 Tables 6.6.2-1 to -3)");
+        if (!fixedShadowing)
+        {
+            Setting("",
+                    std::string(perSatLinks && satellites > 1
+                                    ? "a level per UE and satellite, the same for its beams, independent between UEs and between satellites (--perSatLinks)"
+                                    : "a level per UE, the same towards every beam and satellite") +
+                        "; " +
+                        (shadowingDecorDeg > 0.0
+                             ? "it moves smoothly as the satellite moves: a new independent N(0,1) level every " +
+                                   Num(shadowingDecorDeg, 1) +
+                                   " deg the satellite turns through seen from the UE, blended between them: z = cos(pi f/2) z0 + sin(pi f/2) z1, so z stays N(0,1) (--shadowingDecorDeg)"
+                             : std::string("drawn once for the call (--shadowingDecorDeg=0)")));
+            if (perSatLinks || shadowingDecorDeg > 0.0)
+            {
+                Setting("", "sigma linear in the elevation between the table's 10 deg rows");
+            }
+        }
         const double scintillationDl = dlCarrier.serviceExtra->ScintillationDb();
         const double scintillationUl = ulCarrier.serviceExtra->ScintillationDb();
         const std::string scintillationIs =
@@ -10725,6 +11907,15 @@ main(int argc, char* argv[])
                           std::string(1, tdlProfile) + ")"
                     : "3GPP channel per RB and slot: TR 38.901 7.5 with TR 38.811's " +
                           environment + " tables");
+        if (tdlProfile != 0 && multiCell)
+        {
+            Setting("",
+                    perSatLinks ? "one realisation per UE and satellite: a satellite's beams share it (the "
+                                  "same path, only the beam gain differs), satellites are independent "
+                                  "(--perSatLinks)"
+                                : "one realisation per UE and cell: the beams of a satellite fade "
+                                  "independently (--perSatLinks=0)");
+        }
         if (tdlProfile != 0)
         {
             const double dopplerHz = ntnTdlSpeedKmph / 3.6 * dlFrequencyHz / 299792458.0;
@@ -11182,8 +12373,11 @@ main(int argc, char* argv[])
                 "the cell's DCIs (those that found no room before first), random access, uplink "
                 "grants");
         Setting("",
-                "(at most " + Num(100.0 * ulShare, 0) +
-                    " % of the CCEs while the downlink wants them too), downlink assignments;");
+                (AttributeDefault<StringValue>("ns3::NrPdcch", "UlBalance") == "demand"
+                     ? std::string("(their share of the CCEs follows the demand of each direction, "
+                                   "--pdcchBalance=demand), downlink assignments;")
+                     : "(at most " + Num(100.0 * ulShare, 0) +
+                           " % of the CCEs while the downlink wants them too), downlink assignments;"));
         Setting("", "retransmissions before new data, new data as the scheduler ranks the UEs");
         // The voice bearers: a DCI for every block, or semi-persistent scheduling
         const uint32_t confirmBytes =
@@ -11313,6 +12507,43 @@ main(int argc, char* argv[])
                             " B) gets a dynamic grant (uplink: the one that answers the "
                             "scheduling request),");
                 Setting("", "then 2 DCIs change the configuration: 3 DCIs in all");
+            }
+        }
+        {
+            // v10.3 options away from their v10.2 defaults
+            std::ostringstream fx;
+            if (spsScenario != 0 && cgMaxRepShare < 1.0)
+            {
+                fx << "CG repetitions at most " << cgMaxRepShare * 100 << " % of the period; ";
+            }
+            if (spsScenario != 0 && cgSrsSafe)
+            {
+                fx << "CG blocks fit SRS slots; ";
+            }
+            if (spsScenario != 0 && spsDlAlignMs > 0)
+            {
+                fx << "DL configuration starts " << spsDlAlignMs << " ms after its packet; ";
+            }
+            if (spsScenario != 0 && spsDlMaxWaitMs > 0)
+            {
+                fx << "DL packet with a DCI if its occasion is > " << spsDlMaxWaitMs << " ms away; ";
+            }
+            if (!srs)
+            {
+                fx << "no SRS; ";
+            }
+            if (pdcchBalance == "demand")
+            {
+                fx << "UL/DL CCEs by demand; ";
+            }
+            else if (pdcchUlMaxShare >= 0.0)
+            {
+                fx << "UL CCE share " << pdcchUlMaxShare << "; ";
+            }
+            const std::string f = fx.str();
+            if (!f.empty())
+            {
+                Setting("v10.3 options", f.substr(0, f.size() - 2));
             }
         }
         if (spsScenario != 0 && spsDirection != "both")
@@ -11857,6 +13088,20 @@ main(int argc, char* argv[])
     }
     Simulator::Stop(simEnd);
     Simulator::Run();
+    {
+        // uplink signals a gNB dropped because they overlapped in time (a UE off the gNB's
+        // symbol grid); the run goes on, but its uplink is then not quite right
+        const auto drops = NrSpectrumPhy::GetUlOverlapDrops();
+        if (drops[0] + drops[1] > 0)
+        {
+            std::cout << "\nWARNING: the gNBs dropped " << drops[0]
+                      << " uplink control signals that arrived during data and " << drops[1]
+                      << " data signals that arrived during control (a UE off the gNB's symbol "
+                         "grid); these were stops of the run before v10.3.1\n";
+            std::cerr << "[warning] uplink overlaps dropped: " << drops[0] << " control, "
+                      << drops[1] << " data" << std::endl;
+        }
+    }
 
     // The orbit prediction that sized K_offset must be where the model really flew the satellite
     NS_ABORT_MSG_IF((orbit.At(Simulator::Now()) - satMobility->GetPosition()).GetLength() > 1.0,
@@ -12030,6 +13275,11 @@ main(int argc, char* argv[])
         if (g_rlf[i] > 0)
         {
             o << "; " << g_rlf[i] << " radio link failure" << (g_rlf[i] > 1 ? "s" : "");
+            if (i < g_otherCell.size() && g_otherCell[i] > 0)
+            {
+                o << ", then " << g_otherCell[i] << " time" << (g_otherCell[i] > 1 ? "s" : "")
+                  << " in another cell (cell " << g_connections[i].back().cellId << " last)";
+            }
         }
         return o.str();
     };
@@ -14329,6 +15579,12 @@ main(int argc, char* argv[])
                       << "candidate but were held back to leave CCEs to the\n"
                       << "        downlink (NrPdcch::UlMaxShare)\n";
         }
+        if (stats.ulShareSum > 0.0 && stats.slots > 0)
+        {
+            std::cout << "  NOTE: --pdcchBalance=demand: the uplink's share of the CCEs was "
+                      << Num(stats.ulShareSum / static_cast<double>(stats.slots) * 100.0, 1)
+                      << " % on average\n";
+        }
         if (stats.unusedReservations > 0)
         {
             std::cout << "  NOTE: " << stats.unusedReservations << " PDCCH candidates were kept "
@@ -14411,6 +15667,7 @@ main(int argc, char* argv[])
             addN("raisedLevel", stats.raised);
             addN("noReport", stats.noReport);
             addN("ulCapped", stats.ulCapped);
+            add("ulShareMean", CsvNum(stats.slots > 0 ? stats.ulShareSum / static_cast<double>(stats.slots) : 0.0));
             addN("unusedReservations", stats.unusedReservations);
             addN("boostedDcis", stats.boosted);
             add("boostMeanDb", CsvNum(dcis > 0 ? stats.boostSumDb / static_cast<double>(dcis) : 0.0));
@@ -14425,7 +15682,8 @@ main(int argc, char* argv[])
                                                              "ulCgOwnDci",
                                                              "ulCgLost",
                                                              "ulCgConfirmations",
-                                                             "ulCgConfirmationBytes"};
+                                                             "ulCgConfirmationBytes",
+                                                             "dlSpsMaxWait"};
             for (std::size_t i = 0; i < NrPdcch::VOICE_CHANGES; ++i)
             {
                 addN(eventName[i], stats.events[i]);
@@ -14507,6 +15765,13 @@ main(int argc, char* argv[])
                          "configuration. in pieces and own DCI count every\n"
                       << "such packet; the next table has those that follow a change of the "
                          "speaker.\n";
+            if (stats.events[NrPdcch::DL_SPS_WAIT] > 0)
+            {
+                std::cout << "downlink: " << stats.events[NrPdcch::DL_SPS_WAIT]
+                          << " times a waiting packet went with a DCI instead: its occasion was more than "
+                          << AttributeDefault<UintegerValue>("ns3::NrMacSchedulerNs3", "SpsDlMaxWaitMs")
+                          << " ms away (--spsDlMaxWaitMs).\n";
+            }
             const uint64_t confirmations = stats.events[NrPdcch::UL_CG_CONFIRMATION];
             if (confirmations > 0)
             {
@@ -15250,6 +16515,29 @@ main(int argc, char* argv[])
             << "symbols received.\n";
     }
 
+    // --rbLoad (v10.5): the share of each cell's RBs in use while the calls ran (before the
+    // scene lets go of the cells)
+    std::ostringstream rbLoadLines;
+    if (rbLoad)
+    {
+        const double slots = (g_rbLoadTo - g_rbLoadFrom).GetSeconds() * 1000.0; // 15 kHz
+        for (std::size_t c = 0; c < g_scene.cells.size(); ++c)
+        {
+            const Cell& cell = g_scene.cells[c];
+            const auto it = g_rbLoad.find(cell.cellId);
+            const double dlRbs = it == g_rbLoad.end() ? 0.0 : it->second[0];
+            const double ulRbs = it == g_rbLoad.end() ? 0.0 : it->second[1];
+            const double dlAllocs = it == g_rbLoad.end() ? 0.0 : it->second[2];
+            const double ulAllocs = it == g_rbLoad.end() ? 0.0 : it->second[3];
+            const auto ues = std::count(ueCell.begin(), ueCell.end(), static_cast<uint32_t>(c));
+            rbLoadLines << c << "," << cell.sat << "," << cell.beam << "," << cell.colour << "," << ues
+                        << "," << CsvNum(slots / 1000.0) << "," << CsvNum(dlRbs) << "," << CsvNum(ulRbs)
+                        << "," << CsvNum(dlRbs / (slots * carrierRbs)) << ","
+                        << CsvNum(ulRbs / (slots * carrierRbs)) << "," << CsvNum(dlAllocs) << ","
+                        << CsvNum(ulAllocs) << "," << CsvNum(dlAllocs > 0 ? dlRbs / dlAllocs : 0.0) << ","
+                        << CsvNum(ulAllocs > 0 ? ulRbs / ulAllocs : 0.0) << "\n";
+        }
+    }
     g_scene = Scene(); // let go of the nodes before the simulator is destroyed
     g_sinrTraceDl.close();
     g_sinrTraceUl.close();
@@ -15281,6 +16569,12 @@ main(int argc, char* argv[])
                          "ciMeanDb,ciMinDb,dlSinrDb,onBearer,inPdb,late,discard,lost,overPdbPct,"
                          "perPct,ccePct",
                      csvCells.str());
+        if (rbLoad)
+        {
+            WriteCsvFile(csv + "_rbload.csv",
+                         "cell,sat,beam,colour,ues,windowS,dlRbs,ulRbs,dlLoad,ulLoad,dlAllocs,ulAllocs,dlBlockRbs,ulBlockRbs",
+                         rbLoadLines.str());
+        }
         WriteCsvFile(csv + "_control.csv",
                      csvRunHeader +
                          ",admission,admissionRbPct,admissionCcePct,dropCalls,dropOnTimePct,"

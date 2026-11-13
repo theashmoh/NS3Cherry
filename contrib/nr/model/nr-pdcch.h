@@ -153,6 +153,7 @@ class NR_EXPORT NrPdcch : public Object
         UL_CG_LOST_CONFIG,  //!< an occasion the UE did not use: it had missed the activation
         UL_CG_CONFIRMATION, //!< a configured grant confirmation MAC CE sent
         UL_CG_CONFIRMATION_BYTES, //!< the bytes of these MAC CEs
+        DL_SPS_WAIT,        //!< a packet sent with a DCI: its occasion was too far (SpsDlMaxWaitMs)
         VOICE_CHANGES,      //!< the first of 4 x N_CHANGE counters, see ChangeEvent()
         N_EVENTS = VOICE_CHANGES + 4 * N_CHANGE
     };
@@ -188,6 +189,7 @@ class NR_EXPORT NrPdcch : public Object
         uint64_t raised{0};       //!< DCIs sent at a higher level: the chosen one had no free CCEs
         uint64_t noReport{0};     //!< DCIs sent before the UE had reported a SINR
         uint64_t unusedReservations{0}; //!< candidates reserved for a UE that got no DCI
+        double ulShareSum{0.0};   //!< UlBalance demand: the uplink share of every slot, summed
         uint64_t ulCapped{0};     //!< of the blocked uplink grants: a candidate was free, but
                                   //!< UlMaxShare held them back
         double boostSumDb{0.0};   //!< sum of the PDCCH power boost (dB) of the DCIs sent, see BoostMaxDb
@@ -570,6 +572,12 @@ class NR_EXPORT NrPdcch : public Object
     double m_ulCredit{0.0}; //!< the share of the uplink grants: CCEs they may take in any case
     uint32_t m_dlDemandCce{0};
     uint32_t m_prevDlDemandCce{0};
+    uint32_t m_ulDemandCce{0};      //!< CCEs the uplink grants of the slot asked for
+    uint32_t m_prevUlDemandCce{0};
+    std::string m_ulBalance{"fixed"}; //!< UlBalance attribute: fixed or demand
+    double m_ulDemandShare{0.5};      //!< UlBalance demand: the uplink share, averaged
+    double m_ulBalanceSlots{20.0};    //!< UlBalanceSlots attribute
+    double m_ulBalanceMin{0.2};       //!< UlBalanceMin attribute
     uint32_t m_nextId{1};
 
     // uplink before downlink
